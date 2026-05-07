@@ -1,0 +1,7 @@
+menu "VibAPP"
+
+config VIBAPP_PLACEHOLDER
+    bool "Placeholder"
+    default y
+
+endmenu
