@@ -398,6 +398,7 @@ def summary() -> None:
             source_repo(app),
             icon,
             dependencies_text(app),
+            app.get("share_code") or "",
         )
 
 

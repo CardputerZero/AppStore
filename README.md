@@ -36,3 +36,10 @@ python3 appstore.py --uninstall <app-id>
 python3 appstore.py --run <app-id>
 ```
 
+`<app-id>` accepts either the app UUID or its `share_code` from registry metadata.
+
+## Share Code Flow
+
+On the AppStore home screen, press `S` to open the share code input page. Type
+the code from CardputerZero Hub, then press `Enter` to jump to that app's detail
+page. From there, use the normal install/reinstall flow.

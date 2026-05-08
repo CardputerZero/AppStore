@@ -36,6 +36,7 @@ constexpr uint32_t kEscLongPressMs = 1200;
 
 struct StoreApp {
     std::string id;
+    std::string share_code;
     std::string name;
     std::string version;
     std::string category;
@@ -54,6 +55,7 @@ enum class Screen {
     Detail,
     Confirm,
     Registry,
+    ShareCode,
 };
 
 struct KeyEvent {
@@ -87,6 +89,8 @@ Screen g_screen = Screen::Home;
 std::string g_confirm_action;
 std::vector<std::string> g_confirm_lines;
 std::string g_registry_input = "https://cardputerzero.github.io/generated/registry-index.json";
+std::string g_share_code_input;
+std::string g_share_code_message = "Enter a code from CardputerZero Hub.";
 uint32_t g_esc_press_tick = 0;
 bool g_esc_pressed = false;
 bool g_esc_long_consumed = false;
@@ -202,6 +206,16 @@ std::string upper_ascii(std::string value)
         ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
     }
     return value;
+}
+
+std::string match_key(std::string value)
+{
+    std::string out;
+    for (char ch : value) {
+        unsigned char uch = static_cast<unsigned char>(ch);
+        if (!std::isspace(uch)) out += static_cast<char>(std::tolower(uch));
+    }
+    return out;
 }
 
 std::string first_csv(std::string value)
@@ -324,6 +338,7 @@ void refresh_summary()
             app.git_url = fields[10];
             app.images = fields[11];
             app.dependencies = fields[12];
+            if (fields.size() >= 14) app.share_code = fields[13];
             apps.push_back(app);
         }
     }
@@ -627,11 +642,13 @@ void render_home()
         strong_label(g_root, one_line(g_status_message, 29), 130, 155, 184, 12,
                      &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
     } else {
-        strong_label(g_root, "tab : detail", 130, 153, 78, 15, &lv_font_montserrat_14,
+        strong_label(g_root, "tab detail", 130, 155, 67, 12, &lv_font_montserrat_10,
                      0x168CE5, LV_LABEL_LONG_DOT);
+        strong_label(g_root, "s code", 200, 155, 44, 12, &lv_font_montserrat_10,
+                     0xCCCC33, LV_LABEL_LONG_DOT);
         StoreApp *app = selected_app();
         std::string action = app && app->installed ? "reinstall" : "download";
-        strong_label(g_root, "ok : " + action, 211, 153, 106, 15, &lv_font_montserrat_14,
+        strong_label(g_root, "ok " + action, 247, 155, 68, 12, &lv_font_montserrat_10,
                      0x43CF4D, LV_LABEL_LONG_DOT);
     }
 }
@@ -720,6 +737,27 @@ void render_registry()
     label(g_root, "Enter Add   R Sync   C Clear", 10, 153, 230, 12, &lv_font_montserrat_10, 0xCCCC33);
 }
 
+void render_share_code()
+{
+    clean_root();
+    draw_system_bar();
+    box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
+    box(0, 20, 320, 22, 0x1F6FEB, 0x1F6FEB, 0);
+    label(g_root, "Share Code", 8, 24, 180, 15, &lv_font_montserrat_12, 0xFFFFFF);
+    label(g_root, "Esc Back", 258, 24, 56, 14, &lv_font_montserrat_10, 0xAECBFA);
+
+    label(g_root, "CODE", 10, 52, 42, 12, &lv_font_montserrat_10, 0x58A6FF);
+    box(54, 47, 256, 25, 0x111923, 0x2A3A46, 1, 0);
+    std::string display = g_share_code_input.empty() ? "type share code" : upper_ascii(g_share_code_input);
+    label(g_root, one_line(display, 34), 61, 53, 242, 14, &lv_font_montserrat_12,
+          g_share_code_input.empty() ? 0x6E7681 : 0xE6EDF3, LV_LABEL_LONG_DOT);
+
+    label(g_root, one_line(g_share_code_message, 48), 10, 88, 300, 14,
+          &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
+    label(g_root, "Enter Open   Backspace Delete   Esc Back", 10, 153, 300, 12,
+          &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+}
+
 void render()
 {
     switch (g_screen) {
@@ -727,6 +765,7 @@ void render()
         case Screen::Detail: render_detail(); break;
         case Screen::Confirm: render_confirm(); break;
         case Screen::Registry: render_registry(); break;
+        case Screen::ShareCode: render_share_code(); break;
     }
 }
 
@@ -750,6 +789,9 @@ void navigate_back()
             g_screen = Screen::Detail;
             break;
         case Screen::Registry:
+            g_screen = Screen::Home;
+            break;
+        case Screen::ShareCode:
             g_screen = Screen::Home;
             break;
     }
@@ -783,6 +825,54 @@ void open_registry_screen()
 {
     refresh_registries();
     g_screen = Screen::Registry;
+}
+
+void open_share_code_screen()
+{
+    g_share_code_message = "Enter a code from CardputerZero Hub.";
+    g_screen = Screen::ShareCode;
+}
+
+bool select_app_index(int app_index)
+{
+    if (app_index < 0 || app_index >= static_cast<int>(g_apps.size())) return false;
+    for (int i = 0; i < static_cast<int>(g_categories.size()); ++i) {
+        if (g_categories[i] == "All") {
+            g_category = i;
+            break;
+        }
+    }
+    rebuild_visible();
+    for (int i = 0; i < static_cast<int>(g_visible.size()); ++i) {
+        if (g_visible[i] == app_index) {
+            g_selected = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+void open_share_code_match()
+{
+    std::string code = match_key(g_share_code_input);
+    if (code.empty()) {
+        g_share_code_message = "Type a share code first.";
+        return;
+    }
+    refresh_summary();
+    for (int i = 0; i < static_cast<int>(g_apps.size()); ++i) {
+        const StoreApp &app = g_apps[i];
+        if (match_key(app.share_code) == code || match_key(app.id) == code ||
+            match_key(app.name) == code) {
+            if (select_app_index(i)) {
+                g_status_message = "Share code matched";
+                g_share_code_message.clear();
+                g_screen = Screen::Detail;
+                return;
+            }
+        }
+    }
+    g_share_code_message = "No app found for code: " + g_share_code_input;
 }
 
 void add_registry_from_input()
@@ -916,6 +1006,8 @@ void handle_key(const KeyEvent &key)
                 sync_catalog();
             } else if (key.ch == 'a') {
                 open_registry_screen();
+            } else if (key.ch == 's') {
+                open_share_code_screen();
             } else if (key.ch == 'q') {
                 request_quit();
             }
@@ -954,6 +1046,16 @@ void handle_key(const KeyEvent &key)
                 add_registry_from_input();
             } else if (key.ch >= 32 && key.ch <= 126 && g_registry_input.size() < 140) {
                 g_registry_input.push_back(key.ch);
+            }
+            break;
+        case Screen::ShareCode:
+            if (key.code == KEY_BACKSPACE && !g_share_code_input.empty()) {
+                g_share_code_input.pop_back();
+            } else if (key.code == KEY_ENTER) {
+                open_share_code_match();
+            } else if (key.ch >= 32 && key.ch <= 126 && g_share_code_input.size() < 64) {
+                g_share_code_input.push_back(key.ch);
+                g_share_code_message = "Enter opens the app detail page.";
             }
             break;
     }
