@@ -91,6 +91,7 @@ std::vector<std::string> g_confirm_lines;
 std::string g_registry_input = "https://cardputerzero.github.io/generated/registry-index.json";
 std::string g_share_code_input;
 std::string g_share_code_message = "Enter a code from CardputerZero Hub.";
+uint32_t g_share_code_open_tick = 0;
 uint32_t g_esc_press_tick = 0;
 bool g_esc_pressed = false;
 bool g_esc_long_consumed = false;
@@ -831,6 +832,7 @@ void open_share_code_screen()
 {
     g_share_code_input.clear();
     g_share_code_message = "Enter a code from CardputerZero Hub.";
+    g_share_code_open_tick = lv_tick_get();
     g_screen = Screen::ShareCode;
 }
 
@@ -1055,6 +1057,10 @@ void handle_key(const KeyEvent &key)
             } else if (key.code == KEY_ENTER) {
                 open_share_code_match();
             } else if (key.ch >= 32 && key.ch <= 126 && g_share_code_input.size() < 64) {
+                if (g_share_code_input.empty() && key.ch == 's' &&
+                    lv_tick_elaps(g_share_code_open_tick) < 250) {
+                    break;
+                }
                 g_share_code_input.push_back(key.ch);
                 g_share_code_message = "Enter opens the app detail page.";
             }
