@@ -829,6 +829,7 @@ void open_registry_screen()
 
 void open_share_code_screen()
 {
+    g_share_code_input.clear();
     g_share_code_message = "Enter a code from CardputerZero Hub.";
     g_screen = Screen::ShareCode;
 }
@@ -865,7 +866,7 @@ void open_share_code_match()
         if (match_key(app.share_code) == code || match_key(app.id) == code ||
             match_key(app.name) == code) {
             if (select_app_index(i)) {
-                g_status_message = "Share code matched";
+                g_status_message.clear();
                 g_share_code_message.clear();
                 g_screen = Screen::Detail;
                 return;
