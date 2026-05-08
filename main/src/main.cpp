@@ -747,11 +747,11 @@ void render_share_code()
     label(g_root, "Share Code", 8, 24, 180, 15, &lv_font_montserrat_12, 0xFFFFFF);
     label(g_root, "Esc Back", 258, 24, 56, 14, &lv_font_montserrat_10, 0xAECBFA);
 
-    center_strong_label(g_root, "TYPE SHARE CODE", 54, 51, 212, 16,
+    center_strong_label(g_root, "TYPE SHARE CODE", 68, 51, 184, 16,
                         &lv_font_montserrat_12, 0x58A6FF, LV_LABEL_LONG_DOT);
-    box(28, 69, 264, 45, 0x111923, 0x58A6FF, 2, 3);
-    std::string display = g_share_code_input.empty() ? "type share code" : upper_ascii(g_share_code_input);
-    center_strong_label(g_root, one_line(display, 18), 39, 81, 242, 23,
+    box(68, 69, 184, 45, 0x111923, 0x58A6FF, 2, 3);
+    std::string display = g_share_code_input.empty() ? "share code" : upper_ascii(g_share_code_input);
+    center_strong_label(g_root, one_line(display, 12), 78, 81, 164, 23,
                         &lv_font_montserrat_20,
                         g_share_code_input.empty() ? 0x6E7681 : 0xE6EDF3,
                         LV_LABEL_LONG_DOT);
