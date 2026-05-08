@@ -747,14 +747,17 @@ void render_share_code()
     label(g_root, "Share Code", 8, 24, 180, 15, &lv_font_montserrat_12, 0xFFFFFF);
     label(g_root, "Esc Back", 258, 24, 56, 14, &lv_font_montserrat_10, 0xAECBFA);
 
-    label(g_root, "CODE", 10, 52, 42, 12, &lv_font_montserrat_10, 0x58A6FF);
-    box(54, 47, 256, 25, 0x111923, 0x2A3A46, 1, 0);
+    center_strong_label(g_root, "TYPE SHARE CODE", 54, 51, 212, 16,
+                        &lv_font_montserrat_12, 0x58A6FF, LV_LABEL_LONG_DOT);
+    box(28, 69, 264, 45, 0x111923, 0x58A6FF, 2, 3);
     std::string display = g_share_code_input.empty() ? "type share code" : upper_ascii(g_share_code_input);
-    label(g_root, one_line(display, 34), 61, 53, 242, 14, &lv_font_montserrat_12,
-          g_share_code_input.empty() ? 0x6E7681 : 0xE6EDF3, LV_LABEL_LONG_DOT);
+    center_strong_label(g_root, one_line(display, 18), 39, 81, 242, 23,
+                        &lv_font_montserrat_20,
+                        g_share_code_input.empty() ? 0x6E7681 : 0xE6EDF3,
+                        LV_LABEL_LONG_DOT);
 
-    label(g_root, one_line(g_share_code_message, 48), 10, 88, 300, 14,
-          &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
+    center_label(g_root, one_line(g_share_code_message, 48), 10, 122, 300, 14,
+                 &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
     label(g_root, "Enter Open   Backspace Delete   Esc Back", 10, 153, 300, 12,
           &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
 }
