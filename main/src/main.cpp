@@ -196,6 +196,14 @@ std::string one_line(std::string value, size_t max_len)
     return value;
 }
 
+std::string upper_ascii(std::string value)
+{
+    for (char &ch : value) {
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
+
 std::string first_csv(std::string value)
 {
     size_t comma = value.find(',');
@@ -221,6 +229,19 @@ std::string icon_file_path(const StoreApp &app)
     std::string root = parent_dir(g_app_dir);
     std::string candidate = root + "/" + image;
     return file_exists(candidate) ? candidate : "";
+}
+
+std::string packaged_image_path(const std::string &name)
+{
+    std::vector<std::string> candidates = {
+        parent_dir(g_app_dir) + "/share/images/" + name,
+        g_app_dir + "/share/images/" + name,
+        "/usr/share/APPLaunch/share/images/" + name,
+    };
+    for (const auto &candidate : candidates) {
+        if (file_exists(candidate)) return candidate;
+    }
+    return "";
 }
 
 std::string lvgl_posix_src(const std::string &path)
@@ -337,7 +358,7 @@ void clean_root()
 {
     lv_obj_clean(g_root);
     g_render_image_sources.clear();
-    g_render_image_sources.reserve(4);
+    g_render_image_sources.reserve(12);
     lv_obj_set_style_bg_color(g_root, lv_color_hex(0x080B10), 0);
     lv_obj_set_style_bg_opa(g_root, LV_OPA_COVER, 0);
     lv_obj_clear_flag(g_root, LV_OBJ_FLAG_SCROLLABLE);
@@ -356,6 +377,33 @@ lv_obj_t *label(lv_obj_t *parent, const std::string &text, int x, int y, int w, 
     lv_label_set_text(obj, text.c_str());
     return obj;
 }
+
+lv_obj_t *center_label(lv_obj_t *parent, const std::string &text, int x, int y, int w, int h,
+                       const lv_font_t *font, uint32_t color,
+                       lv_label_long_mode_t mode = LV_LABEL_LONG_CLIP)
+{
+    lv_obj_t *obj = label(parent, text, x, y, w, h, font, color, mode);
+    lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_CENTER, 0);
+    return obj;
+}
+
+void strong_label(lv_obj_t *parent, const std::string &text, int x, int y, int w, int h,
+                  const lv_font_t *font, uint32_t color,
+                  lv_label_long_mode_t mode = LV_LABEL_LONG_DOT)
+{
+    label(parent, text, x, y, w, h, font, color, mode);
+    label(parent, text, x + 1, y, w, h, font, color, mode);
+}
+
+void center_strong_label(lv_obj_t *parent, const std::string &text, int x, int y, int w, int h,
+                         const lv_font_t *font, uint32_t color,
+                         lv_label_long_mode_t mode = LV_LABEL_LONG_CLIP)
+{
+    center_label(parent, text, x, y, w, h, font, color, mode);
+    center_label(parent, text, x + 1, y, w, h, font, color, mode);
+}
+
+bool draw_packaged_image(const std::string &name, int x, int y);
 
 void box(int x, int y, int w, int h, uint32_t color, uint32_t border = 0x2A3A46,
          int border_width = 1, int radius = 0, lv_opa_t bg_opa = LV_OPA_COVER)
@@ -387,19 +435,21 @@ std::string current_time_text()
 
 void draw_system_bar()
 {
-    label(g_root, "ZERO", 5, 4, 58, 13, &lv_font_montserrat_12, 0xFFFFFF);
+    if (!draw_packaged_image("store_wordmark.png", 6, 5)) {
+        strong_label(g_root, "STORE", 6, 5, 78, 22, &lv_font_montserrat_20, 0xFFFFFF);
+    }
 
-    box(206, 3, 40, 13, 0x333333, 0x333333, 0);
-    label(g_root, current_time_text(), 210, 4, 34, 12, &lv_font_montserrat_10, 0xFFFFFF);
+    box(202, 5, 43, 15, 0x333333, 0x333333, 0);
+    center_strong_label(g_root, current_time_text(), 204, 6, 38, 13,
+                        &lv_font_montserrat_14, 0xD7D7D7);
 
-    box(248, 3, 30, 13, 0x333333, 0x333333, 0);
-    box(253, 12, 5, 3, 0x00CCFF, 0x00CCFF, 0);
-    box(260, 9, 5, 6, 0x00CCFF, 0x00CCFF, 0);
-    box(267, 8, 5, 7, 0x00CCFF, 0x00CCFF, 0);
-    box(274, 6, 3, 9, 0x4D4D4D, 0x4D4D4D, 0);
+    box(247, 5, 31, 15, 0x333333, 0x333333, 0);
+    box(253, 16, 5, 3, 0x00BFFF, 0x00BFFF, 0);
+    box(261, 13, 5, 6, 0x00BFFF, 0x00BFFF, 0);
+    box(269, 10, 5, 9, 0x00BFFF, 0x00BFFF, 0);
 
-    box(280, 3, 38, 13, 0x333333, 0x333333, 0);
-    label(g_root, "100%", 286, 4, 29, 12, &lv_font_montserrat_10, 0xFFFFFF);
+    box(281, 5, 37, 15, 0x333333, 0x333333, 0);
+    center_strong_label(g_root, "100%", 282, 6, 35, 13, &lv_font_montserrat_14, 0xD7D7D7);
 }
 
 std::string app_initial(const StoreApp &app)
@@ -420,7 +470,7 @@ bool draw_app_icon_image(const StoreApp &app)
     if (path.empty()) return false;
     g_render_image_sources.push_back(lvgl_posix_src(path));
     lv_obj_t *icon = lv_image_create(g_root);
-    lv_image_set_scale(icon, 104);
+    lv_image_set_scale(icon, 210);
     lv_image_set_src(icon, g_render_image_sources.back().c_str());
     lv_obj_update_layout(icon);
 
@@ -430,7 +480,7 @@ bool draw_app_icon_image(const StoreApp &app)
     if (icon_h <= 0) icon_h = 100;
 
     constexpr int panel_center_x = 60;
-    constexpr int panel_center_y = 76;
+    constexpr int panel_center_y = 81;
     lv_obj_set_pos(icon, panel_center_x - icon_w / 2, panel_center_y - icon_h / 2);
     return true;
 #else
@@ -439,39 +489,60 @@ bool draw_app_icon_image(const StoreApp &app)
 #endif
 }
 
+bool draw_packaged_image(const std::string &name, int x, int y)
+{
+#if LV_USE_LODEPNG && LV_USE_FS_POSIX
+    std::string path = packaged_image_path(name);
+    if (path.empty()) return false;
+    g_render_image_sources.push_back(lvgl_posix_src(path));
+    lv_obj_t *image = lv_image_create(g_root);
+    lv_image_set_src(image, g_render_image_sources.back().c_str());
+    lv_obj_set_pos(image, x, y);
+    return true;
+#else
+    (void)name;
+    (void)x;
+    (void)y;
+    return false;
+#endif
+}
+
 void draw_home_icon_panel(const StoreApp *app)
 {
-    box(20, 40, 81, 81, 0xFFFFFF, 0x4D4D4D, 1, 16, LV_OPA_TRANSP);
+    if (!draw_packaged_image("store_arrow_up.png", 53, 27)) {
+        center_strong_label(g_root, "^", 61, 28, 28, 20, &lv_font_montserrat_20, 0xFF6A3D);
+    }
+    box(19, 40, 82, 82, 0x202020, 0x4D4D4D, 2, 14, LV_OPA_COVER);
     if (!app) {
-        label(g_root, "-", 49, 67, 22, 26, &lv_font_montserrat_20, 0x4D4D4D);
+        center_strong_label(g_root, "-", 49, 82, 24, 26, &lv_font_montserrat_20, 0x9A9A9A);
+        if (!draw_packaged_image("store_arrow_down.png", 53, 127)) {
+            center_strong_label(g_root, "v", 61, 135, 28, 20, &lv_font_montserrat_20, 0xFF6A3D);
+        }
         return;
     }
 
     if (!draw_app_icon_image(*app)) {
-        lv_obj_t *initial = label(g_root, app_initial(*app), 20, 61, 81, 28,
-                                  &lv_font_montserrat_20, app->installed ? 0xCCCC33 : 0xFFFFFF);
-        lv_obj_set_style_text_align(initial, LV_TEXT_ALIGN_CENTER, 0);
+        center_strong_label(g_root, app_initial(*app), 19, 66, 82, 30,
+                            &lv_font_montserrat_20, app->installed ? 0x52D05D : 0xFFFFFF);
     }
-    label(g_root, one_line(app->category, 10), 28, 102, 64, 12, &lv_font_montserrat_10, 0xCCCC33,
-          LV_LABEL_LONG_DOT);
-    if (app->installed) {
-        box(25, 45, 30, 11, 0x333380, 0x333380, 0);
-        label(g_root, "INST", 28, 45, 26, 11, &lv_font_montserrat_10, 0xFFFFFF);
-    } else if (app->recommended) {
-        box(25, 45, 28, 11, 0x333380, 0x333380, 0);
-        label(g_root, "REC", 29, 45, 22, 11, &lv_font_montserrat_10, 0xFFFFFF);
+    if (!draw_packaged_image("store_arrow_down.png", 53, 127)) {
+        center_strong_label(g_root, "v", 61, 135, 28, 20, &lv_font_montserrat_20, 0xFF6A3D);
     }
 }
 
 void draw_nav_bar()
 {
-    box(3, 147, 115, 19, 0x333380, 0x333380, 0);
-    label(g_root, "<", 10, 150, 10, 12, &lv_font_montserrat_12, 0xFFFFFF);
-    std::string cat = g_categories.empty() ? "All" : g_categories[g_category];
-    lv_obj_t *cat_label = label(g_root, one_line(cat, 10), 25, 150, 70, 12,
-                                &lv_font_montserrat_12, 0xFFFFFF, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(cat_label, LV_TEXT_ALIGN_CENTER, 0);
-    label(g_root, ">", 102, 150, 10, 12, &lv_font_montserrat_12, 0xFFFFFF);
+    box(1, 148, 117, 20, 0x333380, 0x333380, 0);
+    if (!draw_packaged_image("store_arrow_left.png", 5, 151)) {
+        strong_label(g_root, "<", 8, 149, 17, 19, &lv_font_montserrat_20, 0xFF6A3D);
+    }
+    StoreApp *app = selected_app();
+    std::string cat = app ? app->category : (g_categories.empty() ? "All" : g_categories[g_category]);
+    center_strong_label(g_root, one_line(upper_ascii(cat), 11), 29, 151, 70, 16,
+                        &lv_font_montserrat_14, 0xFFFFFF, LV_LABEL_LONG_DOT);
+    if (!draw_packaged_image("store_arrow_right.png", 107, 151)) {
+        strong_label(g_root, ">", 111, 149, 17, 19, &lv_font_montserrat_20, 0xFF6A3D);
+    }
 }
 
 void header(const std::string &title, const std::string &right)
@@ -494,48 +565,74 @@ void render_home()
     draw_home_icon_panel(selected_app());
 
     if (g_visible.empty()) {
-        label(g_root, "No apps", 112, 69, 196, 18, &lv_font_montserrat_20, 0xFFFFFF);
+        strong_label(g_root, "NO APPS", 122, 73, 130, 24, &lv_font_montserrat_20, 0xFFFFFF);
     } else {
-        const int list_x = 112;
-        const int y_pos[] = {29, 49, 68, 94, 114};
+        const int list_x = 116;
+        const int y_pos[] = {25, 42, 60, 101, 118};
         const lv_font_t *fonts[] = {
             &lv_font_montserrat_10, &lv_font_montserrat_12, &lv_font_montserrat_20,
             &lv_font_montserrat_12, &lv_font_montserrat_10
         };
-        const uint32_t colors[] = {0x6A6A6A, 0xA0A0A0, 0xFFFFFF, 0xA0A0A0, 0x6A6A6A};
-        for (int row = 0; row < 5; ++row) {
-            int visible_index = g_selected + row - 2;
-            if (visible_index < 0 || visible_index >= static_cast<int>(g_visible.size())) continue;
-            const StoreApp &app = g_apps[g_visible[visible_index]];
-            bool selected = visible_index == g_selected;
-            std::string mark = app.installed ? "* " : (app.recommended ? "+ " : "  ");
-            std::string text = mark + one_line(app.name, selected ? 13 : 18);
-            if (!app.version.empty() && !selected) text += " " + one_line(app.version, 5);
-            if (selected) {
-                box(list_x - 3, y_pos[row] - 1, 200, 25, 0xFFFFFF, 0xFFFFFF, 0, 0, LV_OPA_TRANSP);
+        const uint32_t colors[] = {0x3D3D3D, 0x575757, 0xFFFFFF, 0x575757, 0x3D3D3D};
+        struct HomeRow {
+            int row;
+            int visible_index;
+        };
+        std::vector<HomeRow> rows;
+        int visible_count = static_cast<int>(g_visible.size());
+        if (visible_count >= 5) {
+            for (int row = 0; row < 5; ++row) {
+                HomeRow item = {row, (g_selected + row - 2 + visible_count) % visible_count};
+                rows.push_back(item);
             }
-            label(g_root, text, list_x, y_pos[row], 148, selected ? 24 : 15,
-                  fonts[row], colors[row], LV_LABEL_LONG_DOT);
-            if (selected) {
-                label(g_root, one_line(app.size, 8), 262, y_pos[row] + 7, 45, 12,
-                      &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+        } else {
+            int first = std::max(0, g_selected - 2);
+            int last = std::min(visible_count - 1, first + 4);
+            first = std::max(0, last - 4);
+            int start_row = 2 - (g_selected - first);
+            for (int visible_index = first; visible_index <= last; ++visible_index) {
+                int row = start_row + (visible_index - first);
+                if (row >= 0 && row < 5) {
+                    HomeRow item = {row, visible_index};
+                    rows.push_back(item);
+                }
             }
         }
+        for (const auto &entry : rows) {
+            int row = entry.row;
+            int visible_index = entry.visible_index;
+            const StoreApp &app = g_apps[g_visible[visible_index]];
+            bool selected = visible_index == g_selected;
+            std::string text = selected ? upper_ascii(app.name) : one_line(upper_ascii(app.name), 16);
+            strong_label(g_root, text, list_x, y_pos[row], selected ? 144 : 130,
+                         selected ? 24 : 16, fonts[row], colors[row],
+                         selected ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_DOT);
+            if (selected) {
+                strong_label(g_root, "V" + one_line(app.version.empty() ? "0" : app.version, 6),
+                             264, y_pos[row] + 4, 52, 16, &lv_font_montserrat_14, 0x8B8B8B,
+                             LV_LABEL_LONG_DOT);
+                std::string author = app.author.empty() ? "unknown" : app.author;
+                strong_label(g_root, author + ".",
+                             list_x + 3, y_pos[row] + 23, 196, 12,
+                             &lv_font_montserrat_10, 0xBDBDBD);
+            }
+        }
+        std::string count = std::to_string(g_selected + 1) + "/" + std::to_string(g_visible.size());
+        strong_label(g_root, count, 284, 136, 34, 15, &lv_font_montserrat_14, 0xFFFFFF,
+                     LV_LABEL_LONG_DOT);
     }
 
-    label(g_root, "^", 57, 22, 12, 12, &lv_font_montserrat_12, 0xFFFFFF);
-    label(g_root, "v", 57, 128, 12, 12, &lv_font_montserrat_12, 0xFFFFFF);
-    box(121, 152, 15, 15, 0x333333, 0x333333, 0);
-    label(g_root, "i", 127, 153, 6, 11, &lv_font_montserrat_10, 0xFFFFFF);
-    label(g_root, "A Reg  R Sync", 142, 151, 104, 12, &lv_font_montserrat_10, 0x6A6A6A,
-          LV_LABEL_LONG_DOT);
-
+    box(120, 154, 198, 14, 0x333333, 0x333333, 0);
     if (!g_status_message.empty()) {
-        label(g_root, one_line(g_status_message, 29), 142, 151, 174, 12,
-              &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+        strong_label(g_root, one_line(g_status_message, 29), 130, 155, 184, 12,
+                     &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
     } else {
-        label(g_root, "Free " + g_free_space, 248, 151, 66, 12,
-              &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
+        strong_label(g_root, "tab : detail", 130, 153, 78, 15, &lv_font_montserrat_14,
+                     0x168CE5, LV_LABEL_LONG_DOT);
+        StoreApp *app = selected_app();
+        std::string action = app && app->installed ? "reinstall" : "download";
+        strong_label(g_root, "ok : " + action, 211, 153, 106, 15, &lv_font_montserrat_14,
+                     0x43CF4D, LV_LABEL_LONG_DOT);
     }
 }
 
@@ -800,18 +897,21 @@ void handle_key(const KeyEvent &key)
     if (key.release) return;
     switch (g_screen) {
         case Screen::Home:
-            if (key.code == KEY_UP && g_selected > 0) {
-                --g_selected;
-            } else if (key.code == KEY_DOWN && g_selected + 1 < static_cast<int>(g_visible.size())) {
-                ++g_selected;
+            if (key.code == KEY_UP && !g_visible.empty()) {
+                g_selected = g_selected == 0 ? static_cast<int>(g_visible.size()) - 1 : g_selected - 1;
+            } else if (key.code == KEY_DOWN && !g_visible.empty()) {
+                g_selected = (g_selected + 1) % static_cast<int>(g_visible.size());
             } else if ((key.code == KEY_LEFT || key.ch == '<') && !g_categories.empty()) {
                 g_category = g_category == 0 ? static_cast<int>(g_categories.size()) - 1 : g_category - 1;
                 rebuild_visible();
             } else if ((key.code == KEY_RIGHT || key.ch == '>') && !g_categories.empty()) {
                 g_category = (g_category + 1) % static_cast<int>(g_categories.size());
                 rebuild_visible();
-            } else if (key.code == KEY_ENTER && selected_app()) {
+            } else if (key.code == KEY_TAB && selected_app()) {
                 g_screen = Screen::Detail;
+            } else if (key.code == KEY_ENTER && selected_app()) {
+                StoreApp *app = selected_app();
+                start_confirm(app && app->installed ? "reinstall" : "install");
             } else if (key.ch == 'r') {
                 sync_catalog();
             } else if (key.ch == 'a') {
@@ -888,6 +988,7 @@ uint32_t lv_key_to_linux(uint32_t key)
         case LV_KEY_DOWN: return KEY_DOWN;
         case LV_KEY_RIGHT: return KEY_RIGHT;
         case LV_KEY_LEFT: return KEY_LEFT;
+        case LV_KEY_NEXT: return KEY_TAB;
         case LV_KEY_ESC: return KEY_ESC;
         case LV_KEY_BACKSPACE: return KEY_BACKSPACE;
         case LV_KEY_ENTER: return KEY_ENTER;
@@ -992,7 +1093,7 @@ void lv_linux_indev_init() {}
 void lv_linux_disp_init()
 {
     lv_display_t *disp = lv_sdl_window_create(kScreenWidth, kScreenHeight);
-    lv_sdl_window_set_title(disp, "App Store");
+    lv_sdl_window_set_title(disp, "STORE");
 }
 
 void lv_linux_indev_init()
