@@ -10,9 +10,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <fcntl.h>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -33,6 +35,8 @@ constexpr int kScreenHeight = 170;
 constexpr int kHeaderHeight = 24;
 constexpr int kLineHeight = 15;
 constexpr uint32_t kEscLongPressMs = 1200;
+constexpr uint32_t kJobStartDelayMs = 80;
+constexpr uint32_t kJobPollIntervalMs = 250;
 
 struct StoreApp {
     std::string id;
@@ -55,6 +59,7 @@ enum class Screen {
     Home,
     Detail,
     Confirm,
+    Progress,
     Registry,
     ShareCode,
 };
@@ -105,13 +110,16 @@ std::string g_registry_input = "https://cardputerzero.github.io/generated/regist
 std::string g_share_code_input;
 std::string g_share_code_message = "Enter a code from CardputerZero Hub.";
 bool g_job_running = false;
+bool g_job_pending_start = false;
 std::string g_job_action;
+std::string g_job_app_id;
 std::string g_job_title;
 std::string g_job_output_path;
 std::string g_job_rc_path;
 std::string g_job_stage;
 std::string g_job_detail;
 int g_job_progress = -1;
+pid_t g_job_pid = -1;
 uint32_t g_job_start_tick = 0;
 uint32_t g_share_code_open_tick = 0;
 uint32_t g_esc_press_tick = 0;
@@ -965,6 +973,43 @@ void render_confirm()
                         &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
+void render_progress()
+{
+    clean_root();
+    draw_system_bar();
+    box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
+    box(0, 20, 320, 22, 0x1F6FEB, 0x1F6FEB, 0);
+    label(g_root, "Package Operation", 8, 24, 190, 15, &lv_font_montserrat_12, 0xFFFFFF);
+    label(g_root, "Esc Exit", 262, 24, 52, 14, &lv_font_montserrat_10, 0xAECBFA);
+
+    std::string title = g_job_title.empty() ? "Selected app" : g_job_title;
+    center_strong_label(g_root, upper_ascii(job_action_label(g_job_action)), 24, 50, 272, 18,
+                        &lv_font_montserrat_14, 0xCCCC33, LV_LABEL_LONG_DOT);
+    center_strong_label(g_root, one_line(title, 26), 24, 70, 272, 16,
+                        &lv_font_montserrat_12, 0xE6EDF3, LV_LABEL_LONG_DOT);
+
+    box(28, 92, 264, 12, 0x30363D, 0x30363D, 0, 2);
+    if (g_job_progress >= 0) {
+        int fill = std::max(4, std::min(264, g_job_progress * 264 / 100));
+        box(28, 92, fill, 12, 0xCCCC33, 0xCCCC33, 0, 2);
+    } else {
+        int offset = static_cast<int>((lv_tick_get() / 90) % 216);
+        box(28 + offset, 92, 48, 12, 0xCCCC33, 0xCCCC33, 0, 2);
+    }
+
+    std::string detail = g_job_pending_start ? "Preparing package worker" :
+                         (g_job_detail.empty() ? "Waiting for package output" : g_job_detail);
+    if (g_job_progress >= 0) detail += " " + std::to_string(g_job_progress) + "%";
+    center_label(g_root, one_line(detail, 48), 18, 113, 284, 14,
+                 &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
+
+    uint32_t elapsed = g_job_start_tick ? lv_tick_elaps(g_job_start_tick) / 1000 : 0;
+    center_strong_label(g_root, "Elapsed " + std::to_string(elapsed) + "s", 88, 132, 144, 13,
+                        &lv_font_montserrat_10, 0x58A6FF, LV_LABEL_LONG_DOT);
+    center_label(g_root, "Keep AppStore open until this finishes.", 18, 153, 284, 12,
+                 &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+}
+
 void render_registry()
 {
     clean_root();
@@ -1019,6 +1064,7 @@ void render()
         case Screen::Home: render_home(); break;
         case Screen::Detail: render_detail(); break;
         case Screen::Confirm: render_confirm(); break;
+        case Screen::Progress: render_progress(); break;
         case Screen::Registry: render_registry(); break;
         case Screen::ShareCode: render_share_code(); break;
     }
@@ -1034,6 +1080,11 @@ void refresh_timer_cb(lv_timer_t *)
 
 void finish_backend_job(const std::string &out, const std::string &rc_text)
 {
+    if (g_job_pid > 0) {
+        int status = 0;
+        waitpid(g_job_pid, &status, 0);
+        g_job_pid = -1;
+    }
     bool ok = trim(rc_text) == "0" && out.find("ERROR") == std::string::npos;
     if (!ok) {
         g_status_message = one_line(backend_error_message(out), 54);
@@ -1045,6 +1096,8 @@ void finish_backend_job(const std::string &out, const std::string &rc_text)
         g_status_message = "Done";
     }
     g_job_running = false;
+    g_job_pending_start = false;
+    g_job_app_id.clear();
     g_job_progress = -1;
     g_job_stage.clear();
     g_job_detail.clear();
@@ -1056,7 +1109,7 @@ void finish_backend_job(const std::string &out, const std::string &rc_text)
 
 void poll_backend_job()
 {
-    if (!g_job_running) return;
+    if (!g_job_running || g_job_pending_start) return;
     uint32_t elapsed = lv_tick_elaps(g_job_start_tick) / 1000;
     std::string out = read_text_file(g_job_output_path);
     parse_job_progress(out);
@@ -1071,7 +1124,46 @@ void poll_backend_job()
 
 void job_timer_cb(lv_timer_t *)
 {
-    if (!g_job_running) return;
+    if (!g_job_running && !g_job_pending_start) return;
+    if (g_job_pending_start && lv_tick_elaps(g_job_start_tick) >= kJobStartDelayMs) {
+        g_job_pending_start = false;
+        std::string flag = "--install";
+        if (g_job_action == "reinstall") flag = "--reinstall";
+        else if (g_job_action == "uninstall") flag = "--uninstall";
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            setsid();
+            int null_fd = open("/dev/null", O_RDONLY);
+            if (null_fd >= 0) {
+                dup2(null_fd, STDIN_FILENO);
+                if (null_fd > STDERR_FILENO) close(null_fd);
+            }
+            int out_fd = open(g_job_output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (out_fd >= 0) {
+                dup2(out_fd, STDOUT_FILENO);
+                dup2(out_fd, STDERR_FILENO);
+                if (out_fd > STDERR_FILENO) close(out_fd);
+            }
+            std::string cmd = backend_cmd(flag + " " + shell_quote(g_job_app_id));
+            std::string wrapped = cmd + "; rc=$?; echo $rc > " + shell_quote(g_job_rc_path) + "; exit $rc";
+            execlp("/bin/sh", "sh", "-c", wrapped.c_str(), static_cast<char *>(nullptr));
+            _exit(127);
+        }
+
+        if (pid < 0) {
+            g_job_running = false;
+            g_status_message = "Unable to start operation";
+            g_screen = Screen::Detail;
+            render();
+            return;
+        }
+
+        g_job_pid = pid;
+        g_job_start_tick = lv_tick_get();
+        g_job_detail = "Waiting for package output";
+        g_status_message = job_action_label(g_job_action) + " " + one_line(g_job_title, 18) + "... 0s";
+    }
     poll_backend_job();
     render();
 }
@@ -1086,6 +1178,13 @@ void navigate_back()
             break;
         case Screen::Confirm:
             g_screen = Screen::Detail;
+            break;
+        case Screen::Progress:
+            if (g_job_running || g_job_pending_start) {
+                g_status_message = "Operation is still running";
+            } else {
+                g_screen = Screen::Detail;
+            }
             break;
         case Screen::Registry:
             g_screen = Screen::Home;
@@ -1264,43 +1363,39 @@ void start_backend_job(const std::string &action, StoreApp *app)
         g_status_message = "Operation already running";
         return;
     }
-    std::string flag = "--install";
-    if (action == "reinstall") flag = "--reinstall";
-    else if (action == "uninstall") flag = "--uninstall";
 
-    std::string stamp = std::to_string(static_cast<unsigned long long>(time(nullptr)));
+    std::string stamp = std::to_string(static_cast<unsigned long long>(time(nullptr))) +
+                        "-" + std::to_string(static_cast<unsigned long long>(lv_tick_get()));
     std::string prefix = "/tmp/cardputerzero-appstore-" + stamp;
     g_job_output_path = prefix + ".out";
     g_job_rc_path = prefix + ".rc";
     std::remove(g_job_output_path.c_str());
     std::remove(g_job_rc_path.c_str());
 
-    std::string backend = backend_cmd(flag + " " + shell_quote(app->id));
-    std::string inner = "(" + backend + " > " + shell_quote(g_job_output_path) +
-                        " 2>&1; echo $? > " + shell_quote(g_job_rc_path) + ") & echo $!";
-    std::string pid_text = trim(run_capture("sh -c " + shell_quote(inner)));
-    if (pid_text.empty()) {
-        g_status_message = "Unable to start operation";
-        return;
-    }
-
     g_job_running = true;
+    g_job_pending_start = true;
     g_job_action = action;
+    g_job_app_id = app->id;
     g_job_title = app->name;
     g_job_stage.clear();
-    g_job_detail.clear();
+    g_job_detail = "Preparing package worker";
     g_job_progress = -1;
+    g_job_pid = -1;
     g_job_start_tick = lv_tick_get();
-    g_status_message = job_action_label(action) + " " + one_line(app->name, 18) + "... 0s";
-    g_screen = Screen::Detail;
+    g_status_message = "Preparing " + one_line(app->name, 18) + "...";
+    g_screen = Screen::Progress;
     render();
+    lv_refr_now(nullptr);
 }
 
 void execute_confirm()
 {
     StoreApp *app = selected_app();
     if (!app || g_confirm_action.empty()) return;
-    start_backend_job(g_confirm_action, app);
+    std::string action = g_confirm_action;
+    g_confirm_action.clear();
+    g_confirm_lines.clear();
+    start_backend_job(action, app);
 }
 
 void run_selected()
@@ -1389,6 +1484,11 @@ void handle_key(const KeyEvent &key)
                 g_confirm_lines.clear();
             } else if (key_matches(key, 'y', KEY_Y)) {
                 execute_confirm();
+            }
+            break;
+        case Screen::Progress:
+            if (!g_job_running && !g_job_pending_start && key_matches(key, 'b', KEY_B)) {
+                g_screen = Screen::Detail;
             }
             break;
         case Screen::Registry:
@@ -1603,7 +1703,7 @@ int main(int argc, char **argv)
     render();
     g_refresh_timer = lv_timer_create(refresh_timer_cb, 5000, nullptr);
     g_esc_hold_timer = lv_timer_create(esc_hold_timer_cb, 50, nullptr);
-    g_job_timer = lv_timer_create(job_timer_cb, 500, nullptr);
+    g_job_timer = lv_timer_create(job_timer_cb, kJobPollIntervalMs, nullptr);
 
     while (!g_quit_requested) {
         lv_timer_handler();
