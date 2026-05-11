@@ -87,6 +87,7 @@ std::vector<std::string> g_registry_lines;
 int g_category = 0;
 int g_selected = 0;
 Screen g_screen = Screen::Home;
+bool g_default_category_applied = false;
 std::string g_confirm_action;
 std::vector<std::string> g_confirm_lines;
 std::string g_registry_input = "https://cardputerzero.github.io/generated/registry-index.json";
@@ -301,6 +302,31 @@ bool file_exists(const std::string &path)
     return file.good();
 }
 
+std::string current_category_name()
+{
+    if (g_categories.empty()) return "All";
+    if (g_category < 0 || g_category >= static_cast<int>(g_categories.size())) return "All";
+    return g_categories[g_category];
+}
+
+bool select_category_by_name(const std::string &name)
+{
+    for (int i = 0; i < static_cast<int>(g_categories.size()); ++i) {
+        if (g_categories[i] == name) {
+            g_category = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+void select_default_category()
+{
+    if (!select_category_by_name("All") && !g_categories.empty()) {
+        g_category = 0;
+    }
+}
+
 std::string icon_file_path(const StoreApp &app)
 {
     std::string image = first_csv(app.images);
@@ -357,7 +383,7 @@ std::string resolve_script_path(const std::string &binary_dir)
 void rebuild_visible()
 {
     g_visible.clear();
-    std::string cat = g_categories.empty() ? "All" : g_categories[g_category];
+    std::string cat = current_category_name();
     for (int i = 0; i < static_cast<int>(g_apps.size()); ++i) {
         bool show = cat == "All" ||
             (cat == "Recommended" && g_apps[i].recommended) ||
@@ -376,6 +402,7 @@ StoreApp *selected_app()
 
 void refresh_summary()
 {
+    std::string previous_category = current_category_name();
     std::string output = run_capture(backend_cmd("--summary"));
     std::istringstream stream(output);
     std::string line;
@@ -412,7 +439,15 @@ void refresh_summary()
 
     if (!cats.empty()) g_categories = cats;
     if (!apps.empty()) g_apps = apps;
-    if (g_category >= static_cast<int>(g_categories.size())) g_category = 0;
+    if (!g_default_category_applied) {
+        select_default_category();
+        g_default_category_applied = true;
+        g_selected = 0;
+    } else if (!previous_category.empty() && select_category_by_name(previous_category)) {
+        // Keep the user's current filter stable across periodic refreshes.
+    } else if (g_category >= static_cast<int>(g_categories.size())) {
+        select_default_category();
+    }
     rebuild_visible();
 }
 
@@ -618,8 +653,7 @@ void draw_nav_bar()
     if (!draw_packaged_image("store_arrow_left.png", 5, 151)) {
         strong_label(g_root, "<", 8, 149, 17, 19, &lv_font_montserrat_20, 0xFF6A3D);
     }
-    StoreApp *app = selected_app();
-    std::string cat = app ? app->category : (g_categories.empty() ? "All" : g_categories[g_category]);
+    std::string cat = current_category_name();
     center_strong_label(g_root, one_line(upper_ascii(cat), 11), 29, 151, 70, 16,
                         &lv_font_montserrat_14, 0xFFFFFF, LV_LABEL_LONG_DOT);
     if (!draw_packaged_image("store_arrow_right.png", 107, 151)) {
@@ -1149,14 +1183,14 @@ void handle_key(const KeyEvent &key)
     if (key.release) return;
     switch (g_screen) {
         case Screen::Home:
-            if (key.code == KEY_UP && !g_visible.empty()) {
+            if ((key.code == KEY_UP || key.code == KEY_F || key.ch == 'f') && !g_visible.empty()) {
                 g_selected = g_selected == 0 ? static_cast<int>(g_visible.size()) - 1 : g_selected - 1;
-            } else if (key.code == KEY_DOWN && !g_visible.empty()) {
+            } else if ((key.code == KEY_DOWN || key.code == KEY_X || key.ch == 'x') && !g_visible.empty()) {
                 g_selected = (g_selected + 1) % static_cast<int>(g_visible.size());
-            } else if ((key.code == KEY_LEFT || key.ch == '<') && !g_categories.empty()) {
+            } else if ((key.code == KEY_LEFT || key.code == KEY_Z || key.ch == 'z' || key.ch == '<') && !g_categories.empty()) {
                 g_category = g_category == 0 ? static_cast<int>(g_categories.size()) - 1 : g_category - 1;
                 rebuild_visible();
-            } else if ((key.code == KEY_RIGHT || key.ch == '>') && !g_categories.empty()) {
+            } else if ((key.code == KEY_RIGHT || key.code == KEY_C || key.ch == 'c' || key.ch == '>') && !g_categories.empty()) {
                 g_category = (g_category + 1) % static_cast<int>(g_categories.size());
                 rebuild_visible();
             } else if (key.code == KEY_TAB && selected_app()) {
