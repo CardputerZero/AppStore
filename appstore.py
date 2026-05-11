@@ -151,7 +151,7 @@ def load_config() -> dict[str, Any]:
         normalized.append({
             "name": item.get("name") or registry_name_from_url(url),
             "url": url,
-            "enabled": bool(item.get("enabled", True)),
+            "enabled": enabled_value(item.get("enabled", True)),
         })
     data["registries"] = normalized or [{"name": DEFAULT_REGISTRY_NAME, "url": DEFAULT_INDEX_URL, "enabled": True}]
     return data
@@ -166,6 +166,12 @@ def registry_name_from_url(url: str) -> str:
     if parsed.netloc:
         return parsed.netloc
     return Path(parsed.path).stem or "Local Registry"
+
+
+def enabled_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+    return bool(value)
 
 
 def cache_busted_url(url: str) -> str:
@@ -679,6 +685,8 @@ def registries() -> None:
             count,
             record.get("synced_at") or record.get("last_attempt_at") or "",
             record.get("error") or "",
+            "1" if source.get("enabled", True) else "0",
+            source.get("name") or registry_name_from_url(source["url"]),
         )
 
 
@@ -937,6 +945,42 @@ def remove_registry(url: str) -> int:
     return 0
 
 
+def set_registry_enabled(url: str, enabled: bool) -> int:
+    config = load_config()
+    normalized = normalize_registry_url(url)
+    for item in config["registries"]:
+        if item["url"] == normalized:
+            item["enabled"] = enabled
+            save_config(config)
+            emit("REGISTRY", "ENABLED" if enabled else "DISABLED", normalized)
+            return 0
+    emit("ERROR", "registry not found", normalized)
+    return 1
+
+
+def edit_registry(old_url: str, new_url: str) -> int:
+    config = load_config()
+    old_normalized = normalize_registry_url(old_url)
+    new_normalized = normalize_registry_url(new_url)
+    updated = False
+    rewritten = []
+    for item in config["registries"]:
+        if item["url"] == old_normalized:
+            item = dict(item)
+            item["url"] = new_normalized
+            item["name"] = registry_name_from_url(new_normalized)
+            updated = True
+        if all(existing["url"] != item["url"] for existing in rewritten):
+            rewritten.append(item)
+    if not updated:
+        emit("ERROR", "registry not found", old_normalized)
+        return 1
+    config["registries"] = rewritten
+    save_config(config)
+    emit("REGISTRY", "UPDATED", old_normalized, new_normalized)
+    return 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--summary", action="store_true")
@@ -945,6 +989,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sync", action="store_true")
     parser.add_argument("--add-registry")
     parser.add_argument("--remove-registry")
+    parser.add_argument("--enable-registry")
+    parser.add_argument("--disable-registry")
+    parser.add_argument("--edit-registry", nargs=2, metavar=("OLD_URL", "NEW_URL"))
     parser.add_argument("--plan")
     parser.add_argument("--install")
     parser.add_argument("--reinstall")
@@ -985,6 +1032,12 @@ def main() -> int:
         return add_registry(args.add_registry)
     if args.remove_registry:
         return remove_registry(args.remove_registry)
+    if args.enable_registry:
+        return set_registry_enabled(args.enable_registry, True)
+    if args.disable_registry:
+        return set_registry_enabled(args.disable_registry, False)
+    if args.edit_registry:
+        return edit_registry(args.edit_registry[0], args.edit_registry[1])
     if args.plan:
         return plan(args.plan)
     if args.install:

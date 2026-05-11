@@ -56,6 +56,16 @@ struct StoreApp {
     std::string updated_at;
 };
 
+struct RegistryEntry {
+    std::string url;
+    std::string name;
+    std::string status;
+    std::string count;
+    std::string updated_at;
+    std::string error;
+    bool enabled = true;
+};
+
 enum class Screen {
     Home,
     Detail,
@@ -100,8 +110,10 @@ std::vector<StoreApp> g_apps;
 std::vector<int> g_visible;
 std::vector<std::string> g_render_image_sources;
 std::vector<std::string> g_registry_lines;
+std::vector<RegistryEntry> g_registry_entries;
 int g_category = 0;
 int g_selected = 0;
+int g_registry_selected = 0;
 Screen g_screen = Screen::Home;
 bool g_default_category_applied = false;
 SortRule g_sort_rule = SortRule::Default;
@@ -110,6 +122,7 @@ std::vector<std::string> g_confirm_lines;
 std::string g_loading_title;
 std::string g_loading_detail;
 std::string g_registry_input = "https://cardputerzero.github.io/generated/registry-index.json";
+std::string g_registry_edit_url;
 std::string g_share_code_input;
 std::string g_share_code_message = "Enter a code from CardputerZero Hub.";
 bool g_job_running = false;
@@ -590,24 +603,37 @@ void refresh_summary()
 void refresh_registries()
 {
     g_registry_lines.clear();
+    g_registry_entries.clear();
     std::string output = run_capture(backend_cmd("--registries"));
     std::istringstream stream(output);
     std::string line;
     while (std::getline(stream, line)) {
         auto fields = split_tab(line);
         if (fields.size() >= 5 && fields[0] == "REG") {
-            std::string item = fields[2] + "  " + fields[3] + " apps";
-            if (!fields[4].empty()) item += "  " + fields[4].substr(5, 5);
-            if (fields.size() >= 6 && !fields[5].empty()) {
-                item += "  " + one_line(fields[5], 30);
+            RegistryEntry entry;
+            entry.url = fields[1];
+            entry.status = fields[2];
+            entry.count = fields[3];
+            entry.updated_at = fields[4];
+            if (fields.size() >= 6) entry.error = fields[5];
+            if (fields.size() >= 7) entry.enabled = fields[6] != "0";
+            entry.name = fields.size() >= 8 && !fields[7].empty() ? fields[7] : entry.url;
+            std::string item = std::string(entry.enabled ? "on  " : "off ") + entry.status + "  " + entry.count + " apps";
+            if (!entry.updated_at.empty()) item += "  " + entry.updated_at.substr(5, 5);
+            if (!entry.error.empty()) {
+                item += "  " + one_line(entry.error, 30);
             } else {
-                item += "  " + fields[1];
+                item += "  " + entry.url;
             }
+            g_registry_entries.push_back(entry);
             g_registry_lines.push_back(item);
         }
     }
     if (g_registry_lines.empty()) {
         g_registry_lines.push_back("not synced  0 apps  " + g_registry_input);
+    }
+    if (g_registry_selected >= static_cast<int>(g_registry_entries.size())) {
+        g_registry_selected = std::max(0, static_cast<int>(g_registry_entries.size()) - 1);
     }
 }
 
@@ -739,19 +765,34 @@ bool draw_app_icon_image(const StoreApp &app)
     std::string path = icon_file_path(app);
     if (path.empty()) return false;
     g_render_image_sources.push_back(lvgl_posix_src(path));
-    lv_obj_t *icon = lv_image_create(g_root);
-    lv_image_set_scale(icon, 210);
+
+    constexpr int clip_x = 23;
+    constexpr int clip_y = 44;
+    constexpr int clip_w = 74;
+    constexpr int clip_h = 74;
+    lv_obj_t *clip = lv_obj_create(g_root);
+    lv_obj_remove_style_all(clip);
+    lv_obj_set_pos(clip, clip_x, clip_y);
+    lv_obj_set_size(clip, clip_w, clip_h);
+    lv_obj_clear_flag(clip, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(clip, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(clip, 0, 0);
+    lv_obj_set_style_pad_all(clip, 0, 0);
+
+    lv_obj_t *icon = lv_image_create(clip);
     lv_image_set_src(icon, g_render_image_sources.back().c_str());
     lv_obj_update_layout(icon);
 
     int icon_w = lv_obj_get_width(icon);
     int icon_h = lv_obj_get_height(icon);
-    if (icon_w <= 0) icon_w = 100;
-    if (icon_h <= 0) icon_h = 100;
+    if (icon_w <= 0 || icon_h <= 0) return true;
 
-    constexpr int panel_center_x = 60;
-    constexpr int panel_center_y = 81;
-    lv_obj_set_pos(icon, panel_center_x - icon_w / 2, panel_center_y - icon_h / 2);
+    int scale = std::min(256, std::min(clip_w * 256 / icon_w, clip_h * 256 / icon_h));
+    if (scale <= 0) scale = 1;
+    lv_image_set_scale(icon, scale);
+    int scaled_w = (icon_w * scale + 255) / 256;
+    int scaled_h = (icon_h * scale + 255) / 256;
+    lv_obj_set_pos(icon, (clip_w - scaled_w) / 2, (clip_h - scaled_h) / 2);
     return true;
 #else
     (void)app;
@@ -1062,14 +1103,38 @@ void render_registry()
     label(g_root, one_line(g_registry_input, 42), 44, 49, 260, 12, &lv_font_montserrat_10, 0xE6EDF3,
           LV_LABEL_LONG_DOT);
 
-    int y = 72;
-    for (const auto &line : g_registry_lines) {
-        label(g_root, one_line(line, 50), 10, y, 300, 12, &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
-        y += 16;
-        if (y > 132) break;
+    int y = 70;
+    int first = std::max(0, g_registry_selected - 1);
+    if (first + 2 >= static_cast<int>(g_registry_entries.size())) {
+        first = std::max(0, static_cast<int>(g_registry_entries.size()) - 3);
+    }
+    for (int i = first; i < static_cast<int>(g_registry_entries.size()) && y <= 126; ++i) {
+        const RegistryEntry &entry = g_registry_entries[i];
+        bool selected = i == g_registry_selected;
+        uint32_t title_color = selected ? 0xFFFFFF : 0xB8B8B8;
+        uint32_t state_color = entry.enabled ? 0x43CF4D : 0x6E7681;
+        strong_label(g_root, selected ? ">" : " ", 8, y, 10, 12, &lv_font_montserrat_10,
+                     selected ? 0xCCCC33 : 0x6E7681, LV_LABEL_LONG_DOT);
+        label(g_root, one_line(entry.name, 21), 20, y, 124, 12, &lv_font_montserrat_10,
+              title_color, LV_LABEL_LONG_DOT);
+        label(g_root, entry.enabled ? "on" : "off", 148, y, 22, 12, &lv_font_montserrat_10,
+              state_color, LV_LABEL_LONG_DOT);
+        label(g_root, one_line(entry.status + " " + entry.count + " apps", 24), 174, y, 136, 12,
+              &lv_font_montserrat_10, 0x58A6FF, LV_LABEL_LONG_DOT);
+        std::string detail = entry.error.empty() ? entry.url : entry.error;
+        label(g_root, one_line(detail, 48), 20, y + 12, 290, 12, &lv_font_montserrat_10,
+              entry.error.empty() ? 0x8B949E : 0xF85149, LV_LABEL_LONG_DOT);
+        y += 26;
+    }
+    if (g_registry_entries.empty()) {
+        label(g_root, "No registries. Enter adds current URL.", 10, 78, 300, 12,
+              &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
     }
 
-    label(g_root, "Enter Add   R Sync   C Clear", 10, 153, 230, 12, &lv_font_montserrat_10, 0xCCCC33);
+    std::string footer = g_registry_edit_url.empty() ?
+                         "Enter add  T on/off  E edit  D del  R sync" :
+                         "Enter save  C cancel  B back";
+    label(g_root, footer, 10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
 void render_share_code()
@@ -1395,19 +1460,70 @@ void open_share_code_match()
     g_share_code_message = "No app found for code: " + g_share_code_input;
 }
 
+RegistryEntry *selected_registry()
+{
+    if (g_registry_selected < 0 || g_registry_selected >= static_cast<int>(g_registry_entries.size())) return nullptr;
+    return &g_registry_entries[g_registry_selected];
+}
+
 void add_registry_from_input()
 {
     if (g_registry_input.empty()) return;
-    g_status_message = "Adding registry...";
+    bool editing = !g_registry_edit_url.empty();
+    g_status_message = editing ? "Updating registry..." : "Adding registry...";
     render();
-    std::string out = run_capture(backend_cmd("--add-registry " + shell_quote(g_registry_input)));
+    std::string out = editing ?
+        run_capture(backend_cmd("--edit-registry " + shell_quote(g_registry_edit_url) + " " + shell_quote(g_registry_input))) :
+        run_capture(backend_cmd("--add-registry " + shell_quote(g_registry_input)));
     if (out.find("ERROR") != std::string::npos) {
         g_status_message = one_line(out, 44);
     } else {
-        g_status_message = "Registry added";
+        g_status_message = editing ? "Registry updated" : "Registry added";
+        g_registry_edit_url.clear();
+    }
+    refresh_registries();
+    sync_catalog(true);
+}
+
+void toggle_selected_registry()
+{
+    RegistryEntry *entry = selected_registry();
+    if (!entry) return;
+    bool was_enabled = entry->enabled;
+    std::string flag = entry->enabled ? "--disable-registry " : "--enable-registry ";
+    std::string out = run_capture(backend_cmd(flag + shell_quote(entry->url)));
+    if (out.find("ERROR") != std::string::npos) {
+        g_status_message = one_line(out, 44);
+    } else {
+        g_status_message = entry->enabled ? "Registry disabled" : "Registry enabled";
     }
     refresh_registries();
     refresh_summary();
+    if (!was_enabled) sync_catalog(true);
+}
+
+void delete_selected_registry()
+{
+    RegistryEntry *entry = selected_registry();
+    if (!entry) return;
+    std::string out = run_capture(backend_cmd("--remove-registry " + shell_quote(entry->url)));
+    if (out.find("ERROR") != std::string::npos) {
+        g_status_message = one_line(out, 44);
+    } else {
+        g_status_message = "Registry deleted";
+    }
+    g_registry_edit_url.clear();
+    refresh_registries();
+    refresh_summary();
+}
+
+void edit_selected_registry()
+{
+    RegistryEntry *entry = selected_registry();
+    if (!entry) return;
+    g_registry_edit_url = entry->url;
+    g_registry_input = entry->url;
+    g_status_message = "Edit URL then Enter";
 }
 
 bool parse_plan(const std::string &out)
@@ -1619,10 +1735,22 @@ void handle_key(const KeyEvent &key)
         case Screen::Registry:
             if (key.ch == 'b') {
                 g_screen = Screen::Home;
+            } else if ((key.code == KEY_UP || key.code == KEY_F || key.ch == 'f') && !g_registry_entries.empty()) {
+                g_registry_selected = g_registry_selected == 0 ?
+                    static_cast<int>(g_registry_entries.size()) - 1 : g_registry_selected - 1;
+            } else if ((key.code == KEY_DOWN || key.code == KEY_X || key.ch == 'x') && !g_registry_entries.empty()) {
+                g_registry_selected = (g_registry_selected + 1) % static_cast<int>(g_registry_entries.size());
             } else if (key.ch == 'r') {
                 sync_catalog(true);
+            } else if (key.ch == 't') {
+                toggle_selected_registry();
+            } else if (key.ch == 'd') {
+                delete_selected_registry();
+            } else if (key.ch == 'e') {
+                edit_selected_registry();
             } else if (key.ch == 'c') {
                 g_registry_input.clear();
+                g_registry_edit_url.clear();
             } else if (key.code == KEY_BACKSPACE && !g_registry_input.empty()) {
                 g_registry_input.pop_back();
             } else if (key.code == KEY_ENTER) {
