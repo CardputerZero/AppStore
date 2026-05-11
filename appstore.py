@@ -13,16 +13,10 @@ import hashlib
 import json
 import os
 import shutil
-import stat
 import subprocess
-import sys
-import tarfile
-import tempfile
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
-import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -279,11 +273,42 @@ def source_repo(app: dict[str, Any]) -> str:
     return str(app.get("repository") or app.get("git_url") or "")
 
 
-def download_url(app: dict[str, Any]) -> str:
+def download_meta(app: dict[str, Any]) -> dict[str, Any]:
     download = app.get("download")
-    if isinstance(download, dict):
-        return str(download.get("url") or "")
-    return ""
+    return download if isinstance(download, dict) else {}
+
+
+def download_url(app: dict[str, Any]) -> str:
+    return str(download_meta(app).get("url") or "")
+
+
+def download_type(app: dict[str, Any]) -> str:
+    return str(download_meta(app).get("type") or "").lower()
+
+
+def download_md5(app: dict[str, Any]) -> str:
+    download = download_meta(app)
+    return str(download.get("md5") or download.get("md5sum") or "").lower().strip()
+
+
+def download_size(app: dict[str, Any]) -> str:
+    return str(download_meta(app).get("size") or "")
+
+
+def deb_package_name(app: dict[str, Any]) -> str:
+    download = download_meta(app)
+    return str(download.get("package") or app.get("package") or app.get("deb_package") or "").strip()
+
+
+def is_deb_url(url: str) -> bool:
+    path = urllib.parse.urlparse(url).path.lower()
+    return path.endswith(".deb")
+
+
+def is_deb_download(app: dict[str, Any]) -> bool:
+    url = download_url(app)
+    dtype = download_type(app)
+    return bool(url) and (dtype in {"deb", "debian"} or is_deb_url(url))
 
 
 def dependencies_text(app: dict[str, Any]) -> str:
@@ -316,10 +341,37 @@ def installed_records() -> dict[str, Any]:
 
 
 def is_installed(app: dict[str, Any]) -> bool:
+    package = deb_package_name(app)
+    if package and shutil.which("dpkg-query"):
+        try:
+            result = subprocess.run(
+                ["dpkg-query", "-W", "-f=${Status}", package],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if "install ok installed" in result.stdout:
+                return True
+        except Exception:
+            pass
     key = app_key(app)
     records = installed_records()
     if key in records:
-        files = records[key].get("files", [])
+        record = records[key] if isinstance(records[key], dict) else {}
+        package = record.get("package") if isinstance(record, dict) else ""
+        if package and shutil.which("dpkg-query"):
+            try:
+                result = subprocess.run(
+                    ["dpkg-query", "-W", "-f=${Status}", str(package)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if "install ok installed" in result.stdout:
+                    return True
+            except Exception:
+                pass
+        files = record.get("files", [])
         if any(Path(path).exists() for path in files):
             return True
     return desktop_path_for(app).exists()
@@ -383,7 +435,7 @@ def summary() -> None:
         review = app.get("review_status") or app.get("review", {}).get("status") if isinstance(app.get("review"), dict) else app.get("review_status")
         featured = bool(app.get("featured")) or str(review) in {"approved", "ci-passed"}
         icon = app.get("_icon_local") or ""
-        size = app.get("download", {}).get("size") if isinstance(app.get("download"), dict) else ""
+        size = download_size(app)
         emit(
             "APP",
             key,
@@ -423,8 +475,14 @@ def plan(app_id: str) -> int:
         emit("ERROR", "app not found", app_id)
         return 1
     missing = []
-    if not download_url(app) and not source_repo(app):
+    if not download_url(app):
         missing.append("package")
+    elif not is_deb_download(app):
+        missing.append("deb-only")
+    if not download_md5(app):
+        missing.append("md5")
+    if not deb_package_name(app):
+        missing.append("package-name")
     if not os.access(app_root(), os.W_OK):
         missing.append("root-write")
     emit(
@@ -432,7 +490,7 @@ def plan(app_id: str) -> int:
         app_key(app),
         app.get("title") or app_key(app),
         app.get("version") or "",
-        app.get("download", {}).get("size") if isinstance(app.get("download"), dict) else "online",
+        download_size(app) or "deb",
         free_space_text(),
         dependencies_text(app),
         ",".join(missing),
@@ -440,197 +498,104 @@ def plan(app_id: str) -> int:
     return 0 if not missing or missing == ["root-write"] else 1
 
 
-def verify_sha256(path: Path, expected: str) -> None:
-    if not expected:
-        return
+def verify_md5(path: Path, expected: str) -> None:
     expected = expected.lower().strip()
-    if len(expected) != 64:
-        return
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if len(expected) != 32:
+        raise RuntimeError("download md5 is missing or invalid")
+    digest = hashlib.md5()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
     if actual != expected:
-        raise RuntimeError(f"sha256 mismatch: {actual}")
+        raise RuntimeError(f"md5 mismatch: expected {expected}, got {actual}")
 
 
-def safe_extract_tar(path: Path, dest: Path) -> None:
-    with tarfile.open(path) as archive:
-        for member in archive.getmembers():
-            target = (dest / member.name).resolve()
-            if not str(target).startswith(str(dest.resolve())):
-                raise RuntimeError("unsafe archive path")
-        archive.extractall(dest)
+def deb_cache_path(url: str) -> Path:
+    name = Path(urllib.parse.unquote(urllib.parse.urlparse(url).path)).name
+    if not name.lower().endswith(".deb"):
+        name = short_hash(url) + ".deb"
+    safe_name = "".join(ch if ch.isalnum() or ch in "._+-" else "-" for ch in name)
+    return cache_dir() / "downloads" / f"{short_hash(url)}-{safe_name}"
 
 
-def extract_archive(path: Path, dest: Path) -> Path:
-    dest.mkdir(parents=True, exist_ok=True)
-    name = path.name.lower()
-    if name.endswith(".deb"):
-        subprocess.run(["dpkg-deb", "-x", str(path), str(dest)], check=True)
-    elif name.endswith((".tar.gz", ".tgz", ".tar", ".tar.xz")):
-        safe_extract_tar(path, dest)
-    elif name.endswith(".zip"):
-        with zipfile.ZipFile(path) as archive:
-            archive.extractall(dest)
-    else:
-        raise RuntimeError(f"unsupported package: {path.name}")
-    children = [item for item in dest.iterdir() if item.is_dir()]
-    return children[0] if len(children) == 1 else dest
-
-
-def clone_or_download_source(app: dict[str, Any], dest: Path) -> Path:
-    repo = source_repo(app)
-    if not repo:
-        raise RuntimeError("no source repository")
-    if shutil.which("git"):
-        subprocess.run(["git", "clone", "--depth", "1", repo, str(dest)], check=True)
-        return dest
-    archive_url = repo.rstrip("/") + "/archive/refs/heads/main.zip"
-    archive = cache_dir() / "downloads" / f"{short_hash(archive_url)}.zip"
-    download_file(archive_url, archive)
-    return extract_archive(archive, dest)
-
-
-def package_source(app: dict[str, Any], work: Path) -> Path:
+def download_deb(app: dict[str, Any]) -> Path:
     url = download_url(app)
-    if url:
-        package = cache_dir() / "downloads" / (short_hash(url) + Path(urllib.parse.urlparse(url).path).name[-24:])
+    if not url:
+        raise RuntimeError("download url is missing")
+    if not is_deb_download(app):
+        raise RuntimeError("only .deb downloads are supported")
+    expected_md5 = download_md5(app)
+    if not expected_md5:
+        raise RuntimeError("download md5 is required")
+    dest = deb_cache_path(url)
+    if dest.exists():
         try:
-            download_file(url, package)
-            download = app.get("download")
-            if isinstance(download, dict):
-                verify_sha256(package, str(download.get("sha256") or ""))
-            return extract_archive(package, work / "package")
-        except Exception as exc:
-            print(f"WARN\tdownload failed\t{exc}", file=sys.stderr)
-    return clone_or_download_source(app, work / "source")
+            verify_md5(dest, expected_md5)
+            return dest
+        except Exception:
+            dest.unlink(missing_ok=True)
+    download_file(url, dest)
+    verify_md5(dest, expected_md5)
+    return dest
 
 
-def find_layout_root(root: Path) -> Path:
-    candidates = [root]
-    candidates += [item for item in root.rglob("*") if item.is_dir() and item.name in {"APPLaunch", "applaunch"}]
-    for candidate in candidates:
-        if (candidate / "usr/share/APPLaunch").is_dir():
-            return candidate / "usr/share/APPLaunch"
-        if (candidate / "share/APPLaunch").is_dir():
-            return candidate / "share/APPLaunch"
-        if (candidate / "applications").is_dir() or (candidate / "dist").is_dir() or (candidate / "share").is_dir():
-            return candidate
-    return root
+def command_error(result: subprocess.CompletedProcess[str]) -> str:
+    text = (result.stdout or "") + (result.stderr or "")
+    text = text.strip()
+    if not text:
+        text = f"command failed: {' '.join(result.args)}"
+    return text[-500:]
 
 
-def copy_tree_contents(src: Path, dst: Path, files: list[str]) -> None:
-    if not src.exists():
-        return
-    for item in src.rglob("*"):
-        rel = item.relative_to(src)
-        if any(part == "__MACOSX" or part.startswith("._") for part in rel.parts):
-            continue
-        target = dst / rel
-        if item.is_dir():
-            target.mkdir(parents=True, exist_ok=True)
-        else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item, target)
-            files.append(str(target))
-
-
-def executable_candidates(layout: Path, app: dict[str, Any]) -> list[Path]:
-    candidates = []
-    exec_ref = applaunch_meta(app).get("exec")
-    if exec_ref:
-        name = Path(str(exec_ref)).name
-        candidates += list((layout / "dist").glob(name))
-        candidates += list((layout / "bin").glob(name))
-    if (layout / "dist").is_dir():
-        candidates += [p for p in (layout / "dist").iterdir() if p.is_file() and os.access(p, os.X_OK)]
-        candidates += [p for p in (layout / "dist").glob("*linux-aarch64*") if p.is_file()]
-    if (layout / "bin").is_dir():
-        candidates += [p for p in (layout / "bin").iterdir() if p.is_file()]
-    unique = []
-    seen = set()
-    for path in candidates:
-        if path not in seen:
-            seen.add(path)
-            unique.append(path)
-    return unique
-
-
-def build_source_if_needed(layout: Path) -> None:
-    if executable_candidates(layout, {}):
-        return
-    if not (layout / "SConstruct").exists() or not shutil.which("scons"):
-        return
+def run_package_command(args: list[str]) -> None:
     env = os.environ.copy()
-    env["CardputerZero"] = "y"
-    env["CONFIG_REPO_AUTOMATION"] = "y"
-    subprocess.run(["scons", "-j1"], cwd=layout, env=env, check=True, timeout=1800)
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    result = subprocess.run(args, check=False, capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(command_error(result))
 
 
-def install_layout(layout: Path, app: dict[str, Any]) -> list[str]:
-    root = app_root()
-    if not root.exists():
-        root.mkdir(parents=True, exist_ok=True)
-    files: list[str] = []
-    build_source_if_needed(layout)
-    copy_tree_contents(layout / "applications", root / "applications", files)
-    copy_tree_contents(layout / "share", root / "share", files)
-    copy_tree_contents(layout / "lib", root / "lib", files)
-    for binary in executable_candidates(layout, app):
-        target = root / "bin" / binary.name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(binary, target)
-        target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        files.append(str(target))
-    if not any(path.endswith(".desktop") for path in files):
-        exec_ref = applaunch_meta(app).get("exec")
-        if exec_ref and Path(str(exec_ref)).name:
-            exec_value = "/usr/share/APPLaunch/bin/" + Path(str(exec_ref)).name
-        else:
-            binaries = [Path(path) for path in files if "/bin/" in path]
-            if not binaries:
-                raise RuntimeError("no executable found in package")
-            exec_value = "/usr/share/APPLaunch/bin/" + binaries[0].name
-        icon_ref = applaunch_meta(app).get("icon") or ""
-        desktop = desktop_path_for(app)
-        desktop.parent.mkdir(parents=True, exist_ok=True)
-        desktop.write_text(
-            "\n".join([
-                "[Desktop Entry]",
-                f"Name={app.get('title') or app_key(app)}",
-                f"Exec={exec_value}",
-                "Terminal=false",
-                f"Icon={icon_ref}",
-                "Type=Application",
-                "",
-            ]),
-            encoding="utf-8",
-        )
-        files.append(str(desktop))
-    return files
+def package_files(package: str) -> list[str]:
+    if not package or not shutil.which("dpkg-query"):
+        return []
+    result = subprocess.run(
+        ["dpkg-query", "-L", package],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return []
+    return [line for line in result.stdout.splitlines() if line.startswith("/")]
 
 
 def uninstall(app_id: str) -> int:
     app = find_app(app_id)
     records = installed_records()
-    record = records.pop(app_id, {})
-    files = record.get("files", []) if isinstance(record, dict) else []
-    if app:
-        files.append(str(desktop_path_for(app)))
-        exec_ref = applaunch_meta(app).get("exec")
-        icon_ref = applaunch_meta(app).get("icon")
-        if exec_ref:
-            files.append(str(app_root() / "bin" / Path(str(exec_ref)).name))
-        if icon_ref:
-            files.append(str(app_root() / str(icon_ref)))
-    for path in sorted(set(files), key=len, reverse=True):
-        try:
-            item = Path(path)
-            if item.is_file() or item.is_symlink():
-                item.unlink()
-        except Exception:
-            pass
-    write_json(installed_path(), records)
-    emit("UNINSTALLED", app_id)
-    return 0
+    key = app_key(app) if app else app_id
+    record = records.pop(key, {})
+    if key != app_id:
+        records.pop(app_id, None)
+    package = deb_package_name(app) if app else ""
+    if not package and isinstance(record, dict):
+        package = str(record.get("package") or "")
+    if not package:
+        emit("ERROR", "deb package name missing", app_id)
+        return 1
+    try:
+        if shutil.which("apt-get"):
+            run_package_command(["apt-get", "-y", "remove", package])
+        elif shutil.which("dpkg"):
+            run_package_command(["dpkg", "-r", package])
+        else:
+            raise RuntimeError("apt-get or dpkg is required to uninstall deb packages")
+        write_json(installed_path(), records)
+        emit("UNINSTALLED", app_id)
+        return 0
+    except Exception as exc:
+        emit("ERROR", str(exc))
+        return 1
 
 
 def install(app_id: str, reinstall: bool = False) -> int:
@@ -638,15 +603,29 @@ def install(app_id: str, reinstall: bool = False) -> int:
     if not app:
         emit("ERROR", "app not found", app_id)
         return 1
-    if reinstall:
-        uninstall(app_id)
     try:
-        with tempfile.TemporaryDirectory(prefix="appstore-", dir=str(cache_dir())) as tmp:
-            source = package_source(app, Path(tmp))
-            layout = find_layout_root(source)
-            files = install_layout(layout, app)
+        deb_path = download_deb(app)
+        package = deb_package_name(app)
+        if not package:
+            raise RuntimeError("deb package name missing")
+        if shutil.which("apt-get"):
+            args = ["apt-get", "-y"]
+            if reinstall:
+                args.append("--reinstall")
+            args += ["install", str(deb_path)]
+            run_package_command(args)
+        elif shutil.which("dpkg"):
+            run_package_command(["dpkg", "-i", str(deb_path)])
+        else:
+            raise RuntimeError("apt-get or dpkg is required to install deb packages")
         records = installed_records()
-        records[app_key(app)] = {"installed_at": now_text(), "title": app.get("title"), "files": sorted(set(files))}
+        records[app_key(app)] = {
+            "installed_at": now_text(),
+            "title": app.get("title"),
+            "package": package,
+            "deb_path": str(deb_path),
+            "files": package_files(package),
+        }
         write_json(installed_path(), records)
         emit("INSTALLED", app_key(app), app.get("title") or app_key(app))
         return 0

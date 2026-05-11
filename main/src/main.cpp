@@ -201,6 +201,25 @@ std::string one_line(std::string value, size_t max_len)
     return value;
 }
 
+bool has_blocking_missing(const std::string &missing)
+{
+    std::istringstream stream(missing);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        if (!token.empty() && token != "root-write") return true;
+    }
+    return false;
+}
+
+std::string missing_install_message(const std::string &missing)
+{
+    if (missing.find("deb-only") != std::string::npos) return "Only .deb packages are supported";
+    if (missing.find("md5") != std::string::npos) return "Registry MD5 is required";
+    if (missing.find("package-name") != std::string::npos) return "Deb package name is required";
+    if (missing.find("package") != std::string::npos) return "Download URL is required";
+    return "Install metadata is incomplete";
+}
+
 std::string upper_ascii(std::string value)
 {
     for (char &ch : value) {
@@ -908,7 +927,11 @@ bool parse_plan(const std::string &out)
             g_confirm_lines.push_back("Download/app size: " + fields[4]);
             g_confirm_lines.push_back("Disk free: " + fields[5]);
             g_confirm_lines.push_back("Dependencies: " + (fields[6].empty() ? "-" : fields[6]));
-            g_confirm_lines.push_back("Missing deps: " + (fields[7].empty() ? "-" : fields[7]));
+            if (has_blocking_missing(fields[7])) {
+                g_status_message = missing_install_message(fields[7]);
+                return false;
+            }
+            g_confirm_lines.push_back("Install checks: " + (fields[7].empty() ? "OK" : fields[7]));
             return true;
         }
     }
@@ -921,7 +944,7 @@ void start_confirm(const std::string &action)
     if (!app) return;
     g_confirm_action = action;
     if (action == "uninstall") {
-        g_confirm_lines = {"Uninstall " + app->name, "Remove installed APPLaunch files.", "Disk free: " + g_free_space};
+        g_confirm_lines = {"Uninstall " + app->name, "Remove installed Debian package.", "Disk free: " + g_free_space};
         g_screen = Screen::Confirm;
         return;
     }
