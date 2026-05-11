@@ -56,7 +56,7 @@ def tsv_escape(value: Any) -> str:
 
 
 def emit(*fields: Any) -> None:
-    print("\t".join(tsv_escape(field) for field in fields))
+    print("\t".join(tsv_escape(field) for field in fields), flush=True)
 
 
 def short_hash(value: str) -> str:
@@ -140,10 +140,61 @@ def request_json(url: str) -> Any:
         return json.loads(response.read().decode("utf-8"))
 
 
-def download_file(url: str, dest: Path) -> None:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=30) as response, dest.open("wb") as handle:
-        shutil.copyfileobj(response, handle)
+def content_range_total(value: str) -> int:
+    try:
+        return int(value.rsplit("/", 1)[1])
+    except Exception:
+        return 0
+
+
+def download_file(url: str, dest: Path, progress_stage: str = "", resume: bool = False) -> None:
+    existing = dest.stat().st_size if resume and dest.exists() else 0
+    headers = {"User-Agent": USER_AGENT}
+    if existing:
+        headers["Range"] = f"bytes={existing}-"
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        response_ctx = urllib.request.urlopen(request, timeout=30)
+    except Exception:
+        if existing:
+            headers.pop("Range", None)
+            request = urllib.request.Request(url, headers=headers)
+            response_ctx = urllib.request.urlopen(request, timeout=30)
+            existing = 0
+        else:
+            raise
+    with response_ctx as response:
+        append = existing and getattr(response, "status", 200) == 206
+        mode = "ab" if append else "wb"
+        total_text = response.headers.get("Content-Length") or "0"
+        try:
+            total = int(total_text)
+        except ValueError:
+            total = 0
+        if append:
+            total = content_range_total(response.headers.get("Content-Range") or "") or (existing + total)
+        else:
+            existing = 0
+        done = 0
+        if progress_stage and existing:
+            percent = int(existing * 100 / total) if total else -1
+            emit("PROGRESS", progress_stage, existing, total, percent, "Resuming download")
+        done = existing
+        next_emit = 0
+        with dest.open(mode) as handle:
+            while True:
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                handle.write(chunk)
+                done += len(chunk)
+                if progress_stage and (done >= next_emit or done == total):
+                    percent = int(done * 100 / total) if total else -1
+                    emit("PROGRESS", progress_stage, done, total, percent, "Downloading")
+                    next_emit = done + 512 * 1024
+            if progress_stage:
+                percent = 100 if total and done >= total else -1
+                emit("PROGRESS", progress_stage, done, total, percent, "Download complete")
 
 
 def registry_site_root(index_url: str) -> str:
@@ -499,6 +550,7 @@ def plan(app_id: str) -> int:
 
 
 def verify_md5(path: Path, expected: str) -> None:
+    emit("PROGRESS", "verify", 0, 0, -1, "Verifying MD5")
     expected = expected.lower().strip()
     if len(expected) != 32:
         raise RuntimeError("download md5 is missing or invalid")
@@ -509,6 +561,7 @@ def verify_md5(path: Path, expected: str) -> None:
     actual = digest.hexdigest()
     if actual != expected:
         raise RuntimeError(f"md5 mismatch: expected {expected}, got {actual}")
+    emit("PROGRESS", "verify", 1, 1, 100, "MD5 verified")
 
 
 def deb_cache_path(url: str) -> Path:
@@ -534,9 +587,13 @@ def download_deb(app: dict[str, Any]) -> Path:
             verify_md5(dest, expected_md5)
             return dest
         except Exception:
-            dest.unlink(missing_ok=True)
-    download_file(url, dest)
-    verify_md5(dest, expected_md5)
+            pass
+    download_file(url, dest, progress_stage="download", resume=True)
+    try:
+        verify_md5(dest, expected_md5)
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
     return dest
 
 
@@ -585,12 +642,15 @@ def uninstall(app_id: str) -> int:
         return 1
     try:
         if shutil.which("apt-get"):
+            emit("PROGRESS", "uninstall", 0, 0, -1, "Removing package")
             run_package_command(["apt-get", "-y", "remove", package])
         elif shutil.which("dpkg"):
+            emit("PROGRESS", "uninstall", 0, 0, -1, "Removing package")
             run_package_command(["dpkg", "-r", package])
         else:
             raise RuntimeError("apt-get or dpkg is required to uninstall deb packages")
         write_json(installed_path(), records)
+        emit("PROGRESS", "uninstall", 1, 1, 100, "Remove complete")
         emit("UNINSTALLED", app_id)
         return 0
     except Exception as exc:
@@ -613,8 +673,10 @@ def install(app_id: str, reinstall: bool = False) -> int:
             if reinstall:
                 args.append("--reinstall")
             args += ["install", str(deb_path)]
+            emit("PROGRESS", "install", 0, 0, -1, "Installing package")
             run_package_command(args)
         elif shutil.which("dpkg"):
+            emit("PROGRESS", "install", 0, 0, -1, "Installing package")
             run_package_command(["dpkg", "-i", str(deb_path)])
         else:
             raise RuntimeError("apt-get or dpkg is required to install deb packages")
@@ -627,6 +689,7 @@ def install(app_id: str, reinstall: bool = False) -> int:
             "files": package_files(package),
         }
         write_json(installed_path(), records)
+        emit("PROGRESS", "install", 1, 1, 100, "Install complete")
         emit("INSTALLED", app_key(app), app.get("title") or app_key(app))
         return 0
     except Exception as exc:

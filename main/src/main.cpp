@@ -70,6 +70,7 @@ lv_indev_t *g_keyboard_indev = nullptr;
 lv_group_t *g_group = nullptr;
 lv_timer_t *g_refresh_timer = nullptr;
 lv_timer_t *g_esc_hold_timer = nullptr;
+lv_timer_t *g_job_timer = nullptr;
 volatile sig_atomic_t g_quit_requested = 0;
 
 std::string g_app_dir = ".";
@@ -91,6 +92,15 @@ std::vector<std::string> g_confirm_lines;
 std::string g_registry_input = "https://cardputerzero.github.io/generated/registry-index.json";
 std::string g_share_code_input;
 std::string g_share_code_message = "Enter a code from CardputerZero Hub.";
+bool g_job_running = false;
+std::string g_job_action;
+std::string g_job_title;
+std::string g_job_output_path;
+std::string g_job_rc_path;
+std::string g_job_stage;
+std::string g_job_detail;
+int g_job_progress = -1;
+uint32_t g_job_start_tick = 0;
 uint32_t g_share_code_open_tick = 0;
 uint32_t g_esc_press_tick = 0;
 bool g_esc_pressed = false;
@@ -156,6 +166,15 @@ std::string run_capture(const std::string &cmd)
     return output;
 }
 
+std::string read_text_file(const std::string &path)
+{
+    std::ifstream file(path);
+    if (!file) return "";
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+}
+
 std::string tsv_unescape(const std::string &value)
 {
     std::string out;
@@ -201,6 +220,13 @@ std::string one_line(std::string value, size_t max_len)
     return value;
 }
 
+std::string trim(std::string value)
+{
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
+    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
+    return value;
+}
+
 bool has_blocking_missing(const std::string &missing)
 {
     std::istringstream stream(missing);
@@ -218,6 +244,27 @@ std::string missing_install_message(const std::string &missing)
     if (missing.find("package-name") != std::string::npos) return "Deb package name is required";
     if (missing.find("package") != std::string::npos) return "Download URL is required";
     return "Install metadata is incomplete";
+}
+
+std::string job_action_label(const std::string &action)
+{
+    if (action == "uninstall") return "Uninstalling";
+    if (action == "reinstall") return "Reinstalling";
+    return "Installing";
+}
+
+void parse_job_progress(const std::string &out)
+{
+    std::istringstream stream(out);
+    std::string line;
+    while (std::getline(stream, line)) {
+        auto fields = split_tab(line);
+        if (fields.size() >= 6 && fields[0] == "PROGRESS") {
+            g_job_stage = fields[1];
+            g_job_progress = std::atoi(fields[4].c_str());
+            g_job_detail = fields[5];
+        }
+    }
 }
 
 std::string upper_ascii(std::string value)
@@ -708,7 +755,21 @@ void render_detail()
           &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
     label(g_root, one_line(app->description, 54), 10, 131, 300, 14,
           &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
-    if (app->installed) {
+    if (g_job_running) {
+        box(10, 144, 300, 5, 0x30363D, 0x30363D, 0);
+        if (g_job_progress >= 0) {
+            int fill = std::max(2, std::min(300, g_job_progress * 300 / 100));
+            box(10, 144, fill, 5, 0xCCCC33, 0xCCCC33, 0);
+        } else {
+            int offset = static_cast<int>((lv_tick_get() / 120) % 260);
+            box(10 + offset, 144, 40, 5, 0xCCCC33, 0xCCCC33, 0);
+        }
+        label(g_root, one_line(g_status_message.empty() ? "Working..." : g_status_message, 54),
+              10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+    } else if (!g_status_message.empty()) {
+        label(g_root, one_line(g_status_message, 54), 10, 153, 300, 12,
+              &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+    } else if (app->installed) {
         label(g_root, "R Run   U Uninstall   I Reinstall", 10, 153, 300, 12,
               &lv_font_montserrat_10, 0xCCCC33);
     } else {
@@ -798,6 +859,50 @@ void refresh_timer_cb(lv_timer_t *)
         refresh_summary();
         render();
     }
+}
+
+void finish_backend_job(const std::string &out, const std::string &rc_text)
+{
+    bool ok = trim(rc_text) == "0" && out.find("ERROR") == std::string::npos;
+    if (!ok) {
+        g_status_message = one_line(out.empty() ? "Operation failed" : out, 54);
+    } else if (g_job_action == "uninstall" || out.find("UNINSTALLED") != std::string::npos) {
+        g_status_message = "Uninstalled";
+    } else if (out.find("INSTALLED") != std::string::npos) {
+        g_status_message = "Installed. Return to launcher to test.";
+    } else {
+        g_status_message = "Done";
+    }
+    g_job_running = false;
+    g_job_progress = -1;
+    g_job_stage.clear();
+    g_job_detail.clear();
+    std::remove(g_job_output_path.c_str());
+    std::remove(g_job_rc_path.c_str());
+    refresh_summary();
+    g_screen = Screen::Detail;
+}
+
+void poll_backend_job()
+{
+    if (!g_job_running) return;
+    uint32_t elapsed = lv_tick_elaps(g_job_start_tick) / 1000;
+    std::string out = read_text_file(g_job_output_path);
+    parse_job_progress(out);
+    std::string detail = g_job_detail.empty() ? job_action_label(g_job_action) : g_job_detail;
+    if (g_job_progress >= 0) {
+        detail += " " + std::to_string(g_job_progress) + "%";
+    }
+    g_status_message = detail + " " + one_line(g_job_title, 16) + " " + std::to_string(elapsed) + "s";
+    if (!file_exists(g_job_rc_path)) return;
+    finish_backend_job(out, read_text_file(g_job_rc_path));
+}
+
+void job_timer_cb(lv_timer_t *)
+{
+    if (!g_job_running) return;
+    poll_backend_job();
+    render();
 }
 
 void navigate_back()
@@ -942,6 +1047,10 @@ void start_confirm(const std::string &action)
 {
     StoreApp *app = selected_app();
     if (!app) return;
+    if (g_job_running) {
+        g_status_message = "Operation already running";
+        return;
+    }
     g_confirm_action = action;
     if (action == "uninstall") {
         g_confirm_lines = {"Uninstall " + app->name, "Remove installed Debian package.", "Disk free: " + g_free_space};
@@ -956,25 +1065,49 @@ void start_confirm(const std::string &action)
     }
 }
 
+void start_backend_job(const std::string &action, StoreApp *app)
+{
+    if (!app) return;
+    if (g_job_running) {
+        g_status_message = "Operation already running";
+        return;
+    }
+    std::string flag = "--install";
+    if (action == "reinstall") flag = "--reinstall";
+    else if (action == "uninstall") flag = "--uninstall";
+
+    std::string stamp = std::to_string(static_cast<unsigned long long>(time(nullptr)));
+    std::string prefix = "/tmp/cardputerzero-appstore-" + stamp;
+    g_job_output_path = prefix + ".out";
+    g_job_rc_path = prefix + ".rc";
+    std::remove(g_job_output_path.c_str());
+    std::remove(g_job_rc_path.c_str());
+
+    std::string backend = backend_cmd(flag + " " + shell_quote(app->id));
+    std::string inner = "(" + backend + " > " + shell_quote(g_job_output_path) +
+                        " 2>&1; echo $? > " + shell_quote(g_job_rc_path) + ") & echo $!";
+    std::string pid_text = trim(run_capture("sh -c " + shell_quote(inner)));
+    if (pid_text.empty()) {
+        g_status_message = "Unable to start operation";
+        return;
+    }
+
+    g_job_running = true;
+    g_job_action = action;
+    g_job_title = app->name;
+    g_job_stage.clear();
+    g_job_detail.clear();
+    g_job_progress = -1;
+    g_job_start_tick = lv_tick_get();
+    g_status_message = job_action_label(action) + " " + one_line(app->name, 18) + "... 0s";
+    g_screen = Screen::Detail;
+}
+
 void execute_confirm()
 {
     StoreApp *app = selected_app();
     if (!app || g_confirm_action.empty()) return;
-    std::string flag = "--install";
-    if (g_confirm_action == "reinstall") flag = "--reinstall";
-    else if (g_confirm_action == "uninstall") flag = "--uninstall";
-    std::string out = run_capture(backend_cmd(flag + " " + shell_quote(app->id)));
-    if (out.find("ERROR") != std::string::npos) {
-        g_status_message = one_line(out, 44);
-    } else if (out.find("UNINSTALLED") != std::string::npos) {
-        g_status_message = "Uninstalled";
-    } else if (out.find("INSTALLED") != std::string::npos) {
-        g_status_message = "Installed. Return to launcher to test.";
-    } else {
-        g_status_message = one_line(out.empty() ? "Done" : out, 44);
-    }
-    refresh_summary();
-    g_screen = Screen::Detail;
+    start_backend_job(g_confirm_action, app);
 }
 
 void run_selected()
@@ -1272,6 +1405,7 @@ int main(int argc, char **argv)
     render();
     g_refresh_timer = lv_timer_create(refresh_timer_cb, 5000, nullptr);
     g_esc_hold_timer = lv_timer_create(esc_hold_timer_cb, 50, nullptr);
+    g_job_timer = lv_timer_create(job_timer_cb, 500, nullptr);
 
     while (!g_quit_requested) {
         lv_timer_handler();
@@ -1280,5 +1414,6 @@ int main(int argc, char **argv)
 
     if (g_esc_hold_timer) lv_timer_delete(g_esc_hold_timer);
     if (g_refresh_timer) lv_timer_delete(g_refresh_timer);
+    if (g_job_timer) lv_timer_delete(g_job_timer);
     return 0;
 }
