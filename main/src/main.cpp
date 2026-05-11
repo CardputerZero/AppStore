@@ -258,6 +258,11 @@ std::string missing_install_message(const std::string &missing)
     return "Install metadata is incomplete";
 }
 
+bool key_matches(const KeyEvent &key, char ch, uint32_t code)
+{
+    return key.ch == ch || key.code == code;
+}
+
 std::string job_action_label(const std::string &action)
 {
     if (action == "uninstall") return "Uninstalling";
@@ -1366,23 +1371,23 @@ void handle_key(const KeyEvent &key)
             break;
         case Screen::Detail: {
             StoreApp *app = selected_app();
-            if (key.ch == 'b') {
+            if (key_matches(key, 'b', KEY_B)) {
                 g_screen = Screen::Home;
-            } else if (app && key.ch == 'i') {
+            } else if (app && key_matches(key, 'i', KEY_I)) {
                 start_confirm(app->installed ? "reinstall" : "install");
-            } else if (app && app->installed && key.ch == 'u') {
+            } else if (app && app->installed && key_matches(key, 'u', KEY_U)) {
                 start_confirm("uninstall");
-            } else if (app && app->installed && key.ch == 'r') {
+            } else if (app && app->installed && key_matches(key, 'r', KEY_R)) {
                 run_selected();
             }
             break;
         }
         case Screen::Confirm:
-            if (key.ch == 'b' || key.ch == 'n') {
+            if (key_matches(key, 'b', KEY_B) || key_matches(key, 'n', KEY_N)) {
                 g_screen = Screen::Detail;
                 g_confirm_action.clear();
                 g_confirm_lines.clear();
-            } else if (key.ch == 'y') {
+            } else if (key_matches(key, 'y', KEY_Y)) {
                 execute_confirm();
             }
             break;
