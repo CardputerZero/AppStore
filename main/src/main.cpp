@@ -86,8 +86,10 @@ struct KeyEvent {
 
 enum class SortRule {
     Default,
-    Time,
-    Alphabet,
+    New,
+    Old,
+    AtoZ,
+    ZtoA,
 };
 
 lv_obj_t *g_root = nullptr;
@@ -384,10 +386,12 @@ std::string app_sort_name(const StoreApp &app)
 std::string sort_rule_label(SortRule rule)
 {
     switch (rule) {
-        case SortRule::Time: return "time";
-        case SortRule::Alphabet: return "alphabet";
+        case SortRule::New: return "new";
+        case SortRule::Old: return "old";
+        case SortRule::AtoZ: return "a-z";
+        case SortRule::ZtoA: return "z-a";
         case SortRule::Default:
-        default: return "default";
+        default: return "def";
     }
 }
 
@@ -403,13 +407,22 @@ void sort_apps(std::vector<StoreApp> &apps)
 {
     std::stable_sort(apps.begin(), apps.end(), [](const StoreApp &a, const StoreApp &b) {
         switch (g_sort_rule) {
-            case SortRule::Alphabet:
+            case SortRule::AtoZ:
                 return app_title_less(a, b);
-            case SortRule::Time:
+            case SortRule::ZtoA:
+                return app_title_less(b, a);
+            case SortRule::New:
                 if (a.updated_at != b.updated_at) {
                     if (a.updated_at.empty()) return false;
                     if (b.updated_at.empty()) return true;
                     return a.updated_at > b.updated_at;
+                }
+                return app_title_less(a, b);
+            case SortRule::Old:
+                if (a.updated_at != b.updated_at) {
+                    if (a.updated_at.empty()) return false;
+                    if (b.updated_at.empty()) return true;
+                    return a.updated_at < b.updated_at;
                 }
                 return app_title_less(a, b);
             case SortRule::Default:
@@ -937,13 +950,13 @@ void render_home()
                      &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
     }
     box(120, 154, 198, 14, 0x333333, 0x333333, 0);
-    strong_label(g_root, "ok:detail", 122, 155, 54, 12, &lv_font_montserrat_10,
+    strong_label(g_root, "ok : detail", 122, 155, 54, 12, &lv_font_montserrat_10,
                  0x43CF4D, LV_LABEL_LONG_DOT);
-    strong_label(g_root, "tab:sort", 176, 155, 50, 12, &lv_font_montserrat_10,
+    strong_label(g_root, "tab : sort", 176, 155, 52, 12, &lv_font_montserrat_10,
                  0x168CE5, LV_LABEL_LONG_DOT);
-    strong_label(g_root, sort_rule_label(g_sort_rule), 226, 155, 44, 12,
-                 &lv_font_montserrat_10, 0x8B8B8B, LV_LABEL_LONG_DOT);
-    strong_label(g_root, "r:reload", 272, 155, 46, 12, &lv_font_montserrat_10,
+    strong_label(g_root, "(" + sort_rule_label(g_sort_rule) + ")", 229, 155, 40, 12,
+                 &lv_font_montserrat_10, 0x168CE5, LV_LABEL_LONG_DOT);
+    strong_label(g_root, "r : reload", 270, 155, 48, 12, &lv_font_montserrat_10,
                  0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
@@ -1427,9 +1440,11 @@ void cycle_sort_rule()
     StoreApp *app = selected_app();
     std::string selected_id = app ? app->id : "";
     switch (g_sort_rule) {
-        case SortRule::Default: g_sort_rule = SortRule::Time; break;
-        case SortRule::Time: g_sort_rule = SortRule::Alphabet; break;
-        case SortRule::Alphabet: g_sort_rule = SortRule::Default; break;
+        case SortRule::Default: g_sort_rule = SortRule::New; break;
+        case SortRule::New: g_sort_rule = SortRule::Old; break;
+        case SortRule::Old: g_sort_rule = SortRule::AtoZ; break;
+        case SortRule::AtoZ: g_sort_rule = SortRule::ZtoA; break;
+        case SortRule::ZtoA: g_sort_rule = SortRule::Default; break;
     }
     sort_apps(g_apps);
     rebuild_visible();
