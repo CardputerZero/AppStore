@@ -782,10 +782,10 @@ bool draw_app_icon_image(const StoreApp &app)
     if (path.empty()) return false;
     g_render_image_sources.push_back(lvgl_posix_src(path));
 
-    constexpr int clip_x = 23;
-    constexpr int clip_y = 44;
-    constexpr int clip_w = 74;
-    constexpr int clip_h = 74;
+    constexpr int clip_x = 19;
+    constexpr int clip_y = 40;
+    constexpr int clip_w = 82;
+    constexpr int clip_h = 82;
     lv_obj_t *clip = lv_obj_create(g_root);
     lv_obj_remove_style_all(clip);
     lv_obj_set_pos(clip, clip_x, clip_y);
@@ -793,22 +793,21 @@ bool draw_app_icon_image(const StoreApp &app)
     lv_obj_clear_flag(clip, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_opa(clip, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(clip, 0, 0);
+    lv_obj_set_style_radius(clip, 14, 0);
+    lv_obj_set_style_clip_corner(clip, true, 0);
     lv_obj_set_style_pad_all(clip, 0, 0);
 
     lv_obj_t *icon = lv_image_create(clip);
+    lv_image_set_scale(icon, 210);
     lv_image_set_src(icon, g_render_image_sources.back().c_str());
     lv_obj_update_layout(icon);
 
     int icon_w = lv_obj_get_width(icon);
     int icon_h = lv_obj_get_height(icon);
-    if (icon_w <= 0 || icon_h <= 0) return true;
+    if (icon_w <= 0) icon_w = 100;
+    if (icon_h <= 0) icon_h = 100;
 
-    int scale = std::min(256, std::min(clip_w * 256 / icon_w, clip_h * 256 / icon_h));
-    if (scale <= 0) scale = 1;
-    lv_image_set_scale(icon, scale);
-    int scaled_w = (icon_w * scale + 255) / 256;
-    int scaled_h = (icon_h * scale + 255) / 256;
-    lv_obj_set_pos(icon, (clip_w - scaled_w) / 2, (clip_h - scaled_h) / 2);
+    lv_obj_set_pos(icon, (clip_w - icon_w) / 2, (clip_h - icon_h) / 2);
     return true;
 #else
     (void)app;
@@ -1153,7 +1152,7 @@ void render_registry_edit()
     box(0, 20, 320, 22, 0x1F6FEB, 0x1F6FEB, 0);
     label(g_root, g_registry_edit_url.empty() ? "Add Registry" : "Edit Registry",
           8, 24, 180, 15, &lv_font_montserrat_12, 0xFFFFFF);
-    label(g_root, "B Back", 270, 24, 44, 14, &lv_font_montserrat_10, 0xAECBFA);
+    label(g_root, "Esc Back", 258, 24, 56, 14, &lv_font_montserrat_10, 0xAECBFA);
 
     label(g_root, "NAME", 10, 46, 50, 12, &lv_font_montserrat_10,
           g_registry_focus == 0 ? 0xCCCC33 : 0x58A6FF);
@@ -1169,7 +1168,7 @@ void render_registry_edit()
 
     label(g_root, "Up/Down focus  Enter save", 10, 153, 166, 12,
           &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
-    label(g_root, "Backspace del  B back", 176, 153, 134, 12,
+    label(g_root, "Backspace del  Esc back", 176, 153, 134, 12,
           &lv_font_montserrat_10, 0x8B949E, LV_LABEL_LONG_DOT);
 }
 
@@ -1828,27 +1827,22 @@ void handle_key(const KeyEvent &key)
             break;
         case Screen::RegistryEdit: {
             std::string &field = g_registry_focus == 0 ? g_registry_name_input : g_registry_input;
-            if (key_matches(key, 'b', KEY_B)) {
-                g_screen = Screen::Registry;
-            } else if (key.code == KEY_UP || key.code == KEY_DOWN || key.code == KEY_F ||
-                       key.code == KEY_X || key.ch == 'f' || key.ch == 'x') {
-                g_registry_focus = 1 - g_registry_focus;
-            } else if ((key.code == KEY_LEFT || key.code == KEY_Z || key.ch == 'z' || key.ch == '<') &&
-                       !g_registry_edit_url.empty() && !g_registry_entries.empty()) {
-                g_registry_selected = g_registry_selected == 0 ?
-                    static_cast<int>(g_registry_entries.size()) - 1 : g_registry_selected - 1;
-                edit_selected_registry();
-            } else if ((key.code == KEY_RIGHT || key.code == KEY_C || key.ch == '>') &&
-                       !g_registry_edit_url.empty() && !g_registry_entries.empty()) {
-                g_registry_selected = (g_registry_selected + 1) % static_cast<int>(g_registry_entries.size());
-                edit_selected_registry();
-            } else if (key.code == KEY_BACKSPACE && !field.empty()) {
+            if (key.code == KEY_BACKSPACE && !field.empty()) {
                 field.pop_back();
             } else if (key.code == KEY_ENTER) {
                 add_registry_from_input();
             } else if (key.ch >= 32 && key.ch <= 126 &&
                        (g_registry_focus == 0 ? g_registry_name_input.size() < 48 : g_registry_input.size() < 180)) {
                 field.push_back(key.ch);
+            } else if (key.code == KEY_UP || key.code == KEY_DOWN) {
+                g_registry_focus = 1 - g_registry_focus;
+            } else if (key.code == KEY_LEFT && !g_registry_edit_url.empty() && !g_registry_entries.empty()) {
+                g_registry_selected = g_registry_selected == 0 ?
+                    static_cast<int>(g_registry_entries.size()) - 1 : g_registry_selected - 1;
+                edit_selected_registry();
+            } else if (key.code == KEY_RIGHT && !g_registry_edit_url.empty() && !g_registry_entries.empty()) {
+                g_registry_selected = (g_registry_selected + 1) % static_cast<int>(g_registry_entries.size());
+                edit_selected_registry();
             }
             break;
         }
