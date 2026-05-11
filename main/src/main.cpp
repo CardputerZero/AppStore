@@ -268,6 +268,24 @@ void parse_job_progress(const std::string &out)
     }
 }
 
+std::string backend_error_message(const std::string &out)
+{
+    std::string fallback;
+    std::istringstream stream(out);
+    std::string line;
+    while (std::getline(stream, line)) {
+        auto fields = split_tab(line);
+        if (fields.empty() || fields[0] == "PROGRESS") continue;
+        if (fields[0] == "ERROR") {
+            if (fields.size() >= 2 && !fields[1].empty()) return fields[1];
+            return "Operation failed";
+        }
+        if (!trim(line).empty()) fallback = line;
+    }
+    if (!fallback.empty()) return fallback;
+    return out.empty() ? "Operation failed" : out;
+}
+
 std::string upper_ascii(std::string value)
 {
     for (char &ch : value) {
@@ -899,7 +917,7 @@ void finish_backend_job(const std::string &out, const std::string &rc_text)
 {
     bool ok = trim(rc_text) == "0" && out.find("ERROR") == std::string::npos;
     if (!ok) {
-        g_status_message = one_line(out.empty() ? "Operation failed" : out, 54);
+        g_status_message = one_line(backend_error_message(out), 54);
     } else if (g_job_action == "uninstall" || out.find("UNINSTALLED") != std::string::npos) {
         g_status_message = "Uninstalled";
     } else if (out.find("INSTALLED") != std::string::npos) {

@@ -613,6 +613,20 @@ def run_package_command(args: list[str]) -> None:
         raise RuntimeError(command_error(result))
 
 
+def repair_dpkg_state() -> None:
+    if not shutil.which("dpkg"):
+        return
+    audit = subprocess.run(
+        ["dpkg", "--audit"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if (audit.stdout or audit.stderr).strip():
+        emit("PROGRESS", "apt", 0, 0, -1, "Repairing package database")
+        run_package_command(["dpkg", "--configure", "-a"])
+
+
 def package_files(package: str) -> list[str]:
     if not package or not shutil.which("dpkg-query"):
         return []
@@ -641,6 +655,7 @@ def uninstall(app_id: str) -> int:
         emit("ERROR", "deb package name missing", app_id)
         return 1
     try:
+        repair_dpkg_state()
         if shutil.which("apt-get"):
             emit("PROGRESS", "uninstall", 0, 0, -1, "Removing package")
             run_package_command(["apt-get", "-y", "remove", package])
@@ -668,6 +683,7 @@ def install(app_id: str, reinstall: bool = False) -> int:
         package = deb_package_name(app)
         if not package:
             raise RuntimeError("deb package name missing")
+        repair_dpkg_state()
         if shutil.which("apt-get"):
             args = ["apt-get", "-y"]
             if reinstall:
