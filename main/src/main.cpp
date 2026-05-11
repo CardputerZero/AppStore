@@ -86,6 +86,7 @@ lv_group_t *g_group = nullptr;
 lv_timer_t *g_refresh_timer = nullptr;
 lv_timer_t *g_esc_hold_timer = nullptr;
 lv_timer_t *g_job_timer = nullptr;
+lv_timer_t *g_sync_timer = nullptr;
 volatile sig_atomic_t g_quit_requested = 0;
 
 std::string g_app_dir = ".";
@@ -127,6 +128,11 @@ uint32_t g_share_code_open_tick = 0;
 uint32_t g_esc_press_tick = 0;
 bool g_esc_pressed = false;
 bool g_esc_long_consumed = false;
+pthread_mutex_t g_sync_mutex = PTHREAD_MUTEX_INITIALIZER;
+bool g_sync_running = false;
+bool g_sync_done = false;
+bool g_sync_refresh_registries = false;
+std::string g_sync_output;
 
 const char *getenv_default(const char *name, const char *fallback)
 {
@@ -1227,11 +1233,8 @@ void esc_hold_timer_cb(lv_timer_t *)
     }
 }
 
-void sync_catalog()
+void apply_sync_output(const std::string &out, bool refresh_registries_after)
 {
-    g_status_message = "Syncing catalog...";
-    render();
-    std::string out = run_capture(backend_cmd("--sync"));
     std::string message = sync_status_message(out);
     if (!message.empty()) {
         g_status_message = one_line(message, 54);
@@ -1241,6 +1244,65 @@ void sync_catalog()
         g_status_message.clear();
     }
     refresh_summary();
+    if (refresh_registries_after) refresh_registries();
+}
+
+void *sync_thread_main(void *)
+{
+    std::string out = run_capture(backend_cmd("--sync"));
+    pthread_mutex_lock(&g_sync_mutex);
+    g_sync_output = out;
+    g_sync_done = true;
+    g_sync_running = false;
+    pthread_mutex_unlock(&g_sync_mutex);
+    return nullptr;
+}
+
+void sync_catalog(bool refresh_registries_after = false)
+{
+    pthread_mutex_lock(&g_sync_mutex);
+    if (g_sync_running) {
+        pthread_mutex_unlock(&g_sync_mutex);
+        g_status_message = "Sync already running";
+        return;
+    }
+    g_sync_running = true;
+    g_sync_done = false;
+    g_sync_refresh_registries = refresh_registries_after;
+    g_sync_output.clear();
+    pthread_mutex_unlock(&g_sync_mutex);
+
+    g_status_message = "Syncing catalog...";
+    pthread_t thread_id;
+    if (pthread_create(&thread_id, nullptr, sync_thread_main, nullptr) != 0) {
+        pthread_mutex_lock(&g_sync_mutex);
+        g_sync_running = false;
+        g_sync_done = false;
+        pthread_mutex_unlock(&g_sync_mutex);
+        g_status_message = "Unable to start sync";
+        return;
+    }
+    pthread_detach(thread_id);
+}
+
+void sync_timer_cb(lv_timer_t *)
+{
+    std::string out;
+    bool done = false;
+    bool refresh_registries_after = false;
+    pthread_mutex_lock(&g_sync_mutex);
+    if (g_sync_done) {
+        done = true;
+        out = g_sync_output;
+        refresh_registries_after = g_sync_refresh_registries;
+        g_sync_done = false;
+        g_sync_output.clear();
+        g_sync_refresh_registries = false;
+    }
+    pthread_mutex_unlock(&g_sync_mutex);
+    if (!done) return;
+    apply_sync_output(out, refresh_registries_after);
+    render();
 }
 
 void open_registry_screen()
@@ -1539,8 +1601,7 @@ void handle_key(const KeyEvent &key)
             if (key.ch == 'b') {
                 g_screen = Screen::Home;
             } else if (key.ch == 'r') {
-                sync_catalog();
-                refresh_registries();
+                sync_catalog(true);
             } else if (key.ch == 'c') {
                 g_registry_input.clear();
             } else if (key.code == KEY_BACKSPACE && !g_registry_input.empty()) {
@@ -1743,6 +1804,9 @@ int main(int argc, char **argv)
     LV_EVENT_KEYBOARD = lv_event_register_id();
     lv_linux_indev_init();
     build_ui();
+    refresh_summary();
+    render();
+    g_sync_timer = lv_timer_create(sync_timer_cb, 200, nullptr);
     sync_catalog();
     render();
     g_refresh_timer = lv_timer_create(refresh_timer_cb, 5000, nullptr);
@@ -1757,5 +1821,6 @@ int main(int argc, char **argv)
     if (g_esc_hold_timer) lv_timer_delete(g_esc_hold_timer);
     if (g_refresh_timer) lv_timer_delete(g_refresh_timer);
     if (g_job_timer) lv_timer_delete(g_job_timer);
+    if (g_sync_timer) lv_timer_delete(g_sync_timer);
     return 0;
 }

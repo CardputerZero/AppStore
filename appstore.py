@@ -581,8 +581,8 @@ def free_space_text() -> str:
         return "-"
 
 
-def summary() -> None:
-    records = load_registry_records(sync_if_empty=True)
+def summary(sync_if_empty: bool = False) -> None:
+    records = load_registry_records(sync_if_empty=sync_if_empty)
     apps = merge_apps(records)
     ok = sum(1 for record in records if record.get("status") == "ok")
     cached = sum(1 for record in records if record.get("status") == "cached")
@@ -909,6 +909,7 @@ def remove_registry(url: str) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--summary", action="store_true")
+    parser.add_argument("--summary-sync-if-empty", action="store_true")
     parser.add_argument("--registries", action="store_true")
     parser.add_argument("--sync", action="store_true")
     parser.add_argument("--add-registry")
@@ -925,7 +926,7 @@ def main() -> int:
     ensure_dirs()
     args = parse_args()
     if args.summary:
-        summary()
+        summary(sync_if_empty=args.summary_sync_if_empty)
         return 0
     if args.registries:
         registries()
