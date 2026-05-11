@@ -53,6 +53,7 @@ struct StoreApp {
     std::string images;
     std::string dependencies;
     std::string registry_name;
+    std::string updated_at;
 };
 
 enum class Screen {
@@ -74,11 +75,9 @@ struct KeyEvent {
 };
 
 enum class SortRule {
-    Featured,
-    Name,
-    Category,
-    Installed,
-    Registry,
+    Default,
+    Time,
+    Alphabet,
 };
 
 lv_obj_t *g_root = nullptr;
@@ -104,7 +103,7 @@ int g_category = 0;
 int g_selected = 0;
 Screen g_screen = Screen::Home;
 bool g_default_category_applied = false;
-SortRule g_sort_rule = SortRule::Featured;
+SortRule g_sort_rule = SortRule::Default;
 std::string g_confirm_action;
 std::vector<std::string> g_confirm_lines;
 std::string g_loading_title;
@@ -365,12 +364,10 @@ std::string app_sort_name(const StoreApp &app)
 std::string sort_rule_label(SortRule rule)
 {
     switch (rule) {
-        case SortRule::Name: return "Name";
-        case SortRule::Category: return "Category";
-        case SortRule::Installed: return "Installed";
-        case SortRule::Registry: return "Registry";
-        case SortRule::Featured:
-        default: return "Featured";
+        case SortRule::Time: return "time";
+        case SortRule::Alphabet: return "alphabet";
+        case SortRule::Default:
+        default: return "default";
     }
 }
 
@@ -386,20 +383,16 @@ void sort_apps(std::vector<StoreApp> &apps)
 {
     std::stable_sort(apps.begin(), apps.end(), [](const StoreApp &a, const StoreApp &b) {
         switch (g_sort_rule) {
-            case SortRule::Name:
+            case SortRule::Alphabet:
                 return app_title_less(a, b);
-            case SortRule::Category:
-                if (match_key(a.category) != match_key(b.category)) return match_key(a.category) < match_key(b.category);
-                return app_title_less(a, b);
-            case SortRule::Installed:
-                if (a.installed != b.installed) return a.installed && !b.installed;
-                return app_title_less(a, b);
-            case SortRule::Registry:
-                if (match_key(a.registry_name) != match_key(b.registry_name)) {
-                    return match_key(a.registry_name) < match_key(b.registry_name);
+            case SortRule::Time:
+                if (a.updated_at != b.updated_at) {
+                    if (a.updated_at.empty()) return false;
+                    if (b.updated_at.empty()) return true;
+                    return a.updated_at > b.updated_at;
                 }
                 return app_title_less(a, b);
-            case SortRule::Featured:
+            case SortRule::Default:
             default:
                 if (a.recommended != b.recommended) return a.recommended && !b.recommended;
                 return app_title_less(a, b);
@@ -565,6 +558,7 @@ void refresh_summary()
             app.dependencies = fields[12];
             if (fields.size() >= 14) app.share_code = fields[13];
             if (fields.size() >= 15) app.registry_name = fields[14];
+            if (fields.size() >= 16) app.updated_at = fields[15];
             apps.push_back(app);
         }
     }
@@ -882,12 +876,11 @@ void render_home()
         strong_label(g_root, one_line(g_status_message, 29), 130, 155, 184, 12,
                      &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
     } else {
-        strong_label(g_root, "ok detail", 130, 155, 62, 12, &lv_font_montserrat_10,
+        strong_label(g_root, "ok:detail", 130, 155, 66, 12, &lv_font_montserrat_10,
                      0x43CF4D, LV_LABEL_LONG_DOT);
-        strong_label(g_root, "r reload", 196, 155, 60, 12, &lv_font_montserrat_10,
+        strong_label(g_root, ("tab:sort " + sort_rule_label(g_sort_rule)), 200, 155, 116, 12,
+                     &lv_font_montserrat_10,
                      0x168CE5, LV_LABEL_LONG_DOT);
-        strong_label(g_root, "s code", 260, 155, 50, 12, &lv_font_montserrat_10,
-                     0xCCCC33, LV_LABEL_LONG_DOT);
     }
 }
 
@@ -941,10 +934,10 @@ void render_detail()
         label(g_root, one_line(g_status_message, 54), 10, 153, 300, 12,
               &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
     } else if (app->installed) {
-        label(g_root, "R Run   U Uninstall   I Reinstall", 10, 153, 300, 12,
+        label(g_root, "R Run  U Uninstall  I Reinstall  B Back", 10, 153, 300, 12,
               &lv_font_montserrat_10, 0xCCCC33);
     } else {
-        label(g_root, "I Install", 10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33);
+        label(g_root, "I Install  B Back", 10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33);
     }
 }
 
@@ -1285,16 +1278,14 @@ void cycle_sort_rule()
     StoreApp *app = selected_app();
     std::string selected_id = app ? app->id : "";
     switch (g_sort_rule) {
-        case SortRule::Featured: g_sort_rule = SortRule::Name; break;
-        case SortRule::Name: g_sort_rule = SortRule::Category; break;
-        case SortRule::Category: g_sort_rule = SortRule::Installed; break;
-        case SortRule::Installed: g_sort_rule = SortRule::Registry; break;
-        case SortRule::Registry: g_sort_rule = SortRule::Featured; break;
+        case SortRule::Default: g_sort_rule = SortRule::Time; break;
+        case SortRule::Time: g_sort_rule = SortRule::Alphabet; break;
+        case SortRule::Alphabet: g_sort_rule = SortRule::Default; break;
     }
     sort_apps(g_apps);
     rebuild_visible();
     if (!select_visible_app_by_id(selected_id)) g_selected = 0;
-    g_status_message = "Sort: " + sort_rule_label(g_sort_rule);
+    g_status_message.clear();
 }
 
 void open_share_code_match()
@@ -1500,10 +1491,8 @@ void handle_key(const KeyEvent &key)
             } else if ((key.code == KEY_RIGHT || key.code == KEY_C || key.ch == 'c' || key.ch == '>') && !g_categories.empty()) {
                 g_category = (g_category + 1) % static_cast<int>(g_categories.size());
                 rebuild_visible();
-            } else if (key.code == KEY_TAB && (key.mods & KBD_MOD_CTRL)) {
+            } else if (key.code == KEY_TAB) {
                 cycle_sort_rule();
-            } else if (key.code == KEY_TAB && selected_app()) {
-                g_screen = Screen::Detail;
             } else if (key.code == KEY_ENTER && selected_app()) {
                 g_screen = Screen::Detail;
             } else if (key_matches(key, 'r', KEY_R)) {

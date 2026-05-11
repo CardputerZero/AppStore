@@ -632,6 +632,7 @@ def summary() -> None:
             dependencies_text(app),
             app.get("share_code") or "",
             app.get("_registry_name") or "",
+            app.get("updated_at") or app.get("published_at") or "",
         )
 
 
