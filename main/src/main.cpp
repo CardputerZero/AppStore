@@ -701,9 +701,22 @@ void draw_system_bar()
                         &lv_font_montserrat_14, 0xD7D7D7);
 
     box(247, 5, 31, 15, 0x333333, 0x333333, 0);
-    box(253, 16, 5, 3, 0x00BFFF, 0x00BFFF, 0);
-    box(261, 13, 5, 6, 0x00BFFF, 0x00BFFF, 0);
-    box(269, 10, 5, 9, 0x00BFFF, 0x00BFFF, 0);
+    bool sync_active = false;
+    pthread_mutex_lock(&g_sync_mutex);
+    sync_active = g_sync_running;
+    pthread_mutex_unlock(&g_sync_mutex);
+    if (sync_active) {
+        int phase = static_cast<int>((lv_tick_get() / 180) % 4);
+        uint32_t dim = 0x2B6B7A;
+        box(260, 7, 5, 3, phase == 0 ? 0x00D8FF : dim, phase == 0 ? 0x00D8FF : dim, 0);
+        box(268, 10, 3, 5, phase == 1 ? 0x00D8FF : dim, phase == 1 ? 0x00D8FF : dim, 0);
+        box(260, 17, 5, 3, phase == 2 ? 0x00D8FF : dim, phase == 2 ? 0x00D8FF : dim, 0);
+        box(252, 10, 3, 5, phase == 3 ? 0x00D8FF : dim, phase == 3 ? 0x00D8FF : dim, 0);
+    } else {
+        box(253, 16, 5, 3, 0x00BFFF, 0x00BFFF, 0);
+        box(261, 13, 5, 6, 0x00BFFF, 0x00BFFF, 0);
+        box(269, 10, 5, 9, 0x00BFFF, 0x00BFFF, 0);
+    }
 
     box(281, 5, 37, 15, 0x333333, 0x333333, 0);
     center_strong_label(g_root, "100%", 282, 6, 35, 13, &lv_font_montserrat_14, 0xD7D7D7);
@@ -1263,7 +1276,7 @@ void sync_catalog(bool refresh_registries_after = false)
     pthread_mutex_lock(&g_sync_mutex);
     if (g_sync_running) {
         pthread_mutex_unlock(&g_sync_mutex);
-        g_status_message = "Sync already running";
+        g_status_message.clear();
         return;
     }
     g_sync_running = true;
@@ -1272,7 +1285,7 @@ void sync_catalog(bool refresh_registries_after = false)
     g_sync_output.clear();
     pthread_mutex_unlock(&g_sync_mutex);
 
-    g_status_message = "Syncing catalog...";
+    g_status_message.clear();
     pthread_t thread_id;
     if (pthread_create(&thread_id, nullptr, sync_thread_main, nullptr) != 0) {
         pthread_mutex_lock(&g_sync_mutex);
@@ -1289,8 +1302,10 @@ void sync_timer_cb(lv_timer_t *)
 {
     std::string out;
     bool done = false;
+    bool running = false;
     bool refresh_registries_after = false;
     pthread_mutex_lock(&g_sync_mutex);
+    running = g_sync_running;
     if (g_sync_done) {
         done = true;
         out = g_sync_output;
@@ -1300,6 +1315,10 @@ void sync_timer_cb(lv_timer_t *)
         g_sync_refresh_registries = false;
     }
     pthread_mutex_unlock(&g_sync_mutex);
+    if (running) {
+        render();
+        return;
+    }
     if (!done) return;
     apply_sync_output(out, refresh_registries_after);
     render();
