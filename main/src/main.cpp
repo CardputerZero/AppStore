@@ -871,17 +871,16 @@ void render_home()
                      LV_LABEL_LONG_DOT);
     }
 
-    box(120, 154, 198, 14, 0x333333, 0x333333, 0);
     if (!g_status_message.empty()) {
-        strong_label(g_root, one_line(g_status_message, 29), 130, 155, 184, 12,
+        strong_label(g_root, one_line(g_status_message, 22), 122, 141, 156, 12,
                      &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
-    } else {
-        strong_label(g_root, "ok:detail", 130, 155, 66, 12, &lv_font_montserrat_10,
-                     0x43CF4D, LV_LABEL_LONG_DOT);
-        strong_label(g_root, ("tab:sort " + sort_rule_label(g_sort_rule)), 200, 155, 116, 12,
-                     &lv_font_montserrat_10,
-                     0x168CE5, LV_LABEL_LONG_DOT);
     }
+    box(120, 154, 198, 14, 0x333333, 0x333333, 0);
+    strong_label(g_root, "ok:detail", 130, 155, 66, 12, &lv_font_montserrat_10,
+                 0x43CF4D, LV_LABEL_LONG_DOT);
+    strong_label(g_root, ("tab:sort " + sort_rule_label(g_sort_rule)), 200, 155, 116, 12,
+                 &lv_font_montserrat_10,
+                 0x168CE5, LV_LABEL_LONG_DOT);
 }
 
 void render_detail()
