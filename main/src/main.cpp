@@ -1109,11 +1109,14 @@ void start_confirm(const std::string &action)
         g_screen = Screen::Confirm;
         return;
     }
+    g_status_message = "Checking install plan...";
+    render();
     std::string out = run_capture(backend_cmd("--plan " + shell_quote(app->id)));
     if (parse_plan(out)) {
+        g_status_message.clear();
         g_screen = Screen::Confirm;
     } else {
-        g_status_message = one_line(out.empty() ? "Plan failed" : out, 44);
+        g_status_message = one_line(backend_error_message(out), 44);
     }
 }
 
@@ -1153,6 +1156,7 @@ void start_backend_job(const std::string &action, StoreApp *app)
     g_job_start_tick = lv_tick_get();
     g_status_message = job_action_label(action) + " " + one_line(app->name, 18) + "... 0s";
     g_screen = Screen::Detail;
+    render();
 }
 
 void execute_confirm()

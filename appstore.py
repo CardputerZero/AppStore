@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -386,6 +387,96 @@ def desktop_path_for(app: dict[str, Any]) -> Path:
     return app_root() / "applications" / f"{slug}.desktop"
 
 
+def applaunch_exec(app: dict[str, Any]) -> str:
+    return str(applaunch_meta(app).get("exec") or "").strip()
+
+
+def exec_binary_path(exec_value: str) -> str:
+    try:
+        parts = shlex.split(exec_value)
+    except ValueError:
+        parts = exec_value.split()
+    if not parts:
+        return ""
+    command = parts[0]
+    if os.path.isabs(command):
+        return command
+    if "/" in command:
+        return str(app_root() / command)
+    return shutil.which(command) or ""
+
+
+def executable_exists(exec_value: str) -> bool:
+    binary = exec_binary_path(exec_value)
+    return bool(binary) and Path(binary).exists() and os.access(binary, os.X_OK)
+
+
+def package_installed(package: str) -> bool:
+    if not package or not shutil.which("dpkg-query"):
+        return False
+    try:
+        result = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Status}", package],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return "install ok installed" in result.stdout
+    except Exception:
+        return False
+
+
+def candidate_execs(app: dict[str, Any], files: list[str]) -> list[str]:
+    candidates = []
+    preferred = applaunch_exec(app)
+    if preferred:
+        candidates.append(preferred)
+    package = deb_package_name(app)
+    if package:
+        candidates += [
+            f"/usr/lib/{package}/{package}_zero_device",
+            f"/usr/bin/{package}",
+            f"/usr/lib/{package}/{package}",
+        ]
+    wanted_names = {
+        Path(exec_binary_path(preferred)).name if preferred else "",
+        package,
+        f"{package}_zero_device" if package else "",
+    }
+    for path in files:
+        p = Path(path)
+        if p.name in wanted_names:
+            candidates.append(path)
+    return list(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
+def rewrite_desktop_exec(desktop: Path, exec_value: str) -> None:
+    lines = desktop.read_text(encoding="utf-8", errors="ignore").splitlines()
+    replaced = False
+    out = []
+    for line in lines:
+        if line.startswith("Exec="):
+            out.append(f"Exec={exec_value}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"Exec={exec_value}")
+    desktop.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def repair_applaunch_desktop(app: dict[str, Any], files: list[str]) -> str:
+    desktop = desktop_path_for(app)
+    if not desktop.exists():
+        return ""
+    for exec_value in candidate_execs(app, files):
+        binary = exec_binary_path(exec_value)
+        if binary and Path(binary).exists() and os.access(binary, os.X_OK):
+            rewrite_desktop_exec(desktop, binary)
+            return binary
+    return ""
+
+
 def installed_records() -> dict[str, Any]:
     data = read_json(installed_path(), {})
     return data if isinstance(data, dict) else {}
@@ -394,34 +485,14 @@ def installed_records() -> dict[str, Any]:
 def is_installed(app: dict[str, Any]) -> bool:
     package = deb_package_name(app)
     if package and shutil.which("dpkg-query"):
-        try:
-            result = subprocess.run(
-                ["dpkg-query", "-W", "-f=${Status}", package],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if "install ok installed" in result.stdout:
-                return True
-        except Exception:
-            pass
+        return package_installed(package)
     key = app_key(app)
     records = installed_records()
     if key in records:
         record = records[key] if isinstance(records[key], dict) else {}
         package = record.get("package") if isinstance(record, dict) else ""
         if package and shutil.which("dpkg-query"):
-            try:
-                result = subprocess.run(
-                    ["dpkg-query", "-W", "-f=${Status}", str(package)],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-                if "install ok installed" in result.stdout:
-                    return True
-            except Exception:
-                pass
+            return package_installed(str(package))
         files = record.get("files", [])
         if any(Path(path).exists() for path in files):
             return True
@@ -697,12 +768,15 @@ def install(app_id: str, reinstall: bool = False) -> int:
         else:
             raise RuntimeError("apt-get or dpkg is required to install deb packages")
         records = installed_records()
+        files = package_files(package)
+        repaired_exec = repair_applaunch_desktop(app, files)
         records[app_key(app)] = {
             "installed_at": now_text(),
             "title": app.get("title"),
             "package": package,
             "deb_path": str(deb_path),
-            "files": package_files(package),
+            "exec": repaired_exec or applaunch_exec(app),
+            "files": files,
         }
         write_json(installed_path(), records)
         emit("PROGRESS", "install", 1, 1, 100, "Install complete")
@@ -722,6 +796,9 @@ def run_app(app_id: str) -> int:
     if not desktop.exists():
         emit("ERROR", "desktop entry missing", desktop)
         return 1
+    package = deb_package_name(app)
+    if package and package_installed(package):
+        repair_applaunch_desktop(app, package_files(package))
     exec_value = ""
     for line in desktop.read_text(encoding="utf-8", errors="ignore").splitlines():
         if line.startswith("Exec="):
@@ -730,7 +807,14 @@ def run_app(app_id: str) -> int:
     if not exec_value:
         emit("ERROR", "desktop Exec missing")
         return 1
-    subprocess.Popen(exec_value.split(), cwd=str(app_root()))
+    if not executable_exists(exec_value):
+        repaired = repair_applaunch_desktop(app, package_files(package) if package else [])
+        if repaired:
+            exec_value = repaired
+        else:
+            emit("ERROR", "desktop Exec target missing", exec_value)
+            return 1
+    subprocess.Popen(shlex.split(exec_value), cwd=str(app_root()))
     emit("RUNNING", app_id)
     return 0
 
