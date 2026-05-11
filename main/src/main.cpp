@@ -48,6 +48,7 @@ struct StoreApp {
     std::string git_url;
     std::string images;
     std::string dependencies;
+    std::string registry_name;
 };
 
 enum class Screen {
@@ -60,9 +61,18 @@ enum class Screen {
 
 struct KeyEvent {
     uint32_t code = 0;
+    uint32_t mods = 0;
     char ch = 0;
     bool release = false;
     bool repeated = false;
+};
+
+enum class SortRule {
+    Featured,
+    Name,
+    Category,
+    Installed,
+    Registry,
 };
 
 lv_obj_t *g_root = nullptr;
@@ -88,6 +98,7 @@ int g_category = 0;
 int g_selected = 0;
 Screen g_screen = Screen::Home;
 bool g_default_category_applied = false;
+SortRule g_sort_rule = SortRule::Featured;
 std::string g_confirm_action;
 std::vector<std::string> g_confirm_lines;
 std::string g_registry_input = "https://cardputerzero.github.io/generated/registry-index.json";
@@ -286,6 +297,23 @@ std::string backend_error_message(const std::string &out)
     return out.empty() ? "Operation failed" : out;
 }
 
+std::string sync_status_message(const std::string &out)
+{
+    std::string error;
+    std::istringstream stream(out);
+    std::string line;
+    while (std::getline(stream, line)) {
+        auto fields = split_tab(line);
+        if (fields.empty()) continue;
+        if (fields[0] == "ERROR" && fields.size() >= 2 && !fields[1].empty()) {
+            error = fields[1];
+        } else if (fields[0] == "SYNC" && fields.size() >= 6) {
+            if (!fields[5].empty()) return fields[5];
+        }
+    }
+    return error;
+}
+
 std::string upper_ascii(std::string value)
 {
     for (char &ch : value) {
@@ -311,6 +339,56 @@ std::string first_csv(std::string value)
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front()))) value.erase(value.begin());
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back()))) value.pop_back();
     return value;
+}
+
+std::string app_sort_name(const StoreApp &app)
+{
+    return match_key(app.name);
+}
+
+std::string sort_rule_label(SortRule rule)
+{
+    switch (rule) {
+        case SortRule::Name: return "Name";
+        case SortRule::Category: return "Category";
+        case SortRule::Installed: return "Installed";
+        case SortRule::Registry: return "Registry";
+        case SortRule::Featured:
+        default: return "Featured";
+    }
+}
+
+bool app_title_less(const StoreApp &a, const StoreApp &b)
+{
+    std::string an = app_sort_name(a);
+    std::string bn = app_sort_name(b);
+    if (an != bn) return an < bn;
+    return a.id < b.id;
+}
+
+void sort_apps(std::vector<StoreApp> &apps)
+{
+    std::stable_sort(apps.begin(), apps.end(), [](const StoreApp &a, const StoreApp &b) {
+        switch (g_sort_rule) {
+            case SortRule::Name:
+                return app_title_less(a, b);
+            case SortRule::Category:
+                if (match_key(a.category) != match_key(b.category)) return match_key(a.category) < match_key(b.category);
+                return app_title_less(a, b);
+            case SortRule::Installed:
+                if (a.installed != b.installed) return a.installed && !b.installed;
+                return app_title_less(a, b);
+            case SortRule::Registry:
+                if (match_key(a.registry_name) != match_key(b.registry_name)) {
+                    return match_key(a.registry_name) < match_key(b.registry_name);
+                }
+                return app_title_less(a, b);
+            case SortRule::Featured:
+            default:
+                if (a.recommended != b.recommended) return a.recommended && !b.recommended;
+                return app_title_less(a, b);
+        }
+    });
 }
 
 bool file_exists(const std::string &path)
@@ -418,24 +496,43 @@ StoreApp *selected_app()
     return &g_apps[g_visible[g_selected]];
 }
 
+bool select_visible_app_by_id(const std::string &app_id)
+{
+    if (app_id.empty()) return false;
+    for (int i = 0; i < static_cast<int>(g_visible.size()); ++i) {
+        if (g_apps[g_visible[i]].id == app_id) {
+            g_selected = i;
+            return true;
+        }
+    }
+    return false;
+}
+
 void refresh_summary()
 {
+    StoreApp *previous_app = selected_app();
+    std::string previous_app_id = previous_app ? previous_app->id : "";
     std::string previous_category = current_category_name();
     std::string output = run_capture(backend_cmd("--summary"));
     std::istringstream stream(output);
     std::string line;
     std::vector<StoreApp> apps;
     std::vector<std::string> cats;
+    std::string warning;
+    bool saw_meta = false;
 
     while (std::getline(stream, line)) {
         auto fields = split_tab(line);
         if (fields.empty()) continue;
         if (fields[0] == "META" && fields.size() >= 5) {
+            saw_meta = true;
             g_repo_status = fields[2];
             g_free_space = fields[3];
             g_root_path = fields[4];
         } else if (fields[0] == "CAT" && fields.size() >= 2) {
             cats.push_back(fields[1]);
+        } else if (fields[0] == "WARN" && fields.size() >= 2) {
+            warning = fields[1];
         } else if (fields[0] == "APP" && fields.size() >= 13) {
             StoreApp app;
             app.id = fields[1];
@@ -451,12 +548,14 @@ void refresh_summary()
             app.images = fields[11];
             app.dependencies = fields[12];
             if (fields.size() >= 14) app.share_code = fields[13];
+            if (fields.size() >= 15) app.registry_name = fields[14];
             apps.push_back(app);
         }
     }
 
+    if (!apps.empty()) sort_apps(apps);
     if (!cats.empty()) g_categories = cats;
-    if (!apps.empty()) g_apps = apps;
+    if (saw_meta) g_apps = apps;
     if (!g_default_category_applied) {
         select_default_category();
         g_default_category_applied = true;
@@ -467,6 +566,8 @@ void refresh_summary()
         select_default_category();
     }
     rebuild_visible();
+    select_visible_app_by_id(previous_app_id);
+    if (!warning.empty()) g_status_message = one_line(warning, 54);
 }
 
 void refresh_registries()
@@ -480,7 +581,11 @@ void refresh_registries()
         if (fields.size() >= 5 && fields[0] == "REG") {
             std::string item = fields[2] + "  " + fields[3] + " apps";
             if (!fields[4].empty()) item += "  " + fields[4].substr(5, 5);
-            item += "  " + fields[1];
+            if (fields.size() >= 6 && !fields[5].empty()) {
+                item += "  " + one_line(fields[5], 30);
+            } else {
+                item += "  " + fields[1];
+            }
             g_registry_lines.push_back(item);
         }
     }
@@ -834,16 +939,25 @@ void render_confirm()
     clean_root();
     draw_system_bar();
     box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
-    box(0, 20, 320, 22, 0x1F6FEB, 0x1F6FEB, 0);
-    label(g_root, "Confirm", 8, 24, 170, 15, &lv_font_montserrat_12, 0xFFFFFF);
-    label(g_root, "B Cancel", 264, 24, 50, 14, &lv_font_montserrat_10, 0xAECBFA);
-    int y = 51;
+
+    box(22, 37, 276, 105, 0x111923, 0x58A6FF, 2, 3, LV_OPA_COVER);
+    box(22, 37, 276, 23, 0x1F6FEB, 0x1F6FEB, 0);
+    center_strong_label(g_root, "CONFIRM ACTION", 42, 42, 236, 15, &lv_font_montserrat_12, 0xFFFFFF);
+
+    int y = 68;
     for (const auto &line : g_confirm_lines) {
-        label(g_root, one_line(line, 48), 10, y, 300, 13, &lv_font_montserrat_10, 0xE6EDF3);
-        y += 17;
-        if (y > 132) break;
+        label(g_root, one_line(line, 42), 35, y, 250, 12, &lv_font_montserrat_10, 0xE6EDF3,
+              LV_LABEL_LONG_DOT);
+        y += 14;
+        if (y > 109) break;
     }
-    label(g_root, "I Confirm", 10, 153, 120, 12, &lv_font_montserrat_10, 0xCCCC33);
+
+    box(54, 119, 84, 17, 0x1A6A2A, 0x2EA043, 1);
+    center_strong_label(g_root, "Y YES", 58, 122, 76, 12, &lv_font_montserrat_10, 0xFFFFFF);
+    box(182, 119, 84, 17, 0x4B1F24, 0xF85149, 1);
+    center_strong_label(g_root, "N NO", 186, 122, 76, 12, &lv_font_montserrat_10, 0xFFFFFF);
+    center_strong_label(g_root, "This will start the package operation.", 34, 149, 252, 12,
+                        &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
 void render_registry()
@@ -991,10 +1105,11 @@ void sync_catalog()
     g_status_message = "Syncing catalog...";
     render();
     std::string out = run_capture(backend_cmd("--sync"));
-    if (out.find("ERROR") != std::string::npos) {
-        g_status_message = one_line(out, 44);
+    std::string message = sync_status_message(out);
+    if (!message.empty()) {
+        g_status_message = one_line(message, 54);
     } else if (out.find("SYNC\t0") != std::string::npos) {
-        g_status_message = "Using built-in recommendations";
+        g_status_message = "No apps loaded";
     } else {
         g_status_message = "Catalog synced";
     }
@@ -1032,6 +1147,23 @@ bool select_app_index(int app_index)
         }
     }
     return false;
+}
+
+void cycle_sort_rule()
+{
+    StoreApp *app = selected_app();
+    std::string selected_id = app ? app->id : "";
+    switch (g_sort_rule) {
+        case SortRule::Featured: g_sort_rule = SortRule::Name; break;
+        case SortRule::Name: g_sort_rule = SortRule::Category; break;
+        case SortRule::Category: g_sort_rule = SortRule::Installed; break;
+        case SortRule::Installed: g_sort_rule = SortRule::Registry; break;
+        case SortRule::Registry: g_sort_rule = SortRule::Featured; break;
+    }
+    sort_apps(g_apps);
+    rebuild_visible();
+    if (!select_visible_app_by_id(selected_id)) g_selected = 0;
+    g_status_message = "Sort: " + sort_rule_label(g_sort_rule);
 }
 
 void open_share_code_match()
@@ -1215,6 +1347,8 @@ void handle_key(const KeyEvent &key)
             } else if ((key.code == KEY_RIGHT || key.code == KEY_C || key.ch == 'c' || key.ch == '>') && !g_categories.empty()) {
                 g_category = (g_category + 1) % static_cast<int>(g_categories.size());
                 rebuild_visible();
+            } else if (key.code == KEY_TAB && (key.mods & KBD_MOD_CTRL)) {
+                cycle_sort_rule();
             } else if (key.code == KEY_TAB && selected_app()) {
                 g_screen = Screen::Detail;
             } else if (key.code == KEY_ENTER && selected_app()) {
@@ -1244,9 +1378,11 @@ void handle_key(const KeyEvent &key)
             break;
         }
         case Screen::Confirm:
-            if (key.ch == 'b') {
+            if (key.ch == 'b' || key.ch == 'n') {
                 g_screen = Screen::Detail;
-            } else if (key.ch == 'i' || key.code == KEY_ENTER) {
+                g_confirm_action.clear();
+                g_confirm_lines.clear();
+            } else if (key.ch == 'y') {
                 execute_confirm();
             }
             break;
@@ -1298,6 +1434,7 @@ void handle_keyboard_event(lv_event_t *event)
     if (!item) return;
     KeyEvent key;
     key.code = item->key_code;
+    key.mods = item->mods;
     key.ch = lower_printable(item->utf8);
     key.release = item->key_state == KBD_KEY_RELEASED;
     key.repeated = item->key_state == KBD_KEY_REPEATED;
@@ -1457,7 +1594,7 @@ int main(int argc, char **argv)
     LV_EVENT_KEYBOARD = lv_event_register_id();
     lv_linux_indev_init();
     build_ui();
-    refresh_summary();
+    sync_catalog();
     render();
     g_refresh_timer = lv_timer_create(refresh_timer_cb, 5000, nullptr);
     g_esc_hold_timer = lv_timer_create(esc_hold_timer_cb, 50, nullptr);

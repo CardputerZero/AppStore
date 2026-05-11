@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -25,6 +26,7 @@ from typing import Any, Optional
 DEFAULT_INDEX_URL = "https://cardputerzero.github.io/generated/registry-index.json"
 DEFAULT_REGISTRY_NAME = "CardputerZero Hub"
 USER_AGENT = "CardputerZero-AppStore/0.1"
+CACHE_BUST_PARAM = "_cz_appstore_ts"
 
 
 def state_dir() -> Path:
@@ -135,8 +137,44 @@ def registry_name_from_url(url: str) -> str:
     return Path(parsed.path).stem or "Local Registry"
 
 
+def cache_busted_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return url
+    query = [(key, value) for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+             if key != CACHE_BUST_PARAM]
+    query.append((CACHE_BUST_PARAM, str(int(time.time() * 1000))))
+    return parsed._replace(query=urllib.parse.urlencode(query), fragment="").geturl()
+
+
+def clean_json_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme in {"http", "https", "file"}:
+        return parsed._replace(query="", fragment="").geturl()
+    return url
+
+
+def compact_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code} {exc.reason}"
+    if isinstance(exc, urllib.error.URLError):
+        return str(exc.reason)
+    return str(exc)
+
+
+def registry_error_message(url: str, exc: Exception) -> str:
+    name = Path(urllib.parse.urlparse(clean_json_url(url)).path).name or "registry"
+    return f"Unable to load {name}: {compact_error(exc)}"
+
+
 def request_json(url: str) -> Any:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    request = urllib.request.Request(cache_busted_url(url), headers=headers)
     with urllib.request.urlopen(request, timeout=15) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -199,19 +237,20 @@ def download_file(url: str, dest: Path, progress_stage: str = "", resume: bool =
 
 
 def registry_site_root(index_url: str) -> str:
-    parsed = urllib.parse.urlparse(index_url)
+    parsed = urllib.parse.urlparse(clean_json_url(index_url))
     if parsed.scheme in {"http", "https"} and "/generated/" in parsed.path:
         prefix = parsed.path.split("/generated/", 1)[0].rstrip("/") + "/"
         return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, prefix, "", "", ""))
-    return urllib.parse.urljoin(index_url, "./")
+    return urllib.parse.urljoin(clean_json_url(index_url), "./")
 
 
 def full_registry_url(index_url: str) -> str:
-    if index_url.endswith("/registry-index.json"):
-        return index_url[:-len("registry-index.json")] + "registry.json"
-    if index_url.endswith("/registry.json"):
-        return index_url
-    return urllib.parse.urljoin(index_url, "registry.json")
+    clean_url = clean_json_url(index_url)
+    if clean_url.endswith("/registry-index.json"):
+        return clean_url[:-len("registry-index.json")] + "registry.json"
+    if clean_url.endswith("/registry.json"):
+        return clean_url
+    return urllib.parse.urljoin(clean_url, "registry.json")
 
 
 def cache_file_for(url: str) -> Path:
@@ -267,12 +306,16 @@ def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
         write_json(cache_file_for(url), record)
     except Exception as exc:
         record["status"] = "error"
-        record["error"] = str(exc)
+        record["error"] = registry_error_message(url, exc)
+        record["last_attempt_at"] = now_text()
         cached = read_json(cache_file_for(url), {})
         if isinstance(cached, dict) and cached.get("index"):
             cached["status"] = "cached"
-            cached["error"] = str(exc)
+            cached["error"] = record["error"]
+            cached["last_attempt_at"] = record["last_attempt_at"]
+            write_json(cache_file_for(url), cached)
             return cached
+        write_json(cache_file_for(url), record)
     return record
 
 
@@ -292,7 +335,7 @@ def load_registry_records(sync_if_empty: bool = False) -> list[dict[str, Any]]:
         if not source.get("enabled", True):
             continue
         cached = read_json(cache_file_for(source["url"]), {})
-        if isinstance(cached, dict) and cached.get("index"):
+        if isinstance(cached, dict) and (cached.get("index") or cached.get("status") == "error"):
             records.append(cached)
     if not records and sync_if_empty:
         records = sync_all()
@@ -541,9 +584,24 @@ def free_space_text() -> str:
 def summary() -> None:
     records = load_registry_records(sync_if_empty=True)
     apps = merge_apps(records)
-    ok = sum(1 for record in records if record.get("status") in {"ok", "cached"})
-    status = f"{len(apps)} apps/{ok} registries"
+    ok = sum(1 for record in records if record.get("status") == "ok")
+    cached = sum(1 for record in records if record.get("status") == "cached")
+    failed = sum(1 for record in records if record.get("status") == "error")
+    usable = ok + cached
+    if failed and not apps:
+        status = "registry unavailable"
+    elif cached:
+        status = f"{len(apps)} apps/cache"
+    else:
+        status = f"{len(apps)} apps/{usable} registries"
     emit("META", 1, status, free_space_text(), app_root())
+    warning = ""
+    if failed:
+        warning = next((str(record.get("error") or "") for record in records if record.get("status") == "error"), "")
+    elif cached:
+        warning = "Registry offline; using cached catalog"
+    if warning:
+        emit("WARN", warning)
     categories = ["Recommended", "All"]
     for app in apps:
         for category in list_value(app.get("categories")):
@@ -573,6 +631,7 @@ def summary() -> None:
             icon,
             dependencies_text(app),
             app.get("share_code") or "",
+            app.get("_registry_name") or "",
         )
 
 
@@ -581,7 +640,14 @@ def registries() -> None:
     for source in load_config()["registries"]:
         record = records.get(source["url"], {})
         count = len(record.get("index", {}).get("apps", [])) if isinstance(record.get("index"), dict) else 0
-        emit("REG", source["url"], record.get("status") or "not synced", count, record.get("synced_at") or "")
+        emit(
+            "REG",
+            source["url"],
+            record.get("status") or "not synced",
+            count,
+            record.get("synced_at") or record.get("last_attempt_at") or "",
+            record.get("error") or "",
+        )
 
 
 def find_app(app_id: str) -> Optional[dict[str, Any]]:
@@ -865,10 +931,23 @@ def main() -> int:
         return 0
     if args.sync:
         records = sync_all()
-        ok = sum(1 for record in records if record.get("status") != "error")
+        ok = sum(1 for record in records if record.get("status") == "ok")
+        cached = sum(1 for record in records if record.get("status") == "cached")
+        failed = sum(1 for record in records if record.get("status") == "error")
+        usable = ok + cached
         apps = sum(len(record.get("index", {}).get("apps", [])) for record in records)
-        emit("SYNC", apps, f"{ok}/{len(records)} registries")
-        return 0 if ok else 1
+        if failed and not usable:
+            message = next((str(record.get("error") or "") for record in records if record.get("status") == "error"), "")
+        elif failed or cached:
+            message = "Registry offline; using cached catalog"
+        elif apps:
+            message = "Catalog synced"
+        else:
+            message = "No apps loaded"
+        emit("SYNC", apps, f"{usable}/{len(records)} registries", cached, failed, message)
+        if failed and not usable and message:
+            emit("ERROR", message)
+        return 0 if usable else 1
     if args.add_registry:
         return add_registry(args.add_registry)
     if args.remove_registry:

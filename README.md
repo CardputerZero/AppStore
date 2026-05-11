@@ -29,6 +29,12 @@ Default registry:
 https://cardputerzero.github.io/generated/registry-index.json
 ```
 
+AppStore performs a fresh registry sync when it starts. Registry HTTP requests
+send `Cache-Control: no-cache` and a timestamp query parameter so GitHub Pages
+or intermediate CDN cache does not hide newly published entries. If a registry
+cannot be loaded, the UI shows the load failure; if a previous catalog exists,
+AppStore keeps showing the cached app list and marks the registry as cached.
+
 ## Backend Commands
 
 ```bash
@@ -43,6 +49,12 @@ python3 appstore.py --run <app-id>
 ```
 
 `<app-id>` accepts either the app UUID or its `share_code` from registry metadata.
+
+Multiple registries are supported. Add another registry from the Registries
+screen or with `--add-registry`; enabled registries are synced and merged into
+one app list. Apps with the same UUID/share code are de-duplicated, with later
+registry metadata taking precedence. On the home screen, `Ctrl+Tab` cycles the
+display order through Featured, Name, Category, Installed, and Registry.
 
 Registry entries must provide a Debian package download:
 
