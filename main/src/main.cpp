@@ -60,6 +60,7 @@ enum class Screen {
     Detail,
     Confirm,
     Progress,
+    Loading,
     Registry,
     ShareCode,
 };
@@ -106,6 +107,8 @@ bool g_default_category_applied = false;
 SortRule g_sort_rule = SortRule::Featured;
 std::string g_confirm_action;
 std::vector<std::string> g_confirm_lines;
+std::string g_loading_title;
+std::string g_loading_detail;
 std::string g_registry_input = "https://cardputerzero.github.io/generated/registry-index.json";
 std::string g_share_code_input;
 std::string g_share_code_message = "Enter a code from CardputerZero Hub.";
@@ -879,14 +882,12 @@ void render_home()
         strong_label(g_root, one_line(g_status_message, 29), 130, 155, 184, 12,
                      &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
     } else {
-        strong_label(g_root, "tab detail", 130, 155, 67, 12, &lv_font_montserrat_10,
-                     0x168CE5, LV_LABEL_LONG_DOT);
-        strong_label(g_root, "s code", 200, 155, 44, 12, &lv_font_montserrat_10,
-                     0xCCCC33, LV_LABEL_LONG_DOT);
-        StoreApp *app = selected_app();
-        std::string action = app && app->installed ? "reinstall" : "download";
-        strong_label(g_root, "ok " + action, 247, 155, 68, 12, &lv_font_montserrat_10,
+        strong_label(g_root, "ok detail", 130, 155, 62, 12, &lv_font_montserrat_10,
                      0x43CF4D, LV_LABEL_LONG_DOT);
+        strong_label(g_root, "r reload", 196, 155, 60, 12, &lv_font_montserrat_10,
+                     0x168CE5, LV_LABEL_LONG_DOT);
+        strong_label(g_root, "s code", 260, 155, 50, 12, &lv_font_montserrat_10,
+                     0xCCCC33, LV_LABEL_LONG_DOT);
     }
 }
 
@@ -969,7 +970,9 @@ void render_confirm()
     center_strong_label(g_root, "Y YES", 58, 122, 76, 12, &lv_font_montserrat_10, 0xFFFFFF);
     box(182, 119, 84, 17, 0x4B1F24, 0xF85149, 1);
     center_strong_label(g_root, "N NO", 186, 122, 76, 12, &lv_font_montserrat_10, 0xFFFFFF);
-    center_strong_label(g_root, "This will start the package operation.", 34, 149, 252, 12,
+    std::string footer = g_confirm_action == "run" ? "This will leave AppStore and launch the app."
+                                                    : "This will start the package operation.";
+    center_strong_label(g_root, footer, 34, 149, 252, 12,
                         &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
@@ -1008,6 +1011,26 @@ void render_progress()
                         &lv_font_montserrat_10, 0x58A6FF, LV_LABEL_LONG_DOT);
     center_label(g_root, "Keep AppStore open until this finishes.", 18, 153, 284, 12,
                  &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+}
+
+void render_loading()
+{
+    clean_root();
+    draw_system_bar();
+    box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
+    box(0, 20, 320, 22, 0x1F6FEB, 0x1F6FEB, 0);
+    label(g_root, "Launching", 8, 24, 190, 15, &lv_font_montserrat_12, 0xFFFFFF);
+
+    center_strong_label(g_root, upper_ascii(g_loading_title.empty() ? "LOADING" : g_loading_title),
+                        32, 58, 256, 20, &lv_font_montserrat_14, 0xCCCC33, LV_LABEL_LONG_DOT);
+    center_strong_label(g_root, one_line(g_loading_detail.empty() ? "Starting app..." : g_loading_detail, 30),
+                        24, 84, 272, 16, &lv_font_montserrat_12, 0xE6EDF3, LV_LABEL_LONG_DOT);
+
+    box(70, 111, 180, 8, 0x30363D, 0x30363D, 0, 2);
+    int offset = static_cast<int>((lv_tick_get() / 80) % 132);
+    box(70 + offset, 111, 48, 8, 0xCCCC33, 0xCCCC33, 0, 2);
+    center_label(g_root, "Please wait...", 40, 138, 240, 12,
+                 &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
 }
 
 void render_registry()
@@ -1065,6 +1088,7 @@ void render()
         case Screen::Detail: render_detail(); break;
         case Screen::Confirm: render_confirm(); break;
         case Screen::Progress: render_progress(); break;
+        case Screen::Loading: render_loading(); break;
         case Screen::Registry: render_registry(); break;
         case Screen::ShareCode: render_share_code(); break;
     }
@@ -1185,6 +1209,9 @@ void navigate_back()
             } else {
                 g_screen = Screen::Detail;
             }
+            break;
+        case Screen::Loading:
+            g_status_message = "Launch in progress";
             break;
         case Screen::Registry:
             g_screen = Screen::Home;
@@ -1316,7 +1343,10 @@ bool parse_plan(const std::string &out)
         auto fields = split_tab(line);
         if (fields.size() >= 8 && fields[0] == "PLAN") {
             g_confirm_lines.clear();
-            g_confirm_lines.push_back((g_confirm_action == "uninstall" ? "Uninstall " : "Install ") + fields[2]);
+            std::string verb = "Install ";
+            if (g_confirm_action == "uninstall") verb = "Uninstall ";
+            else if (g_confirm_action == "reinstall") verb = "Reinstall ";
+            g_confirm_lines.push_back(verb + fields[2]);
             g_confirm_lines.push_back("Download/app size: " + fields[4]);
             g_confirm_lines.push_back("Disk free: " + fields[5]);
             g_confirm_lines.push_back("Dependencies: " + (fields[6].empty() ? "-" : fields[6]));
@@ -1340,6 +1370,15 @@ void start_confirm(const std::string &action)
         return;
     }
     g_confirm_action = action;
+    if (action == "run") {
+        if (!app->installed) {
+            g_status_message = "Install this app before running";
+            return;
+        }
+        g_confirm_lines = {"Run " + app->name, "Leave AppStore and launch the app.", "Use Esc in app to return."};
+        g_screen = Screen::Confirm;
+        return;
+    }
     if (action == "uninstall") {
         g_confirm_lines = {"Uninstall " + app->name, "Remove installed Debian package.", "Disk free: " + g_free_space};
         g_screen = Screen::Confirm;
@@ -1388,6 +1427,8 @@ void start_backend_job(const std::string &action, StoreApp *app)
     lv_refr_now(nullptr);
 }
 
+void run_selected();
+
 void execute_confirm()
 {
     StoreApp *app = selected_app();
@@ -1395,6 +1436,10 @@ void execute_confirm()
     std::string action = g_confirm_action;
     g_confirm_action.clear();
     g_confirm_lines.clear();
+    if (action == "run") {
+        run_selected();
+        return;
+    }
     start_backend_job(action, app);
 }
 
@@ -1402,12 +1447,20 @@ void run_selected()
 {
     StoreApp *app = selected_app();
     if (!app) return;
+    g_loading_title = "Launching";
+    g_loading_detail = app->name;
+    g_status_message.clear();
+    g_screen = Screen::Loading;
+    render();
+    lv_refr_now(nullptr);
+
     std::string out = run_capture(backend_cmd("--run " + shell_quote(app->id)));
     if (out.find("RUNNING") != std::string::npos) {
         g_status_message = "Launched app";
         request_quit();
     } else {
         g_status_message = one_line(out.empty() ? "Run failed" : out, 44);
+        g_screen = Screen::Detail;
     }
 }
 
@@ -1452,9 +1505,8 @@ void handle_key(const KeyEvent &key)
             } else if (key.code == KEY_TAB && selected_app()) {
                 g_screen = Screen::Detail;
             } else if (key.code == KEY_ENTER && selected_app()) {
-                StoreApp *app = selected_app();
-                start_confirm(app && app->installed ? "reinstall" : "install");
-            } else if (key.ch == 'r') {
+                g_screen = Screen::Detail;
+            } else if (key_matches(key, 'r', KEY_R)) {
                 sync_catalog();
             } else if (key.ch == 'a') {
                 open_registry_screen();
@@ -1473,7 +1525,7 @@ void handle_key(const KeyEvent &key)
             } else if (app && app->installed && key_matches(key, 'u', KEY_U)) {
                 start_confirm("uninstall");
             } else if (app && app->installed && key_matches(key, 'r', KEY_R)) {
-                run_selected();
+                start_confirm("run");
             }
             break;
         }
