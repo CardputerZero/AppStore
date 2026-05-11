@@ -356,6 +356,21 @@ def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+def validated_registry_record(name: str, url: str) -> tuple[str, dict[str, Any], int]:
+    normalized = normalize_registry_url(url)
+    if not name.strip():
+        raise ValueError("registry name is required")
+    if not normalized:
+        raise ValueError("registry URL is required")
+    record = sync_one_registry({"name": name.strip(), "url": normalized, "enabled": True})
+    if record.get("status") == "error":
+        raise ValueError(str(record.get("error") or "registry unavailable"))
+    index = record.get("index")
+    if not isinstance(index, dict) or not isinstance(index.get("apps"), list):
+        raise ValueError("invalid registry: apps array missing")
+    return normalized, record, len(index.get("apps", []))
+
+
 def sync_all() -> list[dict[str, Any]]:
     config = load_config()
     records = []
@@ -925,15 +940,22 @@ def run_app(app_id: str) -> int:
     return 0
 
 
-def add_registry(url: str) -> int:
+def add_registry(url: str, name: str = "") -> int:
     config = load_config()
     normalized = normalize_registry_url(url)
-    if all(item["url"] != normalized for item in config["registries"]):
-        config["registries"].append({"name": registry_name_from_url(normalized), "url": normalized, "enabled": True})
-        save_config(config)
-    record = sync_one_registry({"name": registry_name_from_url(normalized), "url": normalized, "enabled": True})
-    emit("REGISTRY", "ADDED", normalized, record.get("status"), len(record.get("index", {}).get("apps", [])))
-    return 0 if record.get("status") != "error" else 1
+    if any(item["url"] == normalized for item in config["registries"]):
+        emit("ERROR", "registry already exists", normalized)
+        return 1
+    try:
+        final_name = name.strip() or registry_name_from_url(normalized)
+        normalized, record, app_count = validated_registry_record(final_name, normalized)
+    except Exception as exc:
+        emit("ERROR", str(exc), normalized)
+        return 1
+    config["registries"].append({"name": final_name, "url": normalized, "enabled": True})
+    save_config(config)
+    emit("REGISTRY", "ADDED", normalized, record.get("status"), app_count, final_name)
+    return 0
 
 
 def remove_registry(url: str) -> int:
@@ -958,17 +980,23 @@ def set_registry_enabled(url: str, enabled: bool) -> int:
     return 1
 
 
-def edit_registry(old_url: str, new_url: str) -> int:
+def edit_registry(old_url: str, new_url: str, name: str = "") -> int:
     config = load_config()
     old_normalized = normalize_registry_url(old_url)
     new_normalized = normalize_registry_url(new_url)
     updated = False
     rewritten = []
+    final_name = name.strip() or registry_name_from_url(new_normalized)
+    try:
+        new_normalized, record, app_count = validated_registry_record(final_name, new_normalized)
+    except Exception as exc:
+        emit("ERROR", str(exc), new_normalized)
+        return 1
     for item in config["registries"]:
         if item["url"] == old_normalized:
             item = dict(item)
             item["url"] = new_normalized
-            item["name"] = registry_name_from_url(new_normalized)
+            item["name"] = final_name
             updated = True
         if all(existing["url"] != item["url"] for existing in rewritten):
             rewritten.append(item)
@@ -977,7 +1005,7 @@ def edit_registry(old_url: str, new_url: str) -> int:
         return 1
     config["registries"] = rewritten
     save_config(config)
-    emit("REGISTRY", "UPDATED", old_normalized, new_normalized)
+    emit("REGISTRY", "UPDATED", old_normalized, new_normalized, record.get("status"), app_count, final_name)
     return 0
 
 
@@ -988,6 +1016,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--registries", action="store_true")
     parser.add_argument("--sync", action="store_true")
     parser.add_argument("--add-registry")
+    parser.add_argument("--registry-name")
     parser.add_argument("--remove-registry")
     parser.add_argument("--enable-registry")
     parser.add_argument("--disable-registry")
@@ -1029,7 +1058,7 @@ def main() -> int:
             emit("ERROR", message)
         return 0 if usable else 1
     if args.add_registry:
-        return add_registry(args.add_registry)
+        return add_registry(args.add_registry, args.registry_name or "")
     if args.remove_registry:
         return remove_registry(args.remove_registry)
     if args.enable_registry:
@@ -1037,7 +1066,7 @@ def main() -> int:
     if args.disable_registry:
         return set_registry_enabled(args.disable_registry, False)
     if args.edit_registry:
-        return edit_registry(args.edit_registry[0], args.edit_registry[1])
+        return edit_registry(args.edit_registry[0], args.edit_registry[1], args.registry_name or "")
     if args.plan:
         return plan(args.plan)
     if args.install:

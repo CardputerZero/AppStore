@@ -73,6 +73,7 @@ enum class Screen {
     Progress,
     Loading,
     Registry,
+    RegistryEdit,
     ShareCode,
 };
 
@@ -125,6 +126,8 @@ std::string g_loading_title;
 std::string g_loading_detail;
 std::string g_registry_input = "https://cardputerzero.github.io/generated/registry-index.json";
 std::string g_registry_edit_url;
+std::string g_registry_name_input;
+int g_registry_focus = 0;
 std::string g_share_code_input;
 std::string g_share_code_message = "Enter a code from CardputerZero Hub.";
 bool g_job_running = false;
@@ -1111,43 +1114,63 @@ void render_registry()
     label(g_root, "Registries", 8, 24, 180, 15, &lv_font_montserrat_12, 0xFFFFFF);
     label(g_root, "B Back", 270, 24, 44, 14, &lv_font_montserrat_10, 0xAECBFA);
 
-    label(g_root, "URL", 10, 48, 28, 12, &lv_font_montserrat_10, 0x58A6FF);
-    box(39, 45, 270, 20, 0x111923, 0x2A3A46, 1, 0);
-    label(g_root, one_line(g_registry_input, 42), 44, 49, 260, 12, &lv_font_montserrat_10, 0xE6EDF3,
-          LV_LABEL_LONG_DOT);
-
-    int y = 70;
-    int first = std::max(0, g_registry_selected - 1);
-    if (first + 2 >= static_cast<int>(g_registry_entries.size())) {
-        first = std::max(0, static_cast<int>(g_registry_entries.size()) - 3);
-    }
-    for (int i = first; i < static_cast<int>(g_registry_entries.size()) && y <= 126; ++i) {
-        const RegistryEntry &entry = g_registry_entries[i];
-        bool selected = i == g_registry_selected;
-        uint32_t title_color = selected ? 0xFFFFFF : 0xB8B8B8;
-        uint32_t state_color = entry.enabled ? 0x43CF4D : 0x6E7681;
-        strong_label(g_root, selected ? ">" : " ", 8, y, 10, 12, &lv_font_montserrat_10,
-                     selected ? 0xCCCC33 : 0x6E7681, LV_LABEL_LONG_DOT);
-        label(g_root, one_line(entry.name, 21), 20, y, 124, 12, &lv_font_montserrat_10,
-              title_color, LV_LABEL_LONG_DOT);
-        label(g_root, entry.enabled ? "on" : "off", 148, y, 22, 12, &lv_font_montserrat_10,
-              state_color, LV_LABEL_LONG_DOT);
-        label(g_root, one_line(entry.status + " " + entry.count + " apps", 24), 174, y, 136, 12,
-              &lv_font_montserrat_10, 0x58A6FF, LV_LABEL_LONG_DOT);
-        std::string detail = entry.error.empty() ? entry.url : entry.error;
-        label(g_root, one_line(detail, 48), 20, y + 12, 290, 12, &lv_font_montserrat_10,
-              entry.error.empty() ? 0x8B949E : 0xF85149, LV_LABEL_LONG_DOT);
-        y += 26;
-    }
     if (g_registry_entries.empty()) {
-        label(g_root, "No registries. Enter adds current URL.", 10, 78, 300, 12,
+        label(g_root, "No registries configured.", 10, 68, 300, 14,
               &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
+    } else {
+        const RegistryEntry &entry = g_registry_entries[g_registry_selected];
+        center_label(g_root, std::to_string(g_registry_selected + 1) + "/" +
+                     std::to_string(g_registry_entries.size()), 132, 45, 56, 12,
+                     &lv_font_montserrat_10, 0x8B949E, LV_LABEL_LONG_DOT);
+        strong_label(g_root, "<", 8, 78, 12, 18, &lv_font_montserrat_20, 0xFF6A3D);
+        strong_label(g_root, ">", 303, 78, 12, 18, &lv_font_montserrat_20, 0xFF6A3D);
+        label(g_root, "NAME", 24, 48, 34, 12, &lv_font_montserrat_10, 0x58A6FF);
+        strong_label(g_root, one_line(entry.name, 28), 24, 61, 210, 16,
+                     &lv_font_montserrat_12, 0xFFFFFF, LV_LABEL_LONG_DOT);
+        label(g_root, entry.enabled ? "on" : "off", 242, 61, 28, 12, &lv_font_montserrat_10,
+              entry.enabled ? 0x43CF4D : 0x6E7681, LV_LABEL_LONG_DOT);
+        label(g_root, entry.count + " apps", 272, 61, 42, 12, &lv_font_montserrat_10,
+              0xCCCC33, LV_LABEL_LONG_DOT);
+        label(g_root, "URL", 24, 82, 34, 12, &lv_font_montserrat_10, 0x58A6FF);
+        box(24, 96, 272, 38, 0x111923, 0x2A3A46, 1, 2);
+        label(g_root, entry.url, 30, 100, 260, 30, &lv_font_montserrat_10, 0xE6EDF3,
+              LV_LABEL_LONG_WRAP);
+        if (!entry.error.empty()) {
+            label(g_root, one_line(entry.error, 45), 24, 136, 272, 12, &lv_font_montserrat_10,
+                  0xF85149, LV_LABEL_LONG_DOT);
+        }
     }
 
-    std::string footer = g_registry_edit_url.empty() ?
-                         "Enter add  T on/off  E edit  D del  R sync" :
-                         "Enter save  C cancel  B back";
-    label(g_root, footer, 10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+    label(g_root, "A add  E edit  T on/off  D del  R sync", 10, 153, 300, 12,
+          &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+}
+
+void render_registry_edit()
+{
+    clean_root();
+    draw_system_bar();
+    box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
+    box(0, 20, 320, 22, 0x1F6FEB, 0x1F6FEB, 0);
+    label(g_root, g_registry_edit_url.empty() ? "Add Registry" : "Edit Registry",
+          8, 24, 180, 15, &lv_font_montserrat_12, 0xFFFFFF);
+    label(g_root, "B Back", 270, 24, 44, 14, &lv_font_montserrat_10, 0xAECBFA);
+
+    label(g_root, "NAME", 10, 46, 50, 12, &lv_font_montserrat_10,
+          g_registry_focus == 0 ? 0xCCCC33 : 0x58A6FF);
+    box(10, 59, 300, 24, 0x111923, g_registry_focus == 0 ? 0xCCCC33 : 0x2A3A46, 1, 2);
+    label(g_root, one_line(g_registry_name_input, 34), 16, 64, 288, 14,
+          &lv_font_montserrat_12, 0xE6EDF3, LV_LABEL_LONG_DOT);
+
+    label(g_root, "URL", 10, 88, 50, 12, &lv_font_montserrat_10,
+          g_registry_focus == 1 ? 0xCCCC33 : 0x58A6FF);
+    box(10, 101, 300, 42, 0x111923, g_registry_focus == 1 ? 0xCCCC33 : 0x2A3A46, 1, 2);
+    label(g_root, g_registry_input, 16, 105, 288, 34, &lv_font_montserrat_12,
+          0xE6EDF3, LV_LABEL_LONG_WRAP);
+
+    label(g_root, "Up/Down focus  Enter save", 10, 153, 166, 12,
+          &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+    label(g_root, "C clear  B back", 188, 153, 122, 12,
+          &lv_font_montserrat_10, 0x8B949E, LV_LABEL_LONG_DOT);
 }
 
 void render_share_code()
@@ -1183,6 +1206,7 @@ void render()
         case Screen::Progress: render_progress(); break;
         case Screen::Loading: render_loading(); break;
         case Screen::Registry: render_registry(); break;
+        case Screen::RegistryEdit: render_registry_edit(); break;
         case Screen::ShareCode: render_share_code(); break;
     }
 }
@@ -1309,6 +1333,9 @@ void navigate_back()
         case Screen::Registry:
             g_screen = Screen::Home;
             break;
+        case Screen::RegistryEdit:
+            g_screen = Screen::Registry;
+            break;
         case Screen::ShareCode:
             g_screen = Screen::Home;
             break;
@@ -1408,6 +1435,16 @@ void open_registry_screen()
     g_screen = Screen::Registry;
 }
 
+void open_registry_add_screen()
+{
+    g_registry_edit_url.clear();
+    g_registry_name_input.clear();
+    g_registry_input = "https://cardputerzero.github.io/generated/registry-index.json";
+    g_registry_focus = 0;
+    g_status_message.clear();
+    g_screen = Screen::RegistryEdit;
+}
+
 void open_share_code_screen()
 {
     g_share_code_input.clear();
@@ -1483,18 +1520,35 @@ RegistryEntry *selected_registry()
 
 void add_registry_from_input()
 {
-    if (g_registry_input.empty()) return;
+    if (g_registry_name_input.empty() || g_registry_input.empty()) {
+        g_status_message = "Name and URL required";
+        return;
+    }
     bool editing = !g_registry_edit_url.empty();
     g_status_message = editing ? "Updating registry..." : "Adding registry...";
     render();
     std::string out = editing ?
-        run_capture(backend_cmd("--edit-registry " + shell_quote(g_registry_edit_url) + " " + shell_quote(g_registry_input))) :
-        run_capture(backend_cmd("--add-registry " + shell_quote(g_registry_input)));
+        run_capture(backend_cmd("--edit-registry " + shell_quote(g_registry_edit_url) + " " +
+                                shell_quote(g_registry_input) + " --registry-name " + shell_quote(g_registry_name_input))) :
+        run_capture(backend_cmd("--add-registry " + shell_quote(g_registry_input) +
+                                " --registry-name " + shell_quote(g_registry_name_input)));
     if (out.find("ERROR") != std::string::npos) {
-        g_status_message = one_line(out, 44);
+        g_status_message = one_line(backend_error_message(out), 54);
     } else {
-        g_status_message = editing ? "Registry updated" : "Registry added";
+        std::string count = "";
+        std::istringstream stream(out);
+        std::string line;
+        while (std::getline(stream, line)) {
+            auto fields = split_tab(line);
+            if (fields.size() >= 5 && fields[0] == "REGISTRY") {
+                count = fields[1] == "UPDATED" && fields.size() >= 6 ? fields[5] : fields[4];
+                break;
+            }
+        }
+        g_status_message = (editing ? "Registry updated" : "Registry added") +
+                           (count.empty() ? std::string() : " (" + count + " apps)");
         g_registry_edit_url.clear();
+        g_screen = Screen::Registry;
     }
     refresh_registries();
     sync_catalog(true);
@@ -1538,7 +1592,10 @@ void edit_selected_registry()
     if (!entry) return;
     g_registry_edit_url = entry->url;
     g_registry_input = entry->url;
-    g_status_message = "Edit URL then Enter";
+    g_registry_name_input = entry->name;
+    g_registry_focus = 0;
+    g_status_message.clear();
+    g_screen = Screen::RegistryEdit;
 }
 
 bool parse_plan(const std::string &out)
@@ -1712,11 +1769,11 @@ void handle_key(const KeyEvent &key)
                 g_screen = Screen::Detail;
             } else if (key_matches(key, 'r', KEY_R)) {
                 sync_catalog();
-            } else if (key.ch == 'a') {
+            } else if (key_matches(key, 'a', KEY_A)) {
                 open_registry_screen();
-            } else if (key.ch == 's') {
+            } else if (key_matches(key, 's', KEY_S)) {
                 open_share_code_screen();
-            } else if (key.ch == 'q') {
+            } else if (key_matches(key, 'q', KEY_Q)) {
                 request_quit();
             }
             break;
@@ -1748,32 +1805,55 @@ void handle_key(const KeyEvent &key)
             }
             break;
         case Screen::Registry:
-            if (key.ch == 'b') {
+            if (key_matches(key, 'b', KEY_B)) {
                 g_screen = Screen::Home;
-            } else if ((key.code == KEY_UP || key.code == KEY_F || key.ch == 'f') && !g_registry_entries.empty()) {
+            } else if (key_matches(key, 'a', KEY_A)) {
+                open_registry_add_screen();
+            } else if ((key.code == KEY_LEFT || key.code == KEY_Z || key.ch == 'z' || key.ch == '<') && !g_registry_entries.empty()) {
                 g_registry_selected = g_registry_selected == 0 ?
                     static_cast<int>(g_registry_entries.size()) - 1 : g_registry_selected - 1;
-            } else if ((key.code == KEY_DOWN || key.code == KEY_X || key.ch == 'x') && !g_registry_entries.empty()) {
+            } else if ((key.code == KEY_RIGHT || key.code == KEY_C || key.ch == 'c' || key.ch == '>') && !g_registry_entries.empty()) {
                 g_registry_selected = (g_registry_selected + 1) % static_cast<int>(g_registry_entries.size());
-            } else if (key.ch == 'r') {
+            } else if (key_matches(key, 'r', KEY_R)) {
                 sync_catalog(true);
-            } else if (key.ch == 't') {
+            } else if (key_matches(key, 't', KEY_T)) {
                 toggle_selected_registry();
-            } else if (key.ch == 'd') {
+            } else if (key_matches(key, 'd', KEY_D)) {
                 delete_selected_registry();
-            } else if (key.ch == 'e') {
+            } else if (key_matches(key, 'e', KEY_E)) {
                 edit_selected_registry();
-            } else if (key.ch == 'c') {
-                g_registry_input.clear();
-                g_registry_edit_url.clear();
-            } else if (key.code == KEY_BACKSPACE && !g_registry_input.empty()) {
-                g_registry_input.pop_back();
             } else if (key.code == KEY_ENTER) {
-                add_registry_from_input();
-            } else if (key.ch >= 32 && key.ch <= 126 && g_registry_input.size() < 140) {
-                g_registry_input.push_back(key.ch);
+                edit_selected_registry();
             }
             break;
+        case Screen::RegistryEdit: {
+            std::string &field = g_registry_focus == 0 ? g_registry_name_input : g_registry_input;
+            if (key_matches(key, 'b', KEY_B)) {
+                g_screen = Screen::Registry;
+            } else if (key_matches(key, 'c', KEY_C)) {
+                field.clear();
+            } else if (key.code == KEY_UP || key.code == KEY_DOWN || key.code == KEY_F ||
+                       key.code == KEY_X || key.ch == 'f' || key.ch == 'x') {
+                g_registry_focus = 1 - g_registry_focus;
+            } else if ((key.code == KEY_LEFT || key.code == KEY_Z || key.ch == 'z' || key.ch == '<') &&
+                       !g_registry_edit_url.empty() && !g_registry_entries.empty()) {
+                g_registry_selected = g_registry_selected == 0 ?
+                    static_cast<int>(g_registry_entries.size()) - 1 : g_registry_selected - 1;
+                edit_selected_registry();
+            } else if ((key.code == KEY_RIGHT || key.code == KEY_C || key.ch == '>') &&
+                       !g_registry_edit_url.empty() && !g_registry_entries.empty()) {
+                g_registry_selected = (g_registry_selected + 1) % static_cast<int>(g_registry_entries.size());
+                edit_selected_registry();
+            } else if (key.code == KEY_BACKSPACE && !field.empty()) {
+                field.pop_back();
+            } else if (key.code == KEY_ENTER) {
+                add_registry_from_input();
+            } else if (key.ch >= 32 && key.ch <= 126 &&
+                       (g_registry_focus == 0 ? g_registry_name_input.size() < 48 : g_registry_input.size() < 180)) {
+                field.push_back(key.ch);
+            }
+            break;
+        }
         case Screen::ShareCode:
             if (key.code == KEY_BACKSPACE && !g_share_code_input.empty()) {
                 g_share_code_input.pop_back();
