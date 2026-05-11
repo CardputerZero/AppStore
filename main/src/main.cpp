@@ -323,6 +323,7 @@ std::string sync_status_message(const std::string &out)
         if (fields[0] == "ERROR" && fields.size() >= 2 && !fields[1].empty()) {
             error = fields[1];
         } else if (fields[0] == "SYNC" && fields.size() >= 6) {
+            if (fields[5] == "Catalog synced") return "";
             if (!fields[5].empty()) return fields[5];
         }
     }
@@ -876,11 +877,14 @@ void render_home()
                      &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
     }
     box(120, 154, 198, 14, 0x333333, 0x333333, 0);
-    strong_label(g_root, "ok:detail", 130, 155, 66, 12, &lv_font_montserrat_10,
+    strong_label(g_root, "ok:detail", 122, 155, 54, 12, &lv_font_montserrat_10,
                  0x43CF4D, LV_LABEL_LONG_DOT);
-    strong_label(g_root, ("tab:sort " + sort_rule_label(g_sort_rule)), 200, 155, 116, 12,
-                 &lv_font_montserrat_10,
+    strong_label(g_root, "tab:sort", 176, 155, 50, 12, &lv_font_montserrat_10,
                  0x168CE5, LV_LABEL_LONG_DOT);
+    strong_label(g_root, sort_rule_label(g_sort_rule), 226, 155, 44, 12,
+                 &lv_font_montserrat_10, 0x8B8B8B, LV_LABEL_LONG_DOT);
+    strong_label(g_root, "r:reload", 272, 155, 46, 12, &lv_font_montserrat_10,
+                 0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
 void render_detail()
@@ -1234,7 +1238,7 @@ void sync_catalog()
     } else if (out.find("SYNC\t0") != std::string::npos) {
         g_status_message = "No apps loaded";
     } else {
-        g_status_message = "Catalog synced";
+        g_status_message.clear();
     }
     refresh_summary();
 }
