@@ -1169,7 +1169,7 @@ void render_registry_edit()
 
     label(g_root, "Up/Down focus  Enter save", 10, 153, 166, 12,
           &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
-    label(g_root, "C clear  B back", 188, 153, 122, 12,
+    label(g_root, "Backspace del  B back", 176, 153, 134, 12,
           &lv_font_montserrat_10, 0x8B949E, LV_LABEL_LONG_DOT);
 }
 
@@ -1830,8 +1830,6 @@ void handle_key(const KeyEvent &key)
             std::string &field = g_registry_focus == 0 ? g_registry_name_input : g_registry_input;
             if (key_matches(key, 'b', KEY_B)) {
                 g_screen = Screen::Registry;
-            } else if (key_matches(key, 'c', KEY_C)) {
-                field.clear();
             } else if (key.code == KEY_UP || key.code == KEY_DOWN || key.code == KEY_F ||
                        key.code == KEY_X || key.ch == 'f' || key.ch == 'x') {
                 g_registry_focus = 1 - g_registry_focus;
