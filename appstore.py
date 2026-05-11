@@ -37,6 +37,37 @@ def app_root() -> Path:
     return Path(os.environ.get("M5APPSTORE_APP_ROOT", "/usr/share/APPLaunch"))
 
 
+def small_lcd_fbdev() -> str:
+    for name in ("LV_LINUX_FBDEV_DEVICE", "APPLAUNCH_LINUX_FBDEV_DEVICE", "FRAMEBUFFER", "SDL_FBDEV"):
+        value = os.environ.get(name)
+        if value:
+            return value
+    try:
+        for line in Path("/proc/fb").read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.split(maxsplit=1)
+            if len(parts) == 2 and "fb_st7789v" in parts[1]:
+                return f"/dev/fb{parts[0]}"
+    except OSError:
+        pass
+    return "/dev/fb0"
+
+
+def app_launch_env() -> dict[str, str]:
+    env = os.environ.copy()
+    fbdev = small_lcd_fbdev()
+    env["APPLAUNCH_LINUX_FBDEV_DEVICE"] = fbdev
+    env["LV_LINUX_FBDEV_DEVICE"] = fbdev
+    env["FRAMEBUFFER"] = fbdev
+    env["SDL_FBDEV"] = fbdev
+    keyboard = env.get("APPLAUNCH_LINUX_KEYBOARD_DEVICE")
+    if keyboard and "LV_LINUX_KEYBOARD_DEVICE" not in env:
+        env["LV_LINUX_KEYBOARD_DEVICE"] = keyboard
+    keymap = env.get("APPLAUNCH_LINUX_KEYBOARD_MAP")
+    if keymap and "LV_LINUX_KEYBOARD_MAP" not in env:
+        env["LV_LINUX_KEYBOARD_MAP"] = keymap
+    return env
+
+
 def cache_dir() -> Path:
     return state_dir() / "cache"
 
@@ -881,7 +912,7 @@ def run_app(app_id: str) -> int:
         else:
             emit("ERROR", "desktop Exec target missing", exec_value)
             return 1
-    subprocess.Popen(shlex.split(exec_value), cwd=str(app_root()))
+    subprocess.Popen(shlex.split(exec_value), cwd=str(app_root()), env=app_launch_env())
     emit("RUNNING", app_id)
     return 0
 
