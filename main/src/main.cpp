@@ -2025,6 +2025,7 @@ void build_ui()
 
 }  // namespace
 
+#ifndef APPSTORE_EMBEDDED
 int main(int argc, char **argv)
 {
     std::signal(SIGINT, handle_signal);
@@ -2058,3 +2059,4 @@ int main(int argc, char **argv)
     if (g_sync_timer) lv_timer_delete(g_sync_timer);
     return 0;
 }
+#endif // APPSTORE_EMBEDDED
