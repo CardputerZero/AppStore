@@ -1927,6 +1927,7 @@ int get_st7789v_fbdev(char *dev_path, size_t buf_size)
     return 0;
 }
 
+#ifndef APPSTORE_EMBEDDED
 #if LV_USE_EVDEV
 int evdev_to_lv_key(uint16_t code)
 {
@@ -2010,6 +2011,7 @@ void lv_linux_indev_init()
 #error Unsupported display configuration
 #endif
 
+#endif // !APPSTORE_EMBEDDED (platform init)
 void build_ui()
 {
     g_root = lv_screen_active();
