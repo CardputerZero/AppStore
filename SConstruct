@@ -13,6 +13,11 @@ update = False
 local_path = Path(os.getcwd()).resolve()
 workspace_path = local_path.parents[1] if len(local_path.parents) > 1 else local_path.parent
 
+freetype_config_lines = [
+    "CONFIG_V9_5_LV_USE_FREETYPE=y",
+    "CONFIG_V9_5_LV_FREETYPE_CACHE_FT_GLYPH_CNT=512",
+]
+
 
 def resolve_sdk_path():
     candidates = []
@@ -134,6 +139,7 @@ if "CardputerZero" in os.environ:
         "CONFIG_V9_5_LV_USE_DRAW_SW_ASM=1",
         "CONFIG_V9_5_LV_USE_EVDEV=y",
     ]
+    config_lines.extend(freetype_config_lines)
     if has_homebrew_aarch64:
         config_lines.append(f'CONFIG_TOOLCHAIN_PATH="{homebrew_toolchain}"')
     config_lines.extend(
@@ -148,7 +154,7 @@ elif arch != "aarch64":
     write_config_tmp(
         [
             "CONFIG_V9_5_LV_USE_SDL=y",
-        ]
+        ] + freetype_config_lines
     )
 else:
     write_config_tmp(
@@ -157,7 +163,7 @@ else:
             "CONFIG_V9_5_LV_DRAW_SW_ASM_NEON=y",
             "CONFIG_V9_5_LV_USE_DRAW_SW_ASM=1",
             "CONFIG_V9_5_LV_USE_EVDEV=y",
-        ]
+        ] + freetype_config_lines
     )
 
 sdk_path = resolve_sdk_path()

@@ -2,6 +2,9 @@
 #include "compat/input_keys.h"
 
 #include "lvgl/lvgl.h"
+#if LV_USE_FREETYPE
+#include "lvgl/src/libs/freetype/lv_freetype.h"
+#endif
 
 #include <algorithm>
 #include <cctype>
@@ -111,6 +114,10 @@ std::vector<std::string> g_categories = {"Recommended", "All"};
 std::vector<StoreApp> g_apps;
 std::vector<int> g_visible;
 std::vector<std::string> g_render_image_sources;
+#if LV_USE_FREETYPE
+lv_font_t *g_runtime_cjk_font_16 = nullptr;
+lv_font_t *g_runtime_cjk_font_14 = nullptr;
+#endif
 std::vector<std::string> g_registry_lines;
 std::vector<RegistryEntry> g_registry_entries;
 int g_category = 0;
@@ -257,7 +264,12 @@ std::string one_line(std::string value, size_t max_len)
         if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
     }
     if (value.size() > max_len) {
-        value.resize(max_len > 3 ? max_len - 3 : max_len);
+        size_t keep = max_len > 3 ? max_len - 3 : max_len;
+        while (keep > 0 && keep < value.size() &&
+               (static_cast<unsigned char>(value[keep]) & 0xC0) == 0x80) {
+            --keep;
+        }
+        value.resize(keep);
         value += "...";
     }
     return value;
@@ -296,7 +308,7 @@ bool key_matches(const KeyEvent &key, char ch, uint32_t code)
 
 std::string job_action_label(const std::string &action)
 {
-    if (action == "uninstall") return "Uninstalling";
+    if (action == "uninstall") return "Deleting";
     if (action == "upgrade") return "Upgrading";
     if (action == "reinstall") return "Reinstalling";
     return "Installing";
@@ -355,7 +367,9 @@ std::string sync_status_message(const std::string &out)
 std::string upper_ascii(std::string value)
 {
     for (char &ch : value) {
-        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        if (ch >= 'a' && ch <= 'z') {
+            ch = static_cast<char>(ch - 'a' + 'A');
+        }
     }
     return value;
 }
@@ -368,9 +382,68 @@ bool has_non_ascii(const std::string &value)
     return false;
 }
 
+#if LV_USE_FREETYPE
+bool font_path_exists(const std::string &path)
+{
+    if (path.empty()) return false;
+    std::ifstream file(path);
+    return file.good();
+}
+
+std::string runtime_cjk_font_path()
+{
+    const char *env_path = std::getenv("M5APPSTORE_CJK_FONT");
+    if (env_path && env_path[0] && font_path_exists(env_path)) {
+        return env_path;
+    }
+
+    std::vector<std::string> candidates = {
+        parent_dir(g_app_dir) + "/share/font/AlibabaPuHuiTi-3-55-Regular.ttf",
+        g_app_dir + "/share/font/AlibabaPuHuiTi-3-55-Regular.ttf",
+        "/usr/share/APPLaunch/share/font/AlibabaPuHuiTi-3-55-Regular.ttf",
+        parent_dir(g_app_dir) + "/share/font/NotoSansSC-Regular.ttf",
+        g_app_dir + "/share/font/NotoSansSC-Regular.ttf",
+        "/usr/share/APPLaunch/share/font/NotoSansSC-Regular.ttf",
+    };
+    for (const auto &candidate : candidates) {
+        if (font_path_exists(candidate)) return candidate;
+    }
+    return "";
+}
+
+void init_runtime_fonts()
+{
+    std::string font_path = runtime_cjk_font_path();
+    if (font_path.empty()) return;
+
+    g_runtime_cjk_font_16 = lv_freetype_font_create(
+        font_path.c_str(), LV_FREETYPE_FONT_RENDER_MODE_BITMAP, 16,
+        LV_FREETYPE_FONT_STYLE_NORMAL);
+    g_runtime_cjk_font_14 = lv_freetype_font_create(
+        font_path.c_str(), LV_FREETYPE_FONT_RENDER_MODE_BITMAP, 14,
+        LV_FREETYPE_FONT_STYLE_NORMAL);
+#if defined(LV_FONT_SOURCE_HAN_SANS_SC_16_CJK) && LV_FONT_SOURCE_HAN_SANS_SC_16_CJK
+    if (g_runtime_cjk_font_16) g_runtime_cjk_font_16->fallback = &lv_font_source_han_sans_sc_16_cjk;
+#elif defined(LV_FONT_SOURCE_HAN_SANS_SC_14_CJK) && LV_FONT_SOURCE_HAN_SANS_SC_14_CJK
+    if (g_runtime_cjk_font_16) g_runtime_cjk_font_16->fallback = &lv_font_source_han_sans_sc_14_cjk;
+#endif
+#if defined(LV_FONT_SOURCE_HAN_SANS_SC_14_CJK) && LV_FONT_SOURCE_HAN_SANS_SC_14_CJK
+    if (g_runtime_cjk_font_14) g_runtime_cjk_font_14->fallback = &lv_font_source_han_sans_sc_14_cjk;
+#endif
+}
+#else
+void init_runtime_fonts() {}
+#endif
+
 const lv_font_t *font_for_text(const std::string &text, const lv_font_t *latin)
 {
     if (!has_non_ascii(text)) return latin;
+#if LV_USE_FREETYPE
+    if ((latin == &lv_font_montserrat_20 || latin == &lv_font_montserrat_14) && g_runtime_cjk_font_16) {
+        return g_runtime_cjk_font_16;
+    }
+    if (g_runtime_cjk_font_14) return g_runtime_cjk_font_14;
+#endif
 #if defined(LV_FONT_SOURCE_HAN_SANS_SC_16_CJK) && LV_FONT_SOURCE_HAN_SANS_SC_16_CJK
     if (latin == &lv_font_montserrat_20 || latin == &lv_font_montserrat_14) {
         return &lv_font_source_han_sans_sc_16_cjk;
@@ -1035,7 +1108,7 @@ void render_detail()
         label(g_root, one_line(g_status_message, 54), 10, 153, 300, 12,
               &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
     } else if (app->installed) {
-        label(g_root, "G Upgrade  U Uninstall  I Reinstall  B Back", 10, 153, 300, 12,
+        label(g_root, "U Upgrade  D Delete  I Reinstall  B Back", 10, 153, 300, 12,
               &lv_font_montserrat_10, 0xCCCC33);
     } else {
         label(g_root, "I Install  B Back", 10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33);
@@ -1230,7 +1303,7 @@ void finish_backend_job(const std::string &out, const std::string &rc_text)
     if (!ok) {
         g_status_message = one_line(backend_error_message(out), 54);
     } else if (g_job_action == "uninstall" || out.find("UNINSTALLED") != std::string::npos) {
-        g_status_message = "Uninstalled";
+        g_status_message = "Deleted";
     } else if (g_job_action == "upgrade" || out.find("UPGRADED") != std::string::npos) {
         g_status_message = "Upgraded. Return to launcher to test.";
     } else if (out.find("INSTALLED") != std::string::npos) {
@@ -1607,7 +1680,7 @@ bool parse_plan(const std::string &out)
         if (fields.size() >= 8 && fields[0] == "PLAN") {
             g_confirm_lines.clear();
             std::string verb = "Install ";
-            if (g_confirm_action == "uninstall") verb = "Uninstall ";
+            if (g_confirm_action == "uninstall") verb = "Delete ";
             else if (g_confirm_action == "upgrade") verb = "Upgrade ";
             else if (g_confirm_action == "reinstall") verb = "Reinstall ";
             g_confirm_lines.push_back(verb + fields[2]);
@@ -1635,7 +1708,7 @@ void start_confirm(const std::string &action)
     }
     g_confirm_action = action;
     if (action == "uninstall") {
-        g_confirm_lines = {"Uninstall " + app->name, "Remove installed Debian package.", "Disk free: " + g_free_space};
+        g_confirm_lines = {"Delete " + app->name, "Remove installed Debian package.", "Disk free: " + g_free_space};
         g_screen = Screen::Confirm;
         return;
     }
@@ -1749,9 +1822,9 @@ void handle_key(const KeyEvent &key)
             } else if (app && key_matches(key, 'i', KEY_I)) {
                 start_confirm(app->installed ? "reinstall" : "install");
             } else if (app && app->installed && key_matches(key, 'u', KEY_U)) {
-                start_confirm("uninstall");
-            } else if (app && app->installed && key_matches(key, 'g', KEY_G)) {
                 start_confirm("upgrade");
+            } else if (app && app->installed && key_matches(key, 'd', KEY_D)) {
+                start_confirm("uninstall");
             }
             break;
         }
@@ -2003,6 +2076,7 @@ int main(int argc, char **argv)
     g_script_path = resolve_script_path(g_app_dir);
 
     lv_init();
+    init_runtime_fonts();
     lv_linux_disp_init();
     LV_EVENT_KEYBOARD = lv_event_register_id();
     lv_linux_indev_init();

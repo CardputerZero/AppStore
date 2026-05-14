@@ -1,4 +1,6 @@
 import os
+import shlex
+import subprocess
 
 Import("env")
 with open(env["PROJECT_TOOL_S"]) as f:
@@ -25,6 +27,26 @@ if "CONFIG_V9_5_LV_USE_SDL" not in os.environ:
 LINK_SEARCH_PATH = []
 STATIC_FILES = []
 MULTIARCH_INCLUDE = None
+FREETYPE_INCLUDE = None
+
+
+def pkg_config_flags(kind, package):
+    try:
+        return shlex.split(subprocess.check_output(["pkg-config", kind, package], text=True))
+    except Exception:
+        return []
+
+
+def append_pkg_config(package, definitions, requirements, link_search_path, ldflags):
+    for flag in pkg_config_flags("--cflags", package):
+        definitions.append(flag)
+    for flag in pkg_config_flags("--libs", package):
+        if flag.startswith("-L"):
+            link_search_path.append(flag[2:])
+        elif flag.startswith("-l"):
+            requirements.append(flag[2:])
+        else:
+            ldflags.append(flag)
 
 if "CONFIG_TOOLCHAIN_SYSROOT" in os.environ:
     sysroot = os.environ["CONFIG_TOOLCHAIN_SYSROOT"].strip('"')
@@ -32,6 +54,10 @@ if "CONFIG_TOOLCHAIN_SYSROOT" in os.environ:
     if os.path.isdir(multiarch_include):
         INCLUDE += [multiarch_include]
         MULTIARCH_INCLUDE = multiarch_include
+    freetype_include = os.path.join(sysroot, "usr", "include", "freetype2")
+    if os.path.isdir(freetype_include):
+        INCLUDE += [freetype_include]
+        FREETYPE_INCLUDE = freetype_include
     multiarch_lib = os.path.join(sysroot, "usr", "lib", "aarch64-linux-gnu")
     if os.path.isdir(multiarch_lib):
         LDFLAGS += [f"-B{multiarch_lib}", f"-Wl,-rpath-link,{multiarch_lib}"]
@@ -41,6 +67,11 @@ lvgl_component = list(filter(lambda x: x["target"] == "lvgl_component", env["COM
 if MULTIARCH_INCLUDE:
     for component in env["COMPONENTS"]:
         component["INCLUDE"] += [MULTIARCH_INCLUDE]
+if FREETYPE_INCLUDE:
+    for component in env["COMPONENTS"]:
+        component["INCLUDE"] += [FREETYPE_INCLUDE]
+if "CONFIG_V9_5_LV_USE_FREETYPE" in os.environ:
+    REQUIREMENTS += ["freetype"]
 if "CONFIG_V9_5_LV_USE_SDL" in os.environ:
     lvgl_component["REQUIREMENTS"] += ["SDL2"]
     lvgl_component["INCLUDE"] += ["/usr/include/SDL2"]
@@ -56,6 +87,8 @@ if "CONFIG_V9_5_LV_USE_SDL" in os.environ:
         if os.path.exists(sdl_lib):
             lvgl_component["LINK_SEARCH_PATH"] += [sdl_lib]
     lvgl_component["DEFINITIONS"] += ["-D_REENTRANT"]
+    append_pkg_config("freetype2", lvgl_component["DEFINITIONS"], REQUIREMENTS,
+                      LINK_SEARCH_PATH, LDFLAGS)
     for src in list(lvgl_component["SRCS"]):
         if "lv_sdl_keyboard.c" in str(src):
             lvgl_component["SRCS"].remove(src)
