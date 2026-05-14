@@ -128,11 +128,15 @@ if "CardputerZero" in os.environ:
     os.environ["CARDPUTERZERO_STATIC_LIB_SYSROOT"] = str(sysroot_dir)
     generic_include = sysroot_dir / "usr" / "include"
     multiarch_include = sysroot_dir / "usr" / "include" / "aarch64-linux-gnu"
+    freetype_include = sysroot_dir / "usr" / "include" / "freetype2"
+    libpng_include = sysroot_dir / "usr" / "include" / "libpng16"
     multiarch_lib = sysroot_dir / "usr" / "lib" / "aarch64-linux-gnu"
     toolchain_flags = [
         f"-B{multiarch_lib}",
         f"-idirafter{generic_include}",
         f"-idirafter{multiarch_include}",
+        f"-I{freetype_include}",
+        f"-I{libpng_include}",
         f"-L{multiarch_lib}",
         f"-Wl,-rpath-link,{multiarch_lib}",
     ]
