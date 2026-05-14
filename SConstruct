@@ -9,7 +9,6 @@ has_homebrew_aarch64 = os.path.exists(os.path.join(homebrew_toolchain, "aarch64-
 
 version = "v0.0.3"
 static_lib = "static_lib"
-update = False
 local_path = Path(os.getcwd()).resolve()
 workspace_path = local_path.parents[1] if len(local_path.parents) > 1 else local_path.parent
 
@@ -123,6 +122,50 @@ def prepare_static_lib(down_url):
     return extracted
 
 
+def ensure_sysroot_lib_layout(sysroot):
+    sysroot = Path(sysroot)
+    usr_multiarch_lib = sysroot / "usr" / "lib" / "aarch64-linux-gnu"
+    if not usr_multiarch_lib.exists():
+        return
+
+    lib_dir = sysroot / "lib"
+    if lib_dir.is_symlink():
+        return
+    if not lib_dir.exists():
+        lib_dir.symlink_to(Path("usr") / "lib", target_is_directory=True)
+        return
+
+    multiarch_alias = lib_dir / "aarch64-linux-gnu"
+    if not multiarch_alias.exists():
+        multiarch_alias.symlink_to(
+            Path("..") / "usr" / "lib" / "aarch64-linux-gnu",
+            target_is_directory=True,
+        )
+
+
+def ensure_static_lib_ready():
+    if "CardputerZero" not in os.environ:
+        return
+
+    needs_update = True
+    if os.path.exists(static_lib):
+        try:
+            with open(str(Path(static_lib) / "version"), "r") as f:
+                needs_update = version != f.read().strip()
+        except Exception:
+            needs_update = True
+
+    if needs_update:
+        down_url = "https://github.com/dianjixz/M5CardputerZero-UserDemo/releases/download/{}/sdk_bsp.tar.gz".format(
+            version
+        )
+        down_path = prepare_static_lib(down_url)
+        remove_path(Path(static_lib))
+        shutil.move(down_path, static_lib)
+
+    ensure_sysroot_lib_layout(Path(static_lib))
+
+
 if "CardputerZero" in os.environ:
     sysroot_dir = local_path / static_lib
     os.environ["CARDPUTERZERO_STATIC_LIB_SYSROOT"] = str(sysroot_dir)
@@ -174,28 +217,12 @@ else:
 
 sdk_path = resolve_sdk_path()
 os.environ["SDK_PATH"] = str(sdk_path)
+os.environ.setdefault("GIT_REPO_PATH", str(sdk_path / "github_source"))
 os.environ.setdefault("EXT_COMPONENTS_PATH", str(sdk_path.parent / "ext_components"))
+ensure_static_lib_ready()
 
 env = SConscript(
     str(sdk_path / "tools" / "scons" / "project.py"),
     variant_dir=os.getcwd(),
     duplicate=0,
 )
-
-if not os.path.exists(static_lib):
-    update = True
-else:
-    try:
-        with open(str(Path(static_lib) / "version"), "r") as f:
-            if version != f.read().strip():
-                update = True
-    except Exception:
-        update = True
-
-if update and "CardputerZero" in os.environ:
-    down_url = "https://github.com/dianjixz/M5CardputerZero-UserDemo/releases/download/{}/sdk_bsp.tar.gz".format(
-        version
-    )
-    down_path = prepare_static_lib(down_url)
-    remove_path(Path(static_lib))
-    shutil.move(down_path, static_lib)
