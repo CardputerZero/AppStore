@@ -26,7 +26,6 @@ if "CONFIG_V9_5_LV_USE_SDL" not in os.environ:
     LDFLAGS += ["-lutil"]
 LINK_SEARCH_PATH = []
 STATIC_FILES = []
-MULTIARCH_INCLUDE = None
 FREETYPE_INCLUDE = None
 
 
@@ -48,25 +47,23 @@ def append_pkg_config(package, definitions, requirements, link_search_path, ldfl
         else:
             ldflags.append(flag)
 
-if "CONFIG_TOOLCHAIN_SYSROOT" in os.environ:
-    sysroot = os.environ["CONFIG_TOOLCHAIN_SYSROOT"].strip('"')
-    multiarch_include = os.path.join(sysroot, "usr", "include", "aarch64-linux-gnu")
-    if os.path.isdir(multiarch_include):
-        INCLUDE += [multiarch_include]
-        MULTIARCH_INCLUDE = multiarch_include
+static_sysroot = os.environ.get("CARDPUTERZERO_STATIC_LIB_SYSROOT") or os.environ.get("CONFIG_TOOLCHAIN_SYSROOT")
+if static_sysroot:
+    sysroot = static_sysroot.strip('"')
     freetype_include = os.path.join(sysroot, "usr", "include", "freetype2")
     if os.path.isdir(freetype_include):
         INCLUDE += [freetype_include]
         FREETYPE_INCLUDE = freetype_include
     multiarch_lib = os.path.join(sysroot, "usr", "lib", "aarch64-linux-gnu")
     if os.path.isdir(multiarch_lib):
-        LDFLAGS += [f"-B{multiarch_lib}", f"-Wl,-rpath-link,{multiarch_lib}"]
+        LDFLAGS += [
+            f"--sysroot={sysroot}",
+            f"-B{multiarch_lib}",
+            f"-Wl,-rpath-link,{multiarch_lib}",
+        ]
         LINK_SEARCH_PATH += [multiarch_lib]
 
 lvgl_component = list(filter(lambda x: x["target"] == "lvgl_component", env["COMPONENTS"]))[0]
-if MULTIARCH_INCLUDE:
-    for component in env["COMPONENTS"]:
-        component["INCLUDE"] += [MULTIARCH_INCLUDE]
 if FREETYPE_INCLUDE:
     for component in env["COMPONENTS"]:
         component["INCLUDE"] += [FREETYPE_INCLUDE]

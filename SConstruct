@@ -125,11 +125,14 @@ def prepare_static_lib(down_url):
 
 if "CardputerZero" in os.environ:
     sysroot_dir = local_path / static_lib
+    os.environ["CARDPUTERZERO_STATIC_LIB_SYSROOT"] = str(sysroot_dir)
+    generic_include = sysroot_dir / "usr" / "include"
     multiarch_include = sysroot_dir / "usr" / "include" / "aarch64-linux-gnu"
     multiarch_lib = sysroot_dir / "usr" / "lib" / "aarch64-linux-gnu"
     toolchain_flags = [
         f"-B{multiarch_lib}",
-        f"-isystem{multiarch_include}",
+        f"-idirafter{generic_include}",
+        f"-idirafter{multiarch_include}",
         f"-L{multiarch_lib}",
         f"-Wl,-rpath-link,{multiarch_lib}",
     ]
@@ -145,7 +148,6 @@ if "CardputerZero" in os.environ:
     config_lines.extend(
         [
             'CONFIG_TOOLCHAIN_PREFIX="aarch64-linux-gnu-"',
-            f'CONFIG_TOOLCHAIN_SYSROOT="{local_path / static_lib}"',
             f'CONFIG_TOOLCHAIN_FLAGS="{" ".join(toolchain_flags)}"',
         ]
     )
