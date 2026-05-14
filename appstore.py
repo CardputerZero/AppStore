@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-DEFAULT_INDEX_URL = "https://cardputerzero.github.io/generated/registry-index.json"
+DEFAULT_REGISTRY_URL = "https://cardputerzero.github.io/generated/registry.json"
 DEFAULT_REGISTRY_NAME = "CardputerZero Hub"
 USER_AGENT = "CardputerZero-AppStore/0.1"
 CACHE_BUST_PARAM = "_cz_appstore_ts"
@@ -35,37 +35,6 @@ def state_dir() -> Path:
 
 def app_root() -> Path:
     return Path(os.environ.get("M5APPSTORE_APP_ROOT", "/usr/share/APPLaunch"))
-
-
-def small_lcd_fbdev() -> str:
-    for name in ("LV_LINUX_FBDEV_DEVICE", "APPLAUNCH_LINUX_FBDEV_DEVICE", "FRAMEBUFFER", "SDL_FBDEV"):
-        value = os.environ.get(name)
-        if value:
-            return value
-    try:
-        for line in Path("/proc/fb").read_text(encoding="utf-8", errors="ignore").splitlines():
-            parts = line.split(maxsplit=1)
-            if len(parts) == 2 and "fb_st7789v" in parts[1]:
-                return f"/dev/fb{parts[0]}"
-    except OSError:
-        pass
-    return "/dev/fb0"
-
-
-def app_launch_env() -> dict[str, str]:
-    env = os.environ.copy()
-    fbdev = small_lcd_fbdev()
-    env["APPLAUNCH_LINUX_FBDEV_DEVICE"] = fbdev
-    env["LV_LINUX_FBDEV_DEVICE"] = fbdev
-    env["FRAMEBUFFER"] = fbdev
-    env["SDL_FBDEV"] = fbdev
-    keyboard = env.get("APPLAUNCH_LINUX_KEYBOARD_DEVICE")
-    if keyboard and "LV_LINUX_KEYBOARD_DEVICE" not in env:
-        env["LV_LINUX_KEYBOARD_DEVICE"] = keyboard
-    keymap = env.get("APPLAUNCH_LINUX_KEYBOARD_MAP")
-    if keymap and "LV_LINUX_KEYBOARD_MAP" not in env:
-        env["LV_LINUX_KEYBOARD_MAP"] = keymap
-    return env
 
 
 def cache_dir() -> Path:
@@ -119,16 +88,16 @@ def write_json(path: Path, data: Any) -> None:
 def normalize_registry_url(value: str) -> str:
     value = value.strip()
     if not value:
-        return DEFAULT_INDEX_URL
+        return DEFAULT_REGISTRY_URL
     if value.startswith(("http://", "https://", "file://")):
         parsed = urllib.parse.urlparse(value)
         if parsed.path.endswith(".json"):
             return value
-        return value.rstrip("/") + "/generated/registry-index.json"
+        return value.rstrip("/") + "/generated/registry.json"
     path = Path(value).expanduser()
     if path.suffix == ".json":
         return path.resolve().as_uri()
-    return (path / "generated" / "registry-index.json").resolve().as_uri()
+    return (path / "generated" / "registry.json").resolve().as_uri()
 
 
 def load_config() -> dict[str, Any]:
@@ -136,7 +105,7 @@ def load_config() -> dict[str, Any]:
     data = read_json(config_path(), {})
     registries = data.get("registries")
     if not isinstance(registries, list) or not registries:
-        registries = [{"name": DEFAULT_REGISTRY_NAME, "url": DEFAULT_INDEX_URL, "enabled": True}]
+        registries = [{"name": DEFAULT_REGISTRY_NAME, "url": DEFAULT_REGISTRY_URL, "enabled": True}]
     normalized = []
     seen = set()
     for item in registries:
@@ -153,7 +122,7 @@ def load_config() -> dict[str, Any]:
             "url": url,
             "enabled": enabled_value(item.get("enabled", True)),
         })
-    data["registries"] = normalized or [{"name": DEFAULT_REGISTRY_NAME, "url": DEFAULT_INDEX_URL, "enabled": True}]
+    data["registries"] = normalized or [{"name": DEFAULT_REGISTRY_NAME, "url": DEFAULT_REGISTRY_URL, "enabled": True}]
     return data
 
 
@@ -275,7 +244,7 @@ def download_file(url: str, dest: Path, progress_stage: str = "", resume: bool =
 
 def registry_site_root(index_url: str) -> str:
     parsed = urllib.parse.urlparse(clean_json_url(index_url))
-    if parsed.scheme in {"http", "https"} and "/generated/" in parsed.path:
+    if parsed.scheme in {"http", "https", "file"} and "/generated/" in parsed.path:
         prefix = parsed.path.split("/generated/", 1)[0].rstrip("/") + "/"
         return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, prefix, "", "", ""))
     return urllib.parse.urljoin(clean_json_url(index_url), "./")
@@ -329,7 +298,8 @@ def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
         index = request_json(url)
         record["index"] = index
         try:
-            record["full"] = request_json(full_registry_url(url))
+            full_url = full_registry_url(url)
+            record["full"] = index if clean_json_url(full_url) == clean_json_url(url) else request_json(full_url)
         except Exception as exc:
             record["full_error"] = str(exc)
             record["full"] = {}
@@ -402,6 +372,57 @@ def list_value(value: Any) -> list[str]:
     return []
 
 
+def normalize_locale(value: str) -> str:
+    value = (value or "").split(":", 1)[0].split(".", 1)[0].split("@", 1)[0].replace("_", "-")
+    if not value:
+        return "en"
+    lower = value.lower()
+    if lower.startswith("zh-tw") or lower.startswith("zh-hk"):
+        return "zh-TW"
+    if lower.startswith("zh"):
+        return "zh-CN"
+    if lower.startswith("ja"):
+        return "ja"
+    if lower.startswith("en"):
+        return "en"
+    return value
+
+
+def resolve_locale() -> str:
+    for name in ("M5APPSTORE_LOCALE", "LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(name)
+        if value:
+            return normalize_locale(value)
+    return "en"
+
+
+def locale_candidates(locale: str) -> list[str]:
+    base = locale.split("-", 1)[0]
+    candidates = [locale, base]
+    if base == "zh":
+        candidates += ["zh-CN", "zh-TW"]
+    candidates += ["en", "zh-CN"]
+    out = []
+    for candidate in candidates:
+        if candidate and candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def localized_text(app: dict[str, Any], field: str, locale: str) -> str:
+    sources = []
+    for key in ("i18n", "locales"):
+        value = app.get(key)
+        if isinstance(value, dict):
+            sources.append(value)
+    for source in sources:
+        for candidate in locale_candidates(locale):
+            entry = source.get(candidate)
+            if isinstance(entry, dict) and entry.get(field):
+                return str(entry[field])
+    return str(app.get(field) or "")
+
+
 def app_key(app: dict[str, Any]) -> str:
     return str(app.get("uuid") or app.get("share_code") or app.get("id") or app.get("title") or "")
 
@@ -416,8 +437,10 @@ def author_text(app: dict[str, Any]) -> str:
 def source_repo(app: dict[str, Any]) -> str:
     source = app.get("source")
     if isinstance(source, dict):
-        return str(source.get("repository") or "")
-    return str(app.get("repository") or app.get("git_url") or "")
+        repository = str(source.get("repository") or "")
+        if repository:
+            return repository
+    return str(app.get("source_repo") or app.get("repository") or app.get("git_url") or "")
 
 
 def download_meta(app: dict[str, Any]) -> dict[str, Any]:
@@ -620,7 +643,8 @@ def merge_apps(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 item["_registry_url"] = record.get("url", "")
                 item["_registry_name"] = record.get("name", "")
                 merged[app_key(item)] = item
-    return sorted(merged.values(), key=lambda app: (not bool(app.get("featured")), str(app.get("title", "")).lower()))
+    locale = resolve_locale()
+    return sorted(merged.values(), key=lambda app: (not bool(app.get("featured")), localized_text(app, "title", locale).lower()))
 
 
 def free_space_text() -> str:
@@ -636,6 +660,7 @@ def free_space_text() -> str:
 def summary(sync_if_empty: bool = False) -> None:
     records = load_registry_records(sync_if_empty=sync_if_empty)
     apps = merge_apps(records)
+    locale = resolve_locale()
     ok = sum(1 for record in records if record.get("status") == "ok")
     cached = sum(1 for record in records if record.get("status") == "cached")
     failed = sum(1 for record in records if record.get("status") == "error")
@@ -668,16 +693,18 @@ def summary(sync_if_empty: bool = False) -> None:
         featured = bool(app.get("featured")) or str(review) in {"approved", "ci-passed"}
         icon = app.get("_icon_local") or ""
         size = download_size(app)
+        title = localized_text(app, "title", locale) or key
+        summary_text = localized_text(app, "summary", locale) or localized_text(app, "description", locale)
         emit(
             "APP",
             key,
-            app.get("title") or key,
+            title,
             app.get("version") or "",
             categories_for_app[0] if categories_for_app else "Other",
             "1" if is_installed(app) else "0",
             "1" if featured else "0",
             size or "online",
-            app.get("summary") or app.get("description") or "",
+            summary_text,
             author_text(app),
             source_repo(app),
             icon,
@@ -706,8 +733,9 @@ def registries() -> None:
 
 
 def find_app(app_id: str) -> Optional[dict[str, Any]]:
+    locale = resolve_locale()
     for app in merge_apps(load_registry_records(sync_if_empty=True)):
-        if app_key(app) == app_id or app.get("share_code") == app_id or app.get("title") == app_id:
+        if app_key(app) == app_id or app.get("share_code") == app_id or app.get("title") == app_id or localized_text(app, "title", locale) == app_id:
             return app
     return None
 
@@ -717,6 +745,7 @@ def plan(app_id: str) -> int:
     if not app:
         emit("ERROR", "app not found", app_id)
         return 1
+    title = localized_text(app, "title", resolve_locale()) or app_key(app)
     missing = []
     if not download_url(app):
         missing.append("package")
@@ -731,7 +760,7 @@ def plan(app_id: str) -> int:
     emit(
         "PLAN",
         app_key(app),
-        app.get("title") or app_key(app),
+        title,
         app.get("version") or "",
         download_size(app) or "deb",
         free_space_text(),
@@ -865,7 +894,7 @@ def uninstall(app_id: str) -> int:
         return 1
 
 
-def install(app_id: str, reinstall: bool = False) -> int:
+def install(app_id: str, reinstall: bool = False, upgrade: bool = False) -> int:
     app = find_app(app_id)
     if not app:
         emit("ERROR", "app not found", app_id)
@@ -876,15 +905,18 @@ def install(app_id: str, reinstall: bool = False) -> int:
         if not package:
             raise RuntimeError("deb package name missing")
         repair_dpkg_state()
+        stage = "upgrade" if upgrade else "install"
+        operation = "Upgrading" if upgrade else "Installing"
+        complete = "Upgrade complete" if upgrade else "Install complete"
         if shutil.which("apt-get"):
             args = ["apt-get", "-y"]
             if reinstall:
                 args.append("--reinstall")
             args += ["install", str(deb_path)]
-            emit("PROGRESS", "install", 0, 0, -1, "Installing package")
+            emit("PROGRESS", stage, 0, 0, -1, f"{operation} package")
             run_package_command(args)
         elif shutil.which("dpkg"):
-            emit("PROGRESS", "install", 0, 0, -1, "Installing package")
+            emit("PROGRESS", stage, 0, 0, -1, f"{operation} package")
             run_package_command(["dpkg", "-i", str(deb_path)])
         else:
             raise RuntimeError("apt-get or dpkg is required to install deb packages")
@@ -893,51 +925,19 @@ def install(app_id: str, reinstall: bool = False) -> int:
         repaired_exec = repair_applaunch_desktop(app, files)
         records[app_key(app)] = {
             "installed_at": now_text(),
-            "title": app.get("title"),
+            "title": localized_text(app, "title", resolve_locale()) or app.get("title"),
             "package": package,
             "deb_path": str(deb_path),
             "exec": repaired_exec or applaunch_exec(app),
             "files": files,
         }
         write_json(installed_path(), records)
-        emit("PROGRESS", "install", 1, 1, 100, "Install complete")
-        emit("INSTALLED", app_key(app), app.get("title") or app_key(app))
+        emit("PROGRESS", stage, 1, 1, 100, complete)
+        emit("UPGRADED" if upgrade else "INSTALLED", app_key(app), localized_text(app, "title", resolve_locale()) or app_key(app))
         return 0
     except Exception as exc:
         emit("ERROR", str(exc))
         return 1
-
-
-def run_app(app_id: str) -> int:
-    app = find_app(app_id)
-    if not app:
-        emit("ERROR", "app not found", app_id)
-        return 1
-    desktop = desktop_path_for(app)
-    if not desktop.exists():
-        emit("ERROR", "desktop entry missing", desktop)
-        return 1
-    package = deb_package_name(app)
-    if package and package_installed(package):
-        repair_applaunch_desktop(app, package_files(package))
-    exec_value = ""
-    for line in desktop.read_text(encoding="utf-8", errors="ignore").splitlines():
-        if line.startswith("Exec="):
-            exec_value = line.split("=", 1)[1].strip()
-            break
-    if not exec_value:
-        emit("ERROR", "desktop Exec missing")
-        return 1
-    if not executable_exists(exec_value):
-        repaired = repair_applaunch_desktop(app, package_files(package) if package else [])
-        if repaired:
-            exec_value = repaired
-        else:
-            emit("ERROR", "desktop Exec target missing", exec_value)
-            return 1
-    subprocess.Popen(shlex.split(exec_value), cwd=str(app_root()), env=app_launch_env())
-    emit("RUNNING", app_id)
-    return 0
 
 
 def add_registry(url: str, name: str = "") -> int:
@@ -1024,8 +1024,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan")
     parser.add_argument("--install")
     parser.add_argument("--reinstall")
+    parser.add_argument("--upgrade")
     parser.add_argument("--uninstall")
-    parser.add_argument("--run")
     return parser.parse_args()
 
 
@@ -1073,10 +1073,10 @@ def main() -> int:
         return install(args.install, reinstall=False)
     if args.reinstall:
         return install(args.reinstall, reinstall=True)
+    if args.upgrade:
+        return install(args.upgrade, upgrade=True)
     if args.uninstall:
         return uninstall(args.uninstall)
-    if args.run:
-        return run_app(args.run)
     summary()
     return 0
 

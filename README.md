@@ -10,7 +10,7 @@ manager.
 
 ## Runtime
 
-The LVGL UI calls `appstore.py` for registry, install, uninstall, and run operations. By default the script lives next to the installed binary, but the UI also honors:
+The LVGL UI calls `appstore.py` for registry, install, upgrade, and uninstall operations. By default the script lives next to the installed binary, but the UI also honors:
 
 ```bash
 M5APPSTORE_SCRIPT=/path/to/appstore.py
@@ -26,7 +26,7 @@ M5APPSTORE_APP_ROOT=/usr/share/APPLaunch
 Default registry:
 
 ```text
-https://cardputerzero.github.io/generated/registry-index.json
+https://cardputerzero.github.io/generated/registry.json
 ```
 
 AppStore performs a fresh registry sync when it starts. Registry HTTP requests
@@ -40,12 +40,12 @@ AppStore keeps showing the cached app list and marks the registry as cached.
 ```bash
 python3 appstore.py --summary
 python3 appstore.py --registries
-python3 appstore.py --add-registry https://example.com/generated/registry-index.json
+python3 appstore.py --add-registry https://example.com/generated/registry.json
 python3 appstore.py --sync
 python3 appstore.py --plan <app-id>
 python3 appstore.py --install <app-id>
+python3 appstore.py --upgrade <app-id>
 python3 appstore.py --uninstall <app-id>
-python3 appstore.py --run <app-id>
 ```
 
 `<app-id>` accepts either the app UUID or its `share_code` from registry metadata.
