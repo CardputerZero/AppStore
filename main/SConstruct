@@ -60,6 +60,7 @@ if static_sysroot:
             f"--sysroot={sysroot}",
             f"-B{multiarch_lib}",
             f"-Wl,-rpath-link,{multiarch_lib}",
+            f"{multiarch_lib}/libstdc++.so.6",
         ]
         LINK_SEARCH_PATH += [multiarch_lib]
 
