@@ -689,7 +689,7 @@ def summary(sync_if_empty: bool = False) -> None:
     for app in apps:
         key = app_key(app)
         categories_for_app = list_value(app.get("categories"))
-        review = app.get("review_status") or app.get("review", {}).get("status") if isinstance(app.get("review"), dict) else app.get("review_status")
+        review = review_status(app)
         featured = bool(app.get("featured")) or str(review) in {"approved", "ci-passed"}
         icon = app.get("_icon_local") or ""
         size = download_size(app)
@@ -712,6 +712,8 @@ def summary(sync_if_empty: bool = False) -> None:
             app.get("share_code") or "",
             app.get("_registry_name") or "",
             app.get("updated_at") or app.get("published_at") or "",
+            review,
+            "1" if is_installable(app) else "0",
         )
 
 
@@ -740,6 +742,16 @@ def find_app(app_id: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def review_status(app: dict[str, Any]) -> str:
+    if isinstance(app.get("review"), dict):
+        return str(app.get("review_status") or app["review"].get("status") or "")
+    return str(app.get("review_status") or "")
+
+
+def is_installable(app: dict[str, Any]) -> bool:
+    return review_status(app) == "approved"
+
+
 def plan(app_id: str) -> int:
     app = find_app(app_id)
     if not app:
@@ -747,6 +759,8 @@ def plan(app_id: str) -> int:
         return 1
     title = localized_text(app, "title", resolve_locale()) or app_key(app)
     missing = []
+    if not is_installable(app):
+        missing.append("review-approved")
     if not download_url(app):
         missing.append("package")
     elif not is_deb_download(app):
@@ -900,6 +914,8 @@ def install(app_id: str, reinstall: bool = False, upgrade: bool = False) -> int:
         emit("ERROR", "app not found", app_id)
         return 1
     try:
+        if not is_installable(app):
+            raise RuntimeError("only approved apps can be installed")
         deb_path = download_deb(app)
         package = deb_package_name(app)
         if not package:

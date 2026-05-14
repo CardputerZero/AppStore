@@ -2,11 +2,11 @@
 
 Device-side APPLaunch application for browsing Cardputer Zero registries and installing apps from online registry metadata.
 
-AppStore installs only Debian `.deb` packages. The backend downloads the `.deb`
-to the local cache first, verifies the registry `download.md5`, then installs
-the local file with the Raspberry Pi OS/Debian package tools. Installed apps can
-be launched through their APPLaunch `.desktop` file and removed with the package
-manager.
+AppStore installs only Debian `.deb` packages whose registry review status is
+`approved`. The backend downloads the `.deb` to the local cache first, verifies
+the registry `download.md5`, then installs the local file with the Raspberry Pi
+OS/Debian package tools. Installed apps can be launched through their APPLaunch
+`.desktop` file and removed with the package manager.
 
 ## Runtime
 

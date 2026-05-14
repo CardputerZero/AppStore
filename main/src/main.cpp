@@ -57,6 +57,8 @@ struct StoreApp {
     std::string dependencies;
     std::string registry_name;
     std::string updated_at;
+    std::string review_status;
+    bool installable = false;
 };
 
 struct RegistryEntry {
@@ -294,11 +296,22 @@ bool has_blocking_missing(const std::string &missing)
 
 std::string missing_install_message(const std::string &missing)
 {
+    if (missing.find("review-approved") != std::string::npos) return "Only approved apps can install";
     if (missing.find("deb-only") != std::string::npos) return "Only .deb packages are supported";
     if (missing.find("md5") != std::string::npos) return "Registry MD5 is required";
     if (missing.find("package-name") != std::string::npos) return "Deb package name is required";
     if (missing.find("package") != std::string::npos) return "Download URL is required";
     return "Install metadata is incomplete";
+}
+
+bool can_install_app(const StoreApp &app)
+{
+    return app.installable && app.review_status == "approved";
+}
+
+std::string review_label(const StoreApp &app)
+{
+    return app.review_status.empty() ? "not approved" : app.review_status;
 }
 
 bool key_matches(const KeyEvent &key, char ch, uint32_t code)
@@ -689,6 +702,8 @@ void refresh_summary()
             if (fields.size() >= 14) app.share_code = fields[13];
             if (fields.size() >= 15) app.registry_name = fields[14];
             if (fields.size() >= 16) app.updated_at = fields[15];
+            if (fields.size() >= 17) app.review_status = fields[16];
+            if (fields.size() >= 18) app.installable = fields[17] == "1";
             apps.push_back(app);
         }
     }
@@ -1078,14 +1093,14 @@ void render_detail()
     label(g_root, "Size :", 176, 50, 42, 12, &lv_font_montserrat_10, 0x58A6FF);
     label(g_root, app->size, 220, 50, 84, 12, &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
 
-    label(g_root, "Author:", 10, 66, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
-    label(g_root, one_line(app->author.empty() ? "-" : app->author, 36), 62, 66, 246, 12,
+    label(g_root, "Review:", 10, 66, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
+    label(g_root, one_line(review_label(*app), 36), 62, 66, 246, 12,
+          &lv_font_montserrat_10, can_install_app(*app) ? 0x52D05D : 0xF0C45C, LV_LABEL_LONG_DOT);
+    label(g_root, "Author:", 10, 82, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
+    label(g_root, one_line(app->author.empty() ? "-" : app->author, 36), 62, 82, 246, 12,
           &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
-    label(g_root, "Git   :", 10, 82, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
-    label(g_root, one_line(app->git_url.empty() ? "-" : app->git_url, 42), 62, 82, 246, 12,
-          &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
-    label(g_root, "Image :", 10, 98, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
-    label(g_root, one_line(app->images.empty() ? "-" : app->images, 42), 62, 98, 246, 12,
+    label(g_root, "Git   :", 10, 98, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
+    label(g_root, one_line(app->git_url.empty() ? "-" : app->git_url, 42), 62, 98, 246, 12,
           &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
     label(g_root, "Deps  :", 10, 114, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
     label(g_root, one_line(app->dependencies.empty() ? "-" : app->dependencies, 42), 62, 114, 246, 12,
@@ -1107,9 +1122,14 @@ void render_detail()
     } else if (!g_status_message.empty()) {
         label(g_root, one_line(g_status_message, 54), 10, 153, 300, 12,
               &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
-    } else if (app->installed) {
+    } else if (app->installed && can_install_app(*app)) {
         label(g_root, "U Upgrade  D Delete  I Reinstall  B Back", 10, 153, 300, 12,
               &lv_font_montserrat_10, 0xCCCC33);
+    } else if (app->installed) {
+        label(g_root, "D Delete  B Back", 10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33);
+    } else if (!can_install_app(*app)) {
+        label(g_root, "Only approved apps can install  B Back", 10, 153, 300, 12,
+              &lv_font_montserrat_10, 0xF0C45C, LV_LABEL_LONG_DOT);
     } else {
         label(g_root, "I Install  B Back", 10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33);
     }
@@ -1820,8 +1840,12 @@ void handle_key(const KeyEvent &key)
             if (key_matches(key, 'b', KEY_B)) {
                 g_screen = Screen::Home;
             } else if (app && key_matches(key, 'i', KEY_I)) {
-                start_confirm(app->installed ? "reinstall" : "install");
-            } else if (app && app->installed && key_matches(key, 'u', KEY_U)) {
+                if (can_install_app(*app)) {
+                    start_confirm(app->installed ? "reinstall" : "install");
+                } else {
+                    g_status_message = "Only approved apps can install";
+                }
+            } else if (app && app->installed && can_install_app(*app) && key_matches(key, 'u', KEY_U)) {
                 start_confirm("upgrade");
             } else if (app && app->installed && key_matches(key, 'd', KEY_D)) {
                 start_confirm("uninstall");
