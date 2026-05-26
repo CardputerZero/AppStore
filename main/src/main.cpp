@@ -950,8 +950,8 @@ void draw_home_icon_panel(const StoreApp *app)
     box(19, 40, 82, 82, 0x202020, 0x4D4D4D, 2, 14, LV_OPA_COVER);
     if (!app) {
         center_strong_label(g_root, "-", 49, 82, 24, 26, &lv_font_montserrat_20, 0x9A9A9A);
-        if (!draw_packaged_image("store_arrow_down.png", 53, 127)) {
-            center_strong_label(g_root, "v", 61, 135, 28, 20, &lv_font_montserrat_20, 0xFF6A3D);
+        if (!draw_packaged_image("store_arrow_down.png", 48, 127)) {
+            center_strong_label(g_root, "v", 56, 135, 28, 20, &lv_font_montserrat_20, 0xFF6A3D);
         }
         return;
     }
@@ -960,8 +960,8 @@ void draw_home_icon_panel(const StoreApp *app)
         center_strong_label(g_root, app_initial(*app), 19, 66, 82, 30,
                             &lv_font_montserrat_20, app->installed ? 0x52D05D : 0xFFFFFF);
     }
-    if (!draw_packaged_image("store_arrow_down.png", 53, 127)) {
-        center_strong_label(g_root, "v", 61, 135, 28, 20, &lv_font_montserrat_20, 0xFF6A3D);
+    if (!draw_packaged_image("store_arrow_down.png", 48, 127)) {
+        center_strong_label(g_root, "v", 56, 135, 28, 20, &lv_font_montserrat_20, 0xFF6A3D);
     }
 }
 
