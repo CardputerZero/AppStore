@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cardputer Zero AppStore registry backend.
+"""CardputerZero AppStore registry backend.
 
 The LVGL UI consumes this script through a small TSV protocol. The backend keeps
 state on device, syncs JSON registries, caches icons, and installs APPLaunch

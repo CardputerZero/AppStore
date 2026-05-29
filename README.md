@@ -1,6 +1,6 @@
-# Cardputer Zero AppStore
+# CardputerZero AppStore
 
-Device-side APPLaunch application for browsing Cardputer Zero registries and installing apps from online registry metadata.
+Device-side APPLaunch application for browsing CardputerZero registries and installing apps from online registry metadata.
 
 AppStore installs only Debian `.deb` packages whose registry review status is
 `approved`. The backend downloads the `.deb` to the local cache first, verifies
