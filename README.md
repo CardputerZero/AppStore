@@ -29,6 +29,12 @@ Default registry:
 https://cardputerzero.github.io/generated/registry.json
 ```
 
+CN region registry:
+
+```text
+https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/packages/cn/registry.json
+```
+
 AppStore performs a fresh registry sync when it starts. Registry HTTP requests
 send `Cache-Control: no-cache` and a timestamp query parameter so GitHub Pages
 or intermediate CDN cache does not hide newly published entries. If a registry
@@ -40,6 +46,8 @@ AppStore keeps showing the cached app list and marks the registry as cached.
 ```bash
 python3 appstore.py --summary
 python3 appstore.py --registries
+python3 appstore.py --regions
+python3 appstore.py --set-region CN
 python3 appstore.py --add-registry https://example.com/generated/registry.json
 python3 appstore.py --sync
 python3 appstore.py --plan <app-id>
@@ -50,11 +58,14 @@ python3 appstore.py --uninstall <app-id>
 
 `<app-id>` accepts either the app UUID or its `share_code` from registry metadata.
 
-Multiple registries are supported. Add another registry from the Registries
-screen or with `--add-registry`; enabled registries are synced and merged into
-one app list. Apps with the same UUID/share code are de-duplicated, with later
-registry metadata taking precedence. On the home screen, `Ctrl+Tab` cycles the
-display order through Featured, Name, Category, Installed, and Registry.
+Multiple registries are supported. On the Registries settings screen, use the
+region radio buttons to choose the built-in Default or CN registry. Add another
+registry from the same screen or with `--add-registry`; the selected region
+registry and all enabled custom registries are synced and merged into one app
+list. Apps with the same UUID/share code are de-duplicated, with later registry
+metadata taking precedence. On the home screen, press `S` to open Registry
+Settings and `C` to open the share code input page. AppStore syncs the registry
+automatically when it starts.
 
 Registry entries must provide a Debian package download:
 
@@ -68,6 +79,6 @@ download:
 
 ## Share Code Flow
 
-On the AppStore home screen, press `S` to open the share code input page. Type
+On the AppStore home screen, press `C` to open the share code input page. Type
 the code from CardputerZero Hub, then press `Enter` to jump to that app's detail
 page. From there, use the normal install/reinstall flow.

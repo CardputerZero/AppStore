@@ -25,6 +25,13 @@ from typing import Any, Optional
 
 DEFAULT_REGISTRY_URL = "https://cardputerzero.github.io/generated/registry.json"
 DEFAULT_REGISTRY_NAME = "CardputerZero Hub"
+CN_REGISTRY_URL = "https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/packages/cn/registry.json"
+CN_REGISTRY_NAME = "CardputerZero Hub CN"
+REGION_REGISTRIES = {
+    "default": {"name": DEFAULT_REGISTRY_NAME, "url": DEFAULT_REGISTRY_URL, "label": "Default"},
+    "CN": {"name": CN_REGISTRY_NAME, "url": CN_REGISTRY_URL, "label": "China"},
+}
+BUILTIN_REGISTRY_URLS = {item["url"] for item in REGION_REGISTRIES.values()}
 USER_AGENT = "CardputerZero-AppStore/0.1"
 CACHE_BUST_PARAM = "_cz_appstore_ts"
 
@@ -100,14 +107,49 @@ def normalize_registry_url(value: str) -> str:
     return (path / "generated" / "registry.json").resolve().as_uri()
 
 
+def normalize_region(value: Any) -> str:
+    text = str(value or "default").strip()
+    if not text:
+        return "default"
+    if text in REGION_REGISTRIES:
+        return text
+    upper = text.upper()
+    if upper in REGION_REGISTRIES:
+        return upper
+    lower = text.lower()
+    if lower == "china":
+        return "CN"
+    return "default"
+
+
+def region_registry(region: str) -> dict[str, Any]:
+    code = normalize_region(region)
+    item = REGION_REGISTRIES[code]
+    return {
+        "name": item["name"],
+        "url": item["url"],
+        "enabled": True,
+        "builtin": True,
+        "region": code,
+    }
+
+
+def is_builtin_registry_url(url: str) -> bool:
+    return normalize_registry_url(url) in BUILTIN_REGISTRY_URLS
+
+
 def load_config() -> dict[str, Any]:
     ensure_dirs()
     data = read_json(config_path(), {})
+    if not isinstance(data, dict):
+        data = {}
+    selected_region = normalize_region(data.get("region", "default"))
     registries = data.get("registries")
-    if not isinstance(registries, list) or not registries:
-        registries = [{"name": DEFAULT_REGISTRY_NAME, "url": DEFAULT_REGISTRY_URL, "enabled": True}]
-    normalized = []
-    seen = set()
+    if not isinstance(registries, list):
+        registries = []
+    builtin = region_registry(selected_region)
+    normalized = [builtin]
+    seen = {builtin["url"]}
     for item in registries:
         if isinstance(item, str):
             item = {"url": item}
@@ -115,6 +157,10 @@ def load_config() -> dict[str, Any]:
             continue
         url = normalize_registry_url(str(item.get("url", "")))
         if url in seen:
+            if url == builtin["url"]:
+                builtin["enabled"] = enabled_value(item.get("enabled", True))
+            continue
+        if url in BUILTIN_REGISTRY_URLS:
             continue
         seen.add(url)
         normalized.append({
@@ -122,7 +168,8 @@ def load_config() -> dict[str, Any]:
             "url": url,
             "enabled": enabled_value(item.get("enabled", True)),
         })
-    data["registries"] = normalized or [{"name": DEFAULT_REGISTRY_NAME, "url": DEFAULT_REGISTRY_URL, "enabled": True}]
+    data["region"] = selected_region
+    data["registries"] = normalized
     return data
 
 
@@ -252,11 +299,10 @@ def registry_site_root(index_url: str) -> str:
 
 def full_registry_url(index_url: str) -> str:
     clean_url = clean_json_url(index_url)
-    if clean_url.endswith("/registry-index.json"):
-        return clean_url[:-len("registry-index.json")] + "registry.json"
-    if clean_url.endswith("/registry.json"):
+    parsed = urllib.parse.urlparse(clean_url)
+    if Path(parsed.path).suffix == ".json":
         return clean_url
-    return urllib.parse.urljoin(clean_url, "registry.json")
+    return urllib.parse.urljoin(clean_url.rstrip("/") + "/", "registry.json")
 
 
 def cache_file_for(url: str) -> Path:
@@ -524,9 +570,14 @@ def exec_binary_path(exec_value: str) -> str:
     return shutil.which(command) or ""
 
 
+def is_executable_file(path: str | Path) -> bool:
+    p = Path(path)
+    return p.is_file() and os.access(p, os.X_OK)
+
+
 def executable_exists(exec_value: str) -> bool:
     binary = exec_binary_path(exec_value)
-    return bool(binary) and Path(binary).exists() and os.access(binary, os.X_OK)
+    return bool(binary) and is_executable_file(binary)
 
 
 def package_installed(package: str) -> bool:
@@ -565,6 +616,11 @@ def candidate_execs(app: dict[str, Any], files: list[str]) -> list[str]:
         p = Path(path)
         if p.name in wanted_names:
             candidates.append(path)
+    app_bin = app_root() / "bin"
+    for path in files:
+        p = Path(path)
+        if p.parent == app_bin or (package and p.parent == Path("/usr/lib") / package):
+            candidates.append(path)
     return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
 
@@ -589,7 +645,7 @@ def repair_applaunch_desktop(app: dict[str, Any], files: list[str]) -> str:
         return ""
     for exec_value in candidate_execs(app, files):
         binary = exec_binary_path(exec_value)
-        if binary and Path(binary).exists() and os.access(binary, os.X_OK):
+        if binary and is_executable_file(binary):
             rewrite_desktop_exec(desktop, binary)
             return binary
     return ""
@@ -731,7 +787,37 @@ def registries() -> None:
             record.get("error") or "",
             "1" if source.get("enabled", True) else "0",
             source.get("name") or registry_name_from_url(source["url"]),
+            "1" if source.get("builtin") else "0",
+            source.get("region") or "",
         )
+
+
+def regions() -> None:
+    config = load_config()
+    selected = normalize_region(config.get("region", "default"))
+    current = REGION_REGISTRIES[selected]
+    emit("REGION", selected, current["label"], current["url"])
+    for code, item in REGION_REGISTRIES.items():
+        emit("REGION_OPTION", code, item["label"], item["url"], "1" if code == selected else "0")
+
+
+def set_region(region: str) -> int:
+    requested = str(region or "").strip()
+    selected = normalize_region(requested)
+    if requested and selected == "default" and requested.lower() not in {"default", "global"}:
+        emit("ERROR", "unknown region", requested)
+        return 1
+    config = load_config()
+    custom_registries = [
+        item for item in config["registries"]
+        if not item.get("builtin") and not is_builtin_registry_url(item["url"])
+    ]
+    config["region"] = selected
+    config["registries"] = [region_registry(selected), *custom_registries]
+    save_config(config)
+    item = REGION_REGISTRIES[selected]
+    emit("REGION", selected, item["label"], item["url"])
+    return 0
 
 
 def find_app(app_id: str) -> Optional[dict[str, Any]]:
@@ -807,6 +893,10 @@ def deb_cache_path(url: str) -> Path:
     return cache_dir() / "downloads" / f"{short_hash(url)}-{safe_name}"
 
 
+def partial_deb_path(dest: Path) -> Path:
+    return dest.with_name(dest.name + ".parted")
+
+
 def download_deb(app: dict[str, Any]) -> Path:
     url = download_url(app)
     if not url:
@@ -817,18 +907,21 @@ def download_deb(app: dict[str, Any]) -> Path:
     if not expected_md5:
         raise RuntimeError("download md5 is required")
     dest = deb_cache_path(url)
+    partial = partial_deb_path(dest)
     if dest.exists():
         try:
             verify_md5(dest, expected_md5)
+            partial.unlink(missing_ok=True)
             return dest
         except Exception:
-            pass
-    download_file(url, dest, progress_stage="download", resume=True)
+            dest.unlink(missing_ok=True)
+    download_file(url, partial, progress_stage="download", resume=True)
     try:
-        verify_md5(dest, expected_md5)
+        verify_md5(partial, expected_md5)
     except Exception:
-        dest.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
         raise
+    partial.replace(dest)
     return dest
 
 
@@ -840,10 +933,19 @@ def command_error(result: subprocess.CompletedProcess[str]) -> str:
     return text[-500:]
 
 
+def package_command_args(args: list[str]) -> list[str]:
+    if os.geteuid() == 0:
+        return args
+    sudo = shutil.which("sudo")
+    if not sudo:
+        raise RuntimeError("root privileges are required for package operations")
+    return [sudo, "-n", "env", "DEBIAN_FRONTEND=noninteractive", *args]
+
+
 def run_package_command(args: list[str]) -> None:
     env = os.environ.copy()
     env["DEBIAN_FRONTEND"] = "noninteractive"
-    result = subprocess.run(args, check=False, capture_output=True, text=True, env=env)
+    result = subprocess.run(package_command_args(args), check=False, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         raise RuntimeError(command_error(result))
 
@@ -959,6 +1061,9 @@ def install(app_id: str, reinstall: bool = False, upgrade: bool = False) -> int:
 def add_registry(url: str, name: str = "") -> int:
     config = load_config()
     normalized = normalize_registry_url(url)
+    if is_builtin_registry_url(normalized):
+        emit("ERROR", "use region selection for built-in registries", normalized)
+        return 1
     if any(item["url"] == normalized for item in config["registries"]):
         emit("ERROR", "registry already exists", normalized)
         return 1
@@ -977,6 +1082,9 @@ def add_registry(url: str, name: str = "") -> int:
 def remove_registry(url: str) -> int:
     config = load_config()
     normalized = normalize_registry_url(url)
+    if is_builtin_registry_url(normalized):
+        emit("ERROR", "registry is managed by region selection", normalized)
+        return 1
     config["registries"] = [item for item in config["registries"] if item["url"] != normalized]
     save_config(config)
     emit("REGISTRY", "REMOVED", normalized)
@@ -1000,6 +1108,12 @@ def edit_registry(old_url: str, new_url: str, name: str = "") -> int:
     config = load_config()
     old_normalized = normalize_registry_url(old_url)
     new_normalized = normalize_registry_url(new_url)
+    if is_builtin_registry_url(old_normalized):
+        emit("ERROR", "registry is managed by region selection", old_normalized)
+        return 1
+    if is_builtin_registry_url(new_normalized):
+        emit("ERROR", "use region selection for built-in registries", new_normalized)
+        return 1
     updated = False
     rewritten = []
     final_name = name.strip() or registry_name_from_url(new_normalized)
@@ -1030,6 +1144,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary", action="store_true")
     parser.add_argument("--summary-sync-if-empty", action="store_true")
     parser.add_argument("--registries", action="store_true")
+    parser.add_argument("--regions", action="store_true")
+    parser.add_argument("--set-region")
     parser.add_argument("--sync", action="store_true")
     parser.add_argument("--add-registry")
     parser.add_argument("--registry-name")
@@ -1054,6 +1170,11 @@ def main() -> int:
     if args.registries:
         registries()
         return 0
+    if args.regions:
+        regions()
+        return 0
+    if args.set_region:
+        return set_region(args.set_region)
     if args.sync:
         records = sync_all()
         ok = sum(1 for record in records if record.get("status") == "ok")

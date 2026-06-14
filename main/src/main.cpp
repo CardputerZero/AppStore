@@ -40,6 +40,7 @@ constexpr int kLineHeight = 15;
 constexpr uint32_t kEscLongPressMs = 1200;
 constexpr uint32_t kJobStartDelayMs = 80;
 constexpr uint32_t kJobPollIntervalMs = 250;
+constexpr const char *kDefaultRegistryUrl = "https://cardputerzero.github.io/generated/registry.json";
 
 struct StoreApp {
     std::string id;
@@ -68,7 +69,9 @@ struct RegistryEntry {
     std::string count;
     std::string updated_at;
     std::string error;
+    std::string region;
     bool enabled = true;
+    bool builtin = false;
 };
 
 enum class Screen {
@@ -125,15 +128,19 @@ std::vector<RegistryEntry> g_registry_entries;
 int g_category = 0;
 int g_selected = 0;
 int g_registry_selected = 0;
+int g_registry_page_focus = 0;
 Screen g_screen = Screen::Home;
 bool g_default_category_applied = false;
 SortRule g_sort_rule = SortRule::Default;
 std::string g_confirm_action;
 std::vector<std::string> g_confirm_lines;
-std::string g_registry_input = "https://cardputerzero.github.io/generated/registry.json";
+std::string g_registry_input = kDefaultRegistryUrl;
 std::string g_registry_edit_url;
 std::string g_registry_name_input;
 int g_registry_focus = 0;
+std::string g_region_code = "default";
+std::string g_region_label = "Default";
+std::string g_region_registry_url = kDefaultRegistryUrl;
 std::string g_share_code_input;
 std::string g_share_code_message = "Enter a code from CardputerZero Hub.";
 bool g_job_running = false;
@@ -722,11 +729,29 @@ void refresh_summary()
     }
     rebuild_visible();
     select_visible_app_by_id(previous_app_id);
-    if (!warning.empty()) g_status_message = one_line(warning, 54);
+    if (!warning.empty()) {
+        g_status_message = one_line(warning, 54);
+    } else if (g_status_message.rfind("Registry offline", 0) == 0 ||
+               g_status_message.rfind("Unable to load", 0) == 0) {
+        g_status_message.clear();
+    }
 }
 
 void refresh_registries()
 {
+    std::string regions_output = run_capture(backend_cmd("--regions"));
+    std::istringstream regions_stream(regions_output);
+    std::string region_line;
+    while (std::getline(regions_stream, region_line)) {
+        auto fields = split_tab(region_line);
+        if (fields.size() >= 4 && fields[0] == "REGION") {
+            g_region_code = fields[1];
+            g_region_label = fields[2];
+            g_region_registry_url = fields[3];
+            break;
+        }
+    }
+
     g_registry_lines.clear();
     g_registry_entries.clear();
     std::string output = run_capture(backend_cmd("--registries"));
@@ -743,6 +768,8 @@ void refresh_registries()
             if (fields.size() >= 6) entry.error = fields[5];
             if (fields.size() >= 7) entry.enabled = fields[6] != "0";
             entry.name = fields.size() >= 8 && !fields[7].empty() ? fields[7] : entry.url;
+            if (fields.size() >= 9) entry.builtin = fields[8] == "1";
+            if (fields.size() >= 10) entry.region = fields[9];
             std::string item = std::string(entry.enabled ? "on  " : "off ") + entry.status + "  " + entry.count + " apps";
             if (!entry.updated_at.empty()) item += "  " + entry.updated_at.substr(5, 5);
             if (!entry.error.empty()) {
@@ -755,7 +782,7 @@ void refresh_registries()
         }
     }
     if (g_registry_lines.empty()) {
-        g_registry_lines.push_back("not synced  0 apps  " + g_registry_input);
+        g_registry_lines.push_back("not synced  0 apps  " + g_region_registry_url);
     }
     if (g_registry_selected >= static_cast<int>(g_registry_entries.size())) {
         g_registry_selected = std::max(0, static_cast<int>(g_registry_entries.size()) - 1);
@@ -1061,14 +1088,10 @@ void render_home()
                      &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
     }
     box(120, 154, 198, 14, 0x333333, 0x333333, 0);
-    strong_label(g_root, "ok : detail", 122, 155, 54, 12, &lv_font_montserrat_10,
-                 0x43CF4D, LV_LABEL_LONG_DOT);
-    strong_label(g_root, "tab : sort", 176, 155, 52, 12, &lv_font_montserrat_10,
-                 0x168CE5, LV_LABEL_LONG_DOT);
-    strong_label(g_root, "(" + sort_rule_label(g_sort_rule) + ")", 229, 155, 40, 12,
-                 &lv_font_montserrat_10, 0x168CE5, LV_LABEL_LONG_DOT);
-    strong_label(g_root, "r : reload", 270, 155, 48, 12, &lv_font_montserrat_10,
+    strong_label(g_root, "s : settings", 128, 155, 82, 12, &lv_font_montserrat_10,
                  0xCCCC33, LV_LABEL_LONG_DOT);
+    strong_label(g_root, "c : share code", 212, 155, 96, 12, &lv_font_montserrat_10,
+                 0x168CE5, LV_LABEL_LONG_DOT);
 }
 
 void render_detail()
@@ -1199,35 +1222,57 @@ void render_progress()
                  &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
+void draw_radio_option(int x, int y, const std::string &text, bool selected, bool focused)
+{
+    uint32_t border = focused ? 0xCCCC33 : (selected ? 0x58A6FF : 0x6E7681);
+    uint32_t text_color = selected ? 0xFFFFFF : 0x8B949E;
+    box(x, y + 2, 10, 10, 0x0D1117, border, 1, 5);
+    if (selected) {
+        box(x + 3, y + 5, 4, 4, focused ? 0xCCCC33 : 0x58A6FF,
+            focused ? 0xCCCC33 : 0x58A6FF, 0, 2);
+    }
+    label(g_root, text, x + 15, y, 70, 12, &lv_font_montserrat_10,
+          text_color, LV_LABEL_LONG_DOT);
+}
+
 void render_registry()
 {
     clean_root();
     draw_system_bar();
     box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
     box(0, 20, 320, 22, 0x1F6FEB, 0x1F6FEB, 0);
-    label(g_root, "Registries", 8, 24, 180, 15, &lv_font_montserrat_12, 0xFFFFFF);
+    label(g_root, "Registry Settings", 8, 24, 180, 15, &lv_font_montserrat_12, 0xFFFFFF);
     label(g_root, "B Back", 270, 24, 44, 14, &lv_font_montserrat_10, 0xAECBFA);
 
+    bool region_focused = g_registry_page_focus == 0;
+    label(g_root, "REGION", 24, 45, 45, 12, &lv_font_montserrat_10,
+          region_focused ? 0xCCCC33 : 0x58A6FF);
+    draw_radio_option(76, 45, "Default", g_region_code != "CN", region_focused);
+    draw_radio_option(164, 45, "CN", g_region_code == "CN", region_focused);
+
     if (g_registry_entries.empty()) {
-        label(g_root, "No registries configured.", 10, 68, 300, 14,
+        label(g_root, "No registries configured.", 10, 82, 300, 14,
               &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
     } else {
         const RegistryEntry &entry = g_registry_entries[g_registry_selected];
         center_label(g_root, std::to_string(g_registry_selected + 1) + "/" +
-                     std::to_string(g_registry_entries.size()), 132, 45, 56, 12,
+                     std::to_string(g_registry_entries.size()), 250, 45, 42, 12,
                      &lv_font_montserrat_10, 0x8B949E, LV_LABEL_LONG_DOT);
-        strong_label(g_root, "<", 8, 78, 12, 18, &lv_font_montserrat_20, 0xFF6A3D);
-        strong_label(g_root, ">", 303, 78, 12, 18, &lv_font_montserrat_20, 0xFF6A3D);
-        label(g_root, "NAME", 24, 48, 34, 12, &lv_font_montserrat_10, 0x58A6FF);
-        strong_label(g_root, one_line(entry.name, 28), 24, 61, 210, 16,
+        uint32_t nav_color = g_registry_page_focus == 1 ? 0xFF6A3D : 0x6E7681;
+        strong_label(g_root, "<", 8, 88, 12, 18, &lv_font_montserrat_20, nav_color);
+        strong_label(g_root, ">", 303, 88, 12, 18, &lv_font_montserrat_20, nav_color);
+        label(g_root, "NAME", 24, 62, 34, 12, &lv_font_montserrat_10,
+              g_registry_page_focus == 1 ? 0xCCCC33 : 0x58A6FF);
+        strong_label(g_root, one_line(entry.name, 28), 24, 75, 210, 16,
                      &lv_font_montserrat_12, 0xFFFFFF, LV_LABEL_LONG_DOT);
-        label(g_root, entry.enabled ? "on" : "off", 242, 61, 28, 12, &lv_font_montserrat_10,
+        label(g_root, entry.enabled ? "on" : "off", 242, 75, 28, 12, &lv_font_montserrat_10,
               entry.enabled ? 0x43CF4D : 0x6E7681, LV_LABEL_LONG_DOT);
-        label(g_root, entry.count + " apps", 272, 61, 42, 12, &lv_font_montserrat_10,
+        label(g_root, entry.count + " apps", 272, 75, 42, 12, &lv_font_montserrat_10,
               0xCCCC33, LV_LABEL_LONG_DOT);
-        label(g_root, "URL", 24, 82, 34, 12, &lv_font_montserrat_10, 0x58A6FF);
-        box(24, 96, 272, 38, 0x111923, 0x2A3A46, 1, 2);
-        label(g_root, entry.url, 30, 100, 260, 30, &lv_font_montserrat_10, 0xE6EDF3,
+        label(g_root, entry.builtin ? "URL (region)" : "URL", 24, 96, 80, 12,
+              &lv_font_montserrat_10, 0x58A6FF);
+        box(24, 109, 272, 26, 0x111923, 0x2A3A46, 1, 2);
+        label(g_root, entry.url, 30, 112, 260, 20, &lv_font_montserrat_10, 0xE6EDF3,
               LV_LABEL_LONG_WRAP);
         if (!entry.error.empty()) {
             label(g_root, one_line(entry.error, 45), 24, 136, 272, 12, &lv_font_montserrat_10,
@@ -1235,8 +1280,11 @@ void render_registry()
         }
     }
 
-    label(g_root, "A add  E edit  T on/off  D del  R sync", 10, 153, 300, 12,
-          &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+    std::string hint = region_focused ?
+        "A add registry  Up/Down focus  < > region" :
+        "A add registry  E edit  T toggle  D del  R sync";
+    label(g_root, hint, 10, 153, 300, 12, &lv_font_montserrat_10,
+          0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
 void render_registry_edit()
@@ -1474,7 +1522,7 @@ void sync_catalog(bool refresh_registries_after = false)
     pthread_mutex_lock(&g_sync_mutex);
     if (g_sync_running) {
         pthread_mutex_unlock(&g_sync_mutex);
-        g_status_message.clear();
+        g_status_message = "Sync already running";
         return;
     }
     g_sync_running = true;
@@ -1483,7 +1531,7 @@ void sync_catalog(bool refresh_registries_after = false)
     g_sync_output.clear();
     pthread_mutex_unlock(&g_sync_mutex);
 
-    g_status_message.clear();
+    g_status_message = "Syncing catalog...";
     pthread_t thread_id;
     if (pthread_create(&thread_id, nullptr, sync_thread_main, nullptr) != 0) {
         pthread_mutex_lock(&g_sync_mutex);
@@ -1532,7 +1580,7 @@ void open_registry_add_screen()
 {
     g_registry_edit_url.clear();
     g_registry_name_input.clear();
-    g_registry_input = "https://cardputerzero.github.io/generated/registry.json";
+    g_registry_input = kDefaultRegistryUrl;
     g_registry_focus = 0;
     g_status_message.clear();
     g_screen = Screen::RegistryEdit;
@@ -1611,6 +1659,22 @@ RegistryEntry *selected_registry()
     return &g_registry_entries[g_registry_selected];
 }
 
+void select_region(const std::string &region)
+{
+    if (region == g_region_code || (region == "default" && g_region_code != "CN")) {
+        return;
+    }
+    std::string out = run_capture(backend_cmd("--set-region " + shell_quote(region)));
+    if (out.find("ERROR") != std::string::npos) {
+        g_status_message = one_line(backend_error_message(out), 54);
+        return;
+    }
+    refresh_registries();
+    g_status_message = "Region: " + g_region_label;
+    refresh_summary();
+    sync_catalog(true);
+}
+
 void add_registry_from_input()
 {
     if (g_registry_name_input.empty() || g_registry_input.empty()) {
@@ -1668,6 +1732,10 @@ void delete_selected_registry()
 {
     RegistryEntry *entry = selected_registry();
     if (!entry) return;
+    if (entry->builtin) {
+        g_status_message = "Use region setting";
+        return;
+    }
     std::string out = run_capture(backend_cmd("--remove-registry " + shell_quote(entry->url)));
     if (out.find("ERROR") != std::string::npos) {
         g_status_message = one_line(out, 44);
@@ -1683,6 +1751,10 @@ void edit_selected_registry()
 {
     RegistryEntry *entry = selected_registry();
     if (!entry) return;
+    if (entry->builtin) {
+        g_status_message = "Use region setting";
+        return;
+    }
     g_registry_edit_url = entry->url;
     g_registry_input = entry->url;
     g_registry_name_input = entry->name;
@@ -1818,18 +1890,16 @@ void handle_key(const KeyEvent &key)
             } else if ((key.code == KEY_LEFT || key.code == KEY_Z || key.ch == 'z' || key.ch == '<') && !g_categories.empty()) {
                 g_category = g_category == 0 ? static_cast<int>(g_categories.size()) - 1 : g_category - 1;
                 rebuild_visible();
-            } else if ((key.code == KEY_RIGHT || key.code == KEY_C || key.ch == 'c' || key.ch == '>') && !g_categories.empty()) {
+            } else if ((key.code == KEY_RIGHT || key.ch == '>') && !g_categories.empty()) {
                 g_category = (g_category + 1) % static_cast<int>(g_categories.size());
                 rebuild_visible();
             } else if (key.code == KEY_TAB) {
                 cycle_sort_rule();
             } else if (key.code == KEY_ENTER && selected_app()) {
                 g_screen = Screen::Detail;
-            } else if (key_matches(key, 'r', KEY_R)) {
-                sync_catalog();
-            } else if (key_matches(key, 'a', KEY_A)) {
-                open_registry_screen();
             } else if (key_matches(key, 's', KEY_S)) {
+                open_registry_screen();
+            } else if (key_matches(key, 'c', KEY_C)) {
                 open_share_code_screen();
             } else if (key_matches(key, 'q', KEY_Q)) {
                 request_quit();
@@ -1869,13 +1939,23 @@ void handle_key(const KeyEvent &key)
         case Screen::Registry:
             if (key_matches(key, 'b', KEY_B)) {
                 g_screen = Screen::Home;
+            } else if (key.code == KEY_UP || key.code == KEY_DOWN) {
+                g_registry_page_focus = 1 - g_registry_page_focus;
             } else if (key_matches(key, 'a', KEY_A)) {
                 open_registry_add_screen();
-            } else if ((key.code == KEY_LEFT || key.code == KEY_Z || key.ch == 'z' || key.ch == '<') && !g_registry_entries.empty()) {
-                g_registry_selected = g_registry_selected == 0 ?
-                    static_cast<int>(g_registry_entries.size()) - 1 : g_registry_selected - 1;
-            } else if ((key.code == KEY_RIGHT || key.code == KEY_C || key.ch == 'c' || key.ch == '>') && !g_registry_entries.empty()) {
-                g_registry_selected = (g_registry_selected + 1) % static_cast<int>(g_registry_entries.size());
+            } else if (key.code == KEY_LEFT || key.code == KEY_Z || key.ch == 'z' || key.ch == '<') {
+                if (g_registry_page_focus == 0) {
+                    select_region("default");
+                } else if (!g_registry_entries.empty()) {
+                    g_registry_selected = g_registry_selected == 0 ?
+                        static_cast<int>(g_registry_entries.size()) - 1 : g_registry_selected - 1;
+                }
+            } else if (key.code == KEY_RIGHT || key.code == KEY_C || key.ch == 'c' || key.ch == '>') {
+                if (g_registry_page_focus == 0) {
+                    select_region("CN");
+                } else if (!g_registry_entries.empty()) {
+                    g_registry_selected = (g_registry_selected + 1) % static_cast<int>(g_registry_entries.size());
+                }
             } else if (key_matches(key, 'r', KEY_R)) {
                 sync_catalog(true);
             } else if (key_matches(key, 't', KEY_T)) {
@@ -1884,7 +1964,7 @@ void handle_key(const KeyEvent &key)
                 delete_selected_registry();
             } else if (key_matches(key, 'e', KEY_E)) {
                 edit_selected_registry();
-            } else if (key.code == KEY_ENTER) {
+            } else if (key.code == KEY_ENTER && g_registry_page_focus == 1) {
                 edit_selected_registry();
             }
             break;
@@ -1915,7 +1995,7 @@ void handle_key(const KeyEvent &key)
             } else if (key.code == KEY_ENTER) {
                 open_share_code_match();
             } else if (key.ch >= 32 && key.ch <= 126 && g_share_code_input.size() < 64) {
-                if (g_share_code_input.empty() && key.ch == 's' &&
+                if (g_share_code_input.empty() && key.ch == 'c' &&
                     lv_tick_elaps(g_share_code_open_tick) < 250) {
                     break;
                 }
