@@ -74,7 +74,8 @@ def short_hash(value: str) -> str:
 
 
 def ensure_dirs() -> None:
-    for path in (state_dir(), cache_dir(), cache_dir() / "icons", cache_dir() / "downloads"):
+    for path in (state_dir(), cache_dir(), cache_dir() / "icons",
+                 cache_dir() / "screenshots", cache_dir() / "downloads"):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -309,24 +310,32 @@ def cache_file_for(url: str) -> Path:
     return cache_dir() / f"registry-{short_hash(url)}.json"
 
 
-def cache_icon(index_url: str, icon_ref: str) -> str:
-    if not icon_ref:
+def cache_media(index_url: str, media_ref: str, subdir: str) -> str:
+    if not media_ref:
         return ""
-    if icon_ref.startswith("file://"):
-        return urllib.parse.urlparse(icon_ref).path
-    if icon_ref.startswith(("http://", "https://")):
-        icon_url = icon_ref
+    if media_ref.startswith("file://"):
+        return urllib.parse.urlparse(media_ref).path
+    if media_ref.startswith(("http://", "https://")):
+        media_url = media_ref
     else:
-        icon_url = urllib.parse.urljoin(registry_site_root(index_url), icon_ref)
-    suffix = Path(urllib.parse.urlparse(icon_url).path).suffix or ".png"
-    dest = cache_dir() / "icons" / f"{short_hash(icon_url)}{suffix}"
+        media_url = urllib.parse.urljoin(registry_site_root(index_url), media_ref)
+    suffix = Path(urllib.parse.urlparse(media_url).path).suffix or ".png"
+    dest = cache_dir() / subdir / f"{short_hash(media_url)}{suffix}"
     if dest.exists() and dest.stat().st_size > 0:
         return str(dest)
     try:
-        download_file(icon_url, dest)
+        download_file(media_url, dest)
         return str(dest)
     except Exception:
         return ""
+
+
+def cache_icon(index_url: str, icon_ref: str) -> str:
+    return cache_media(index_url, icon_ref, "icons")
+
+
+def cache_screenshot(index_url: str, screenshot_ref: str) -> str:
+    return cache_media(index_url, screenshot_ref, "screenshots")
 
 
 def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
@@ -339,6 +348,7 @@ def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
         "index": {},
         "full": {},
         "icons": {},
+        "screenshots": {},
     }
     try:
         index = request_json(url)
@@ -349,13 +359,41 @@ def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:
             record["full_error"] = str(exc)
             record["full"] = {}
-        for app in index.get("apps", []):
-            if isinstance(app, dict):
-                icon = app.get("icon") or app.get("assets", {}).get("icon")
-                local_icon = cache_icon(url, str(icon or ""))
-                if local_icon:
-                    app_id = app.get("uuid") or app.get("share_code") or app.get("title")
-                    record["icons"][str(app_id)] = local_icon
+        index_apps = [app for app in index.get("apps", []) if isinstance(app, dict)]
+        full_apps = [app for app in record["full"].get("apps", []) if isinstance(app, dict)]
+        full_by_key = {app_key(app): app for app in full_apps if app_key(app)}
+        merged_for_assets = []
+        seen_asset_keys = set()
+        for item in index_apps:
+            key = app_key(item)
+            if not key:
+                continue
+            full = dict(full_by_key.get(key, {}))
+            full.update({k: v for k, v in item.items() if v not in (None, "", [])})
+            merged_for_assets.append(full)
+            seen_asset_keys.add(key)
+        for item in full_apps:
+            key = app_key(item)
+            if key and key not in seen_asset_keys:
+                merged_for_assets.append(item)
+                seen_asset_keys.add(key)
+
+        for app in merged_for_assets:
+            key = app_key(app)
+            if not key:
+                continue
+            assets = app.get("assets") if isinstance(app.get("assets"), dict) else {}
+            icon = app.get("icon") or assets.get("icon")
+            local_icon = cache_icon(url, str(icon or ""))
+            if local_icon:
+                record["icons"][key] = local_icon
+            local_screenshots = []
+            for screenshot in list_value(assets.get("screenshots") or app.get("screenshots")):
+                local = cache_screenshot(url, screenshot)
+                if local:
+                    local_screenshots.append(local)
+            if local_screenshots:
+                record["screenshots"][key] = local_screenshots
         write_json(cache_file_for(url), record)
     except Exception as exc:
         record["status"] = "error"
@@ -595,6 +633,21 @@ def package_installed(package: str) -> bool:
         return False
 
 
+def package_version(package: str) -> str:
+    if not package or not shutil.which("dpkg-query"):
+        return ""
+    try:
+        result = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Version}", package],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
 def candidate_execs(app: dict[str, Any], files: list[str]) -> list[str]:
     candidates = []
     preferred = applaunch_exec(app)
@@ -673,6 +726,24 @@ def is_installed(app: dict[str, Any]) -> bool:
     return desktop_path_for(app).exists()
 
 
+def installed_version(app: dict[str, Any]) -> str:
+    package = deb_package_name(app)
+    if package:
+        version = package_version(package)
+        if version:
+            return version
+    key = app_key(app)
+    record = installed_records().get(key, {})
+    if isinstance(record, dict):
+        package = str(record.get("package") or "")
+        if package:
+            version = package_version(package)
+            if version:
+                return version
+        return str(record.get("version") or "")
+    return ""
+
+
 def merge_apps(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: dict[str, dict[str, Any]] = {}
     for record in records:
@@ -680,6 +751,7 @@ def merge_apps(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         full_apps = record.get("full", {}).get("apps", [])
         full_by_key = {app_key(app): app for app in full_apps if isinstance(app, dict) and app_key(app)}
         icons = record.get("icons", {})
+        screenshots = record.get("screenshots", {})
         for item in index_apps:
             if not isinstance(item, dict):
                 continue
@@ -692,13 +764,18 @@ def merge_apps(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             full["_registry_name"] = record.get("name", "")
             full["_registry_status"] = record.get("status", "")
             full["_icon_local"] = icons.get(key, "")
+            full["_screenshots_local"] = screenshots.get(key, [])
             merged[key] = full
         for item in full_apps:
             if isinstance(item, dict) and app_key(item) and app_key(item) not in merged:
+                key = app_key(item)
                 item = dict(item)
                 item["_registry_url"] = record.get("url", "")
                 item["_registry_name"] = record.get("name", "")
-                merged[app_key(item)] = item
+                item["_registry_status"] = record.get("status", "")
+                item["_icon_local"] = icons.get(key, "")
+                item["_screenshots_local"] = screenshots.get(key, [])
+                merged[key] = item
     locale = resolve_locale()
     return sorted(merged.values(), key=lambda app: (not bool(app.get("featured")), localized_text(app, "title", locale).lower()))
 
@@ -748,6 +825,8 @@ def summary(sync_if_empty: bool = False) -> None:
         review = review_status(app)
         featured = bool(app.get("featured")) or str(review) in {"approved", "ci-passed"}
         icon = app.get("_icon_local") or ""
+        images = [icon] if icon else []
+        images += [str(path) for path in app.get("_screenshots_local", []) if path]
         size = download_size(app)
         title = localized_text(app, "title", locale) or key
         summary_text = localized_text(app, "summary", locale) or localized_text(app, "description", locale)
@@ -763,13 +842,14 @@ def summary(sync_if_empty: bool = False) -> None:
             summary_text,
             author_text(app),
             source_repo(app),
-            icon,
+            ",".join(images),
             dependencies_text(app),
             app.get("share_code") or "",
             app.get("_registry_name") or "",
             app.get("updated_at") or app.get("published_at") or "",
             review,
             "1" if is_installable(app) else "0",
+            installed_version(app),
         )
 
 
@@ -1044,6 +1124,7 @@ def install(app_id: str, reinstall: bool = False, upgrade: bool = False) -> int:
         records[app_key(app)] = {
             "installed_at": now_text(),
             "title": localized_text(app, "title", resolve_locale()) or app.get("title"),
+            "version": app.get("version") or "",
             "package": package,
             "deb_path": str(deb_path),
             "exec": repaired_exec or applaunch_exec(app),

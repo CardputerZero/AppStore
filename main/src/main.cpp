@@ -37,6 +37,13 @@ constexpr int kScreenWidth = 320;
 constexpr int kScreenHeight = 170;
 constexpr int kHeaderHeight = 24;
 constexpr int kLineHeight = 15;
+constexpr int kHomeIconX = 10;
+constexpr int kHomeIconY = 45;
+constexpr int kHomeIconSize = 68;
+constexpr int kShortcutCenterY = 153;
+constexpr int kShortcutSpecScreenLeft = 132;
+constexpr int kShortcutIconSize = 16;
+constexpr int kShortcutTextWidth = 54;
 constexpr uint32_t kEscLongPressMs = 1200;
 constexpr uint32_t kJobStartDelayMs = 80;
 constexpr uint32_t kJobPollIntervalMs = 250;
@@ -47,6 +54,7 @@ struct StoreApp {
     std::string share_code;
     std::string name;
     std::string version;
+    std::string installed_version;
     std::string category;
     bool installed = false;
     bool recommended = false;
@@ -82,6 +90,8 @@ enum class Screen {
     Registry,
     RegistryEdit,
     ShareCode,
+    Search,
+    Screenshots,
 };
 
 struct KeyEvent {
@@ -143,6 +153,18 @@ std::string g_region_label = "Default";
 std::string g_region_registry_url = kDefaultRegistryUrl;
 std::string g_share_code_input;
 std::string g_share_code_message = "Enter a code from CardputerZero Hub.";
+std::string g_search_input;
+std::string g_search_message = "Search by app name, author, category, or code.";
+std::vector<int> g_search_results;
+int g_search_selected = 0;
+bool g_search_results_active = false;
+std::string g_detail_media_app_id;
+int g_detail_image_index = 0;
+std::string g_detail_description_app_id;
+int g_detail_description_scroll = 0;
+uint32_t g_home_refresh_tick = 0;
+uint32_t g_screenshots_activity_tick = 0;
+bool g_screenshots_overlay_visible = true;
 bool g_job_running = false;
 bool g_job_pending_start = false;
 std::string g_job_action;
@@ -291,6 +313,80 @@ std::string trim(std::string value)
     return value;
 }
 
+size_t utf8_char_len(unsigned char ch)
+{
+    if ((ch & 0x80) == 0) return 1;
+    if ((ch & 0xE0) == 0xC0) return 2;
+    if ((ch & 0xF0) == 0xE0) return 3;
+    if ((ch & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+int utf8_display_width(const std::string &text)
+{
+    int width = 0;
+    for (size_t i = 0; i < text.size();) {
+        unsigned char ch = static_cast<unsigned char>(text[i]);
+        size_t len = utf8_char_len(ch);
+        if (i + len > text.size()) len = 1;
+        width += ch < 0x80 ? 1 : 2;
+        i += len;
+    }
+    return width;
+}
+
+std::vector<std::string> wrap_display_text(std::string text, int max_width)
+{
+    for (char &ch : text) {
+        if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+    }
+    text = trim(text);
+    std::vector<std::string> lines;
+    std::string current;
+    int current_width = 0;
+    size_t last_space_pos = std::string::npos;
+    int width_at_last_space = 0;
+
+    for (size_t i = 0; i < text.size();) {
+        unsigned char ch = static_cast<unsigned char>(text[i]);
+        size_t len = utf8_char_len(ch);
+        if (i + len > text.size()) len = 1;
+        std::string token = text.substr(i, len);
+        int token_width = ch < 0x80 ? 1 : 2;
+        bool is_space = ch < 0x80 && std::isspace(ch);
+        if (is_space && current.empty()) {
+            i += len;
+            continue;
+        }
+        current += token;
+        current_width += token_width;
+        if (is_space) {
+            last_space_pos = current.size() - token.size();
+            width_at_last_space = current_width - token_width;
+        }
+        if (current_width > max_width) {
+            if (last_space_pos != std::string::npos && width_at_last_space > 0) {
+                lines.push_back(trim(current.substr(0, last_space_pos)));
+                current = trim(current.substr(last_space_pos + 1));
+                current_width = utf8_display_width(current);
+            } else {
+                std::string overflow = token;
+                current.resize(current.size() - token.size());
+                if (!current.empty()) lines.push_back(trim(current));
+                current = overflow;
+                current_width = token_width;
+            }
+            last_space_pos = std::string::npos;
+            width_at_last_space = 0;
+        }
+        i += len;
+    }
+    current = trim(current);
+    if (!current.empty()) lines.push_back(current);
+    if (lines.empty()) lines.push_back("-");
+    return lines;
+}
+
 bool has_blocking_missing(const std::string &missing)
 {
     std::istringstream stream(missing);
@@ -314,6 +410,33 @@ std::string missing_install_message(const std::string &missing)
 bool can_install_app(const StoreApp &app)
 {
     return app.installable && app.review_status == "approved";
+}
+
+std::string normalized_version(std::string value)
+{
+    value = trim(value);
+    if (!value.empty() && (value[0] == 'v' || value[0] == 'V')) value.erase(value.begin());
+    for (char &ch : value) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return value;
+}
+
+bool versions_match(const std::string &available, const std::string &installed)
+{
+    std::string a = normalized_version(available);
+    std::string b = normalized_version(installed);
+    if (a.empty() || b.empty()) return false;
+    if (a == b) return true;
+    return b.rfind(a + "-", 0) == 0 || b.rfind(a + "+", 0) == 0;
+}
+
+bool can_reinstall_app(const StoreApp &app)
+{
+    return app.installed && can_install_app(app);
+}
+
+bool can_upgrade_app(const StoreApp &app)
+{
+    return app.installed && can_install_app(app) && !versions_match(app.version, app.installed_version);
 }
 
 std::string review_label(const StoreApp &app)
@@ -495,6 +618,24 @@ std::string first_csv(std::string value)
     return value;
 }
 
+std::vector<std::string> split_csv_paths(const std::string &value)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    for (char ch : value) {
+        if (ch == ',') {
+            cur = trim(cur);
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += ch;
+        }
+    }
+    cur = trim(cur);
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
 std::string app_sort_name(const StoreApp &app)
 {
     return match_key(app.name);
@@ -582,15 +723,35 @@ void select_default_category()
     }
 }
 
-std::string icon_file_path(const StoreApp &app)
+std::string resolve_media_path(std::string image)
 {
-    std::string image = first_csv(app.images);
     if (image.empty()) return "";
     if (image.rfind("file://", 0) == 0) image = image.substr(7);
     if (!image.empty() && image[0] == '/') return file_exists(image) ? image : "";
     std::string root = parent_dir(g_app_dir);
     std::string candidate = root + "/" + image;
     return file_exists(candidate) ? candidate : "";
+}
+
+std::string icon_file_path(const StoreApp &app)
+{
+    return resolve_media_path(first_csv(app.images));
+}
+
+std::vector<std::string> detail_screenshot_paths(const StoreApp &app)
+{
+    std::vector<std::string> images = split_csv_paths(app.images);
+    std::vector<std::string> out;
+    for (size_t i = 1; i < images.size(); ++i) {
+        std::string path = resolve_media_path(images[i]);
+        if (!path.empty()) out.push_back(path);
+    }
+    return out;
+}
+
+std::vector<std::string> detail_description_lines(const StoreApp &app)
+{
+    return wrap_display_text(app.description.empty() ? "-" : app.description, 48);
 }
 
 std::string packaged_image_path(const std::string &name)
@@ -655,6 +816,46 @@ StoreApp *selected_app()
     return &g_apps[g_visible[g_selected]];
 }
 
+void refresh_summary();
+
+StoreApp *ensure_selected_app()
+{
+    StoreApp *app = selected_app();
+    if (app) return app;
+
+    if (!g_apps.empty()) {
+        select_default_category();
+        rebuild_visible();
+        g_selected = 0;
+        app = selected_app();
+        if (app) return app;
+    }
+
+    refresh_summary();
+    app = selected_app();
+    if (app) return app;
+
+    if (!g_apps.empty()) {
+        select_default_category();
+        rebuild_visible();
+        g_selected = 0;
+        app = selected_app();
+        if (app) return app;
+    }
+    return nullptr;
+}
+
+bool open_detail_screen()
+{
+    if (ensure_selected_app()) {
+        g_screen = Screen::Detail;
+        return true;
+    }
+    g_status_message = "No app selected";
+    g_screen = Screen::Home;
+    return false;
+}
+
 bool select_visible_app_by_id(const std::string &app_id)
 {
     if (app_id.empty()) return false;
@@ -711,6 +912,7 @@ void refresh_summary()
             if (fields.size() >= 16) app.updated_at = fields[15];
             if (fields.size() >= 17) app.review_status = fields[16];
             if (fields.size() >= 18) app.installable = fields[17] == "1";
+            if (fields.size() >= 19) app.installed_version = fields[18];
             apps.push_back(app);
         }
     }
@@ -918,10 +1120,10 @@ bool draw_app_icon_image(const StoreApp &app)
     if (path.empty()) return false;
     g_render_image_sources.push_back(lvgl_posix_src(path));
 
-    constexpr int clip_x = 19;
-    constexpr int clip_y = 40;
-    constexpr int clip_w = 82;
-    constexpr int clip_h = 82;
+    constexpr int clip_x = kHomeIconX;
+    constexpr int clip_y = kHomeIconY;
+    constexpr int clip_w = kHomeIconSize;
+    constexpr int clip_h = kHomeIconSize;
     lv_obj_t *clip = lv_obj_create(g_root);
     lv_obj_remove_style_all(clip);
     lv_obj_set_pos(clip, clip_x, clip_y);
@@ -929,12 +1131,12 @@ bool draw_app_icon_image(const StoreApp &app)
     lv_obj_clear_flag(clip, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_opa(clip, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(clip, 0, 0);
-    lv_obj_set_style_radius(clip, 14, 0);
+    lv_obj_set_style_radius(clip, 10, 0);
     lv_obj_set_style_clip_corner(clip, true, 0);
     lv_obj_set_style_pad_all(clip, 0, 0);
 
     lv_obj_t *icon = lv_image_create(clip);
-    lv_image_set_scale(icon, 210);
+    lv_image_set_scale(icon, 174);
     lv_image_set_src(icon, g_render_image_sources.back().c_str());
     lv_obj_update_layout(icon);
 
@@ -969,41 +1171,166 @@ bool draw_packaged_image(const std::string &name, int x, int y)
 #endif
 }
 
+void normalize_detail_image_state(const StoreApp &app, const std::vector<std::string> &screenshots)
+{
+    if (g_detail_media_app_id != app.id) {
+        g_detail_media_app_id = app.id;
+        g_detail_image_index = 0;
+    }
+    if (screenshots.empty()) {
+        g_detail_image_index = 0;
+    } else {
+        int count = static_cast<int>(screenshots.size());
+        if (g_detail_image_index < 0) g_detail_image_index = count - 1;
+        if (g_detail_image_index >= count) g_detail_image_index = 0;
+    }
+}
+
+void normalize_detail_description_state(const StoreApp &app, const std::vector<std::string> &lines)
+{
+    if (g_detail_description_app_id != app.id) {
+        g_detail_description_app_id = app.id;
+        g_detail_description_scroll = 0;
+    }
+    int max_scroll = std::max(0, static_cast<int>(lines.size()) - 2);
+    if (g_detail_description_scroll < 0) g_detail_description_scroll = 0;
+    if (g_detail_description_scroll > max_scroll) g_detail_description_scroll = max_scroll;
+}
+
+void show_screenshots_overlay()
+{
+    g_screenshots_overlay_visible = true;
+    g_screenshots_activity_tick = lv_tick_get();
+}
+
+bool draw_detail_background(const StoreApp &app)
+{
+#if LV_USE_LODEPNG && LV_USE_FS_POSIX
+    std::vector<std::string> screenshots = detail_screenshot_paths(app);
+    normalize_detail_image_state(app, screenshots);
+    if (screenshots.empty()) return false;
+
+    g_render_image_sources.push_back(lvgl_posix_src(screenshots[g_detail_image_index]));
+    lv_obj_t *clip = lv_obj_create(g_root);
+    lv_obj_remove_style_all(clip);
+    lv_obj_set_pos(clip, 0, 0);
+    lv_obj_set_size(clip, kScreenWidth, kScreenHeight);
+    lv_obj_clear_flag(clip, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(clip, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(clip, 0, 0);
+    lv_obj_set_style_pad_all(clip, 0, 0);
+
+    lv_obj_t *image = lv_image_create(clip);
+    lv_image_set_src(image, g_render_image_sources.back().c_str());
+    lv_obj_update_layout(image);
+    int image_w = lv_obj_get_width(image);
+    int image_h = lv_obj_get_height(image);
+    if (image_w <= 0) image_w = kScreenWidth;
+    if (image_h <= 0) image_h = kScreenHeight;
+    int scale_x = kScreenWidth * 256 / image_w;
+    int scale_y = kScreenHeight * 256 / image_h;
+    int scale = std::max(scale_x, scale_y);
+    if (scale <= 0) scale = 256;
+    lv_image_set_scale(image, static_cast<uint16_t>(scale));
+    lv_obj_update_layout(image);
+    int scaled_w = image_w * scale / 256;
+    int scaled_h = image_h * scale / 256;
+    lv_obj_set_pos(image, (kScreenWidth - scaled_w) / 2, (kScreenHeight - scaled_h) / 2);
+    return true;
+#else
+    (void)app;
+    return false;
+#endif
+}
+
 void draw_home_icon_panel(const StoreApp *app)
 {
-    if (!draw_packaged_image("store_arrow_up.png", 53, 27)) {
-        center_strong_label(g_root, "^", 61, 28, 28, 20, &lv_font_montserrat_20, 0xFF6A3D);
+    const int arrow_x = kHomeIconX + (kHomeIconSize - 14) / 2;
+    if (!draw_packaged_image("store_arrow_up.png", arrow_x, 32)) {
+        center_strong_label(g_root, "^", kHomeIconX + 20, 31, 28, 18, &lv_font_montserrat_20, 0xFF6A3D);
     }
-    box(19, 40, 82, 82, 0x202020, 0x4D4D4D, 2, 14, LV_OPA_COVER);
+    box(kHomeIconX, kHomeIconY, kHomeIconSize, kHomeIconSize, 0x202020, 0x4D4D4D, 2, 10, LV_OPA_COVER);
     if (!app) {
-        center_strong_label(g_root, "-", 49, 82, 24, 26, &lv_font_montserrat_20, 0x9A9A9A);
-        if (!draw_packaged_image("store_arrow_down.png", 48, 127)) {
-            center_strong_label(g_root, "v", 56, 135, 28, 20, &lv_font_montserrat_20, 0xFF6A3D);
+        center_strong_label(g_root, "-", kHomeIconX + 22, kHomeIconY + 24, 24, 22,
+                            &lv_font_montserrat_20, 0x9A9A9A);
+        if (!draw_packaged_image("store_arrow_down.png", arrow_x, 119)) {
+            center_strong_label(g_root, "v", kHomeIconX + 20, 119, 28, 18, &lv_font_montserrat_20, 0xFF6A3D);
         }
         return;
     }
 
     if (!draw_app_icon_image(*app)) {
-        center_strong_label(g_root, app_initial(*app), 19, 66, 82, 30,
+        center_strong_label(g_root, app_initial(*app), kHomeIconX, kHomeIconY + 21, kHomeIconSize, 28,
                             &lv_font_montserrat_20, app->installed ? 0x52D05D : 0xFFFFFF);
     }
-    if (!draw_packaged_image("store_arrow_down.png", 48, 127)) {
-        center_strong_label(g_root, "v", 56, 135, 28, 20, &lv_font_montserrat_20, 0xFF6A3D);
+    if (!draw_packaged_image("store_arrow_down.png", arrow_x, 119)) {
+        center_strong_label(g_root, "v", kHomeIconX + 20, 119, 28, 18, &lv_font_montserrat_20, 0xFF6A3D);
     }
 }
 
-void draw_nav_bar()
+void draw_category_selector()
 {
-    box(1, 148, 117, 20, 0x333380, 0x333380, 0);
-    if (!draw_packaged_image("store_arrow_left.png", 5, 151)) {
-        strong_label(g_root, "<", 8, 149, 17, 19, &lv_font_montserrat_20, 0xFF6A3D);
+    if (!draw_packaged_image("store_arrow_left.png", 205, 34)) {
+        strong_label(g_root, "<", 206, 32, 14, 18, &lv_font_montserrat_20, 0xFF6A3D);
     }
     std::string cat = current_category_name();
-    center_strong_label(g_root, one_line(upper_ascii(cat), 11), 29, 151, 70, 16,
-                        &lv_font_montserrat_14, 0xFFFFFF, LV_LABEL_LONG_DOT);
-    if (!draw_packaged_image("store_arrow_right.png", 107, 151)) {
-        strong_label(g_root, ">", 111, 149, 17, 19, &lv_font_montserrat_20, 0xFF6A3D);
+    std::string cat_label = upper_ascii(cat);
+    const lv_font_t *cat_font = cat_label.size() > 8 ? &lv_font_montserrat_10 : &lv_font_montserrat_14;
+    center_strong_label(g_root, one_line(cat_label, 13), 220, 35, 72, 15,
+                        cat_font, 0xFFFFFF, LV_LABEL_LONG_DOT);
+    if (!draw_packaged_image("store_arrow_right.png", 298, 34)) {
+        strong_label(g_root, ">", 300, 32, 14, 18, &lv_font_montserrat_20, 0xFF6A3D);
     }
+}
+
+int shortcut_screen_x(int spec_center_x)
+{
+    return spec_center_x - kShortcutSpecScreenLeft;
+}
+
+void draw_shortcut_button(int spec_center_x, const std::string &icon_name,
+                          const std::string &text, uint32_t text_color)
+{
+    const int cx = shortcut_screen_x(spec_center_x);
+    const int icon_x = cx - kShortcutIconSize / 2;
+    const int icon_y = kShortcutCenterY - 13;
+    if (!draw_packaged_image(icon_name, icon_x, icon_y)) {
+        center_strong_label(g_root, "*", cx - 8, icon_y + 1, 16, 10,
+                            &lv_font_montserrat_10, text_color);
+    }
+    center_strong_label(g_root, text, cx - kShortcutTextWidth / 2, kShortcutCenterY + 5,
+                        kShortcutTextWidth, 10,
+                        &lv_font_montserrat_10, text_color, LV_LABEL_LONG_DOT);
+}
+
+void draw_shortcut_button_if(bool visible, int spec_center_x, const std::string &icon_name,
+                             const std::string &text, uint32_t text_color)
+{
+    if (visible) draw_shortcut_button(spec_center_x, icon_name, text, text_color);
+}
+
+void draw_shortcuts_bar()
+{
+    draw_shortcut_button(180, "appstore-shortcut-settings.png", "settings", 0xF0B429);
+    draw_shortcut_button(236, "appstore-shortcut-sharecode.png", "share", 0x168CE5);
+    draw_shortcut_button(292, "appstore-shortcut-search.png", "search", 0x7ED957);
+    draw_shortcut_button(348, "appstore-shortcut-install.png", "install", 0xB069FF);
+    draw_shortcut_button(404, "appstore-shortcut-detail.png", "detail", 0xFF8A2A);
+}
+
+void draw_detail_shortcuts(const StoreApp &app)
+{
+    draw_shortcut_button(180, "appstore-shortcut-back.png", "back", 0xF0B429);
+    draw_shortcut_button_if(!detail_screenshot_paths(app).empty(), 236,
+                            "appstore-shortcut-screenshots.png", "shots", 0x58A6FF);
+    draw_shortcut_button_if(!app.installed && can_install_app(app), 292,
+                            "appstore-shortcut-install.png", "install", 0xB069FF);
+    draw_shortcut_button_if(can_reinstall_app(app), 292,
+                            "appstore-shortcut-install.png", "reinstall", 0xB069FF);
+    draw_shortcut_button_if(can_upgrade_app(app), 348,
+                            "appstore-shortcut-upgrade.png", "upgrade", 0xB069FF);
+    draw_shortcut_button_if(app.installed, 404,
+                            "appstore-shortcut-delete.png", "remove", 0xFF5B4A);
 }
 
 void header(const std::string &title, const std::string &right)
@@ -1022,14 +1349,14 @@ void render_home()
 {
     clean_root();
     draw_system_bar();
-    draw_nav_bar();
+    draw_category_selector();
     draw_home_icon_panel(selected_app());
 
     if (g_visible.empty()) {
-        strong_label(g_root, "NO APPS", 122, 73, 130, 24, &lv_font_montserrat_20, 0xFFFFFF);
+        strong_label(g_root, "NO APPS", 106, 72, 130, 24, &lv_font_montserrat_20, 0xFFFFFF);
     } else {
-        const int list_x = 116;
-        const int y_pos[] = {25, 42, 60, 101, 118};
+        const int list_x = 106;
+        const int y_pos[] = {39, 55, 70, 104, 119};
         const lv_font_t *fonts[] = {
             &lv_font_montserrat_10, &lv_font_montserrat_12, &lv_font_montserrat_20,
             &lv_font_montserrat_12, &lv_font_montserrat_10
@@ -1070,92 +1397,104 @@ void render_home()
                          selected ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_DOT);
             if (selected) {
                 strong_label(g_root, "V" + one_line(app.version.empty() ? "0" : app.version, 6),
-                             264, y_pos[row] + 4, 52, 16, &lv_font_montserrat_14, 0x8B8B8B,
+                             264, y_pos[row] + 3, 52, 16, &lv_font_montserrat_14, 0x8B8B8B,
                              LV_LABEL_LONG_DOT);
                 std::string author = app.author.empty() ? "unknown" : app.author;
                 strong_label(g_root, author + ".",
-                             list_x + 3, y_pos[row] + 23, 196, 12,
+                             list_x + 3, y_pos[row] + 22, 190, 12,
                              &lv_font_montserrat_10, 0xBDBDBD);
             }
         }
         std::string count = std::to_string(g_selected + 1) + "/" + std::to_string(g_visible.size());
-        strong_label(g_root, count, 284, 136, 34, 15, &lv_font_montserrat_14, 0xFFFFFF,
+        strong_label(g_root, count, 284, 119, 34, 15, &lv_font_montserrat_14, 0xFFFFFF,
                      LV_LABEL_LONG_DOT);
     }
 
     if (!g_status_message.empty()) {
-        strong_label(g_root, one_line(g_status_message, 22), 122, 141, 156, 12,
+        strong_label(g_root, one_line(g_status_message, 26), 106, 128, 172, 10,
                      &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
     }
-    box(120, 154, 198, 14, 0x333333, 0x333333, 0);
-    strong_label(g_root, "s : settings", 128, 155, 82, 12, &lv_font_montserrat_10,
-                 0xCCCC33, LV_LABEL_LONG_DOT);
-    strong_label(g_root, "c : share code", 212, 155, 96, 12, &lv_font_montserrat_10,
-                 0x168CE5, LV_LABEL_LONG_DOT);
+    draw_shortcuts_bar();
 }
 
 void render_detail()
 {
     clean_root();
-    draw_system_bar();
-    box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
-    box(0, 20, 320, 22, 0x1F6FEB, 0x1F6FEB, 0);
-    StoreApp *app = selected_app();
+    StoreApp *app = ensure_selected_app();
     if (!app) {
+        draw_system_bar();
+        box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
         label(g_root, "No selected app", 10, 50, 304, 14, &lv_font_montserrat_12, 0xE6EDF3);
         return;
     }
+    draw_system_bar();
+    box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
+    box(0, 20, 320, 22, 0x1F6FEB, 0x1F6FEB, 0);
     std::string title = one_line(app->name + "  " + app->version, 30);
     label(g_root, title, 8, 24, 220, 15,
           font_for_text(title, &lv_font_montserrat_12), 0xFFFFFF, LV_LABEL_LONG_DOT);
-    label(g_root, "B Back", 270, 24, 44, 14, &lv_font_montserrat_10, 0xAECBFA);
+    label(g_root, "Esc Back", 258, 24, 56, 14, &lv_font_montserrat_10, 0xAECBFA);
 
-    label(g_root, "State :", 10, 50, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
-    label(g_root, app->installed ? "Installed" : "Not installed", 62, 50, 105, 12,
+    std::string state_text = app->installed ? "Installed" : "Not installed";
+    if (app->installed && !app->installed_version.empty()) {
+        state_text += " " + one_line(app->installed_version, 10);
+    }
+    label(g_root, "State :", 10, 47, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
+    label(g_root, state_text, 62, 47, 105, 12,
           &lv_font_montserrat_10, app->installed ? 0xCCCC33 : 0xE6EDF3);
-    label(g_root, "Size :", 176, 50, 42, 12, &lv_font_montserrat_10, 0x58A6FF);
-    label(g_root, app->size, 220, 50, 84, 12, &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
+    label(g_root, "Size :", 176, 47, 42, 12, &lv_font_montserrat_10, 0x58A6FF);
+    label(g_root, app->size, 220, 47, 84, 12, &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
 
-    label(g_root, "Review:", 10, 66, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
-    label(g_root, one_line(review_label(*app), 36), 62, 66, 246, 12,
+    label(g_root, "Review:", 10, 62, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
+    label(g_root, one_line(review_label(*app), 36), 62, 62, 246, 12,
           &lv_font_montserrat_10, can_install_app(*app) ? 0x52D05D : 0xF0C45C, LV_LABEL_LONG_DOT);
-    label(g_root, "Author:", 10, 82, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
-    label(g_root, one_line(app->author.empty() ? "-" : app->author, 36), 62, 82, 246, 12,
+    label(g_root, "Author:", 10, 77, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
+    label(g_root, one_line(app->author.empty() ? "-" : app->author, 36), 62, 77, 246, 12,
           &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
-    label(g_root, "Git   :", 10, 98, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
-    label(g_root, one_line(app->git_url.empty() ? "-" : app->git_url, 42), 62, 98, 246, 12,
+    label(g_root, "Git   :", 10, 92, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
+    label(g_root, one_line(app->git_url.empty() ? "-" : app->git_url, 42), 62, 92, 246, 12,
           &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
-    label(g_root, "Deps  :", 10, 114, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
-    label(g_root, one_line(app->dependencies.empty() ? "-" : app->dependencies, 42), 62, 114, 246, 12,
+    label(g_root, "Deps  :", 10, 107, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
+    label(g_root, one_line(app->dependencies.empty() ? "-" : app->dependencies, 42), 62, 107, 246, 12,
           &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
-    std::string description = one_line(app->description, 54);
-    label(g_root, description, 10, 131, 300, 14,
-          font_for_text(description, &lv_font_montserrat_10), 0xB8B8B8, LV_LABEL_LONG_DOT);
+    if (!g_status_message.empty() && !g_job_running) {
+        label(g_root, one_line(g_status_message, 54), 10, 122, 300, 12,
+              &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+    } else {
+        std::vector<std::string> lines = detail_description_lines(*app);
+        if (lines.empty()) lines.push_back("-");
+        normalize_detail_description_state(*app, lines);
+        const int total = static_cast<int>(lines.size());
+        const int first = std::min(g_detail_description_scroll, std::max(0, total - 1));
+        const int visible_count = std::min(2, total - first);
+        const int text_width = total > 2 ? 268 : 300;
+        for (int row = 0; row < visible_count; ++row) {
+            const std::string &line_text = lines[first + row];
+            label(g_root, line_text, 10, 120 + row * 10, text_width, 10,
+                  font_for_text(line_text, &lv_font_montserrat_10), 0xB8B8B8, LV_LABEL_LONG_DOT);
+        }
+        if (total > 2) {
+            int max_scroll = std::max(0, total - 2);
+            std::string marker = std::to_string(g_detail_description_scroll + 1) + "/" +
+                                 std::to_string(max_scroll + 1);
+            center_label(g_root, marker, 280, 130, 34, 10,
+                         &lv_font_montserrat_10, 0x6E7681, LV_LABEL_LONG_DOT);
+        }
+    }
     if (g_job_running) {
-        box(10, 144, 300, 5, 0x30363D, 0x30363D, 0);
+        box(10, 135, 300, 5, 0x30363D, 0x30363D, 0);
         if (g_job_progress >= 0) {
             int fill = std::max(2, std::min(300, g_job_progress * 300 / 100));
-            box(10, 144, fill, 5, 0xCCCC33, 0xCCCC33, 0);
+            box(10, 135, fill, 5, 0xCCCC33, 0xCCCC33, 0);
         } else {
             int offset = static_cast<int>((lv_tick_get() / 120) % 260);
-            box(10 + offset, 144, 40, 5, 0xCCCC33, 0xCCCC33, 0);
+            box(10 + offset, 135, 40, 5, 0xCCCC33, 0xCCCC33, 0);
         }
         label(g_root, one_line(g_status_message.empty() ? "Working..." : g_status_message, 54),
-              10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
-    } else if (!g_status_message.empty()) {
-        label(g_root, one_line(g_status_message, 54), 10, 153, 300, 12,
-              &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
-    } else if (app->installed && can_install_app(*app)) {
-        label(g_root, "U Upgrade  D Delete  I Reinstall  B Back", 10, 153, 300, 12,
-              &lv_font_montserrat_10, 0xCCCC33);
-    } else if (app->installed) {
-        label(g_root, "D Delete  B Back", 10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33);
-    } else if (!can_install_app(*app)) {
-        label(g_root, "Only approved apps can install  B Back", 10, 153, 300, 12,
-              &lv_font_montserrat_10, 0xF0C45C, LV_LABEL_LONG_DOT);
-    } else {
-        label(g_root, "I Install  B Back", 10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33);
+              10, 143, 300, 12, &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+        return;
     }
+    draw_detail_shortcuts(*app);
 }
 
 void render_confirm()
@@ -1339,6 +1678,113 @@ void render_share_code()
           &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
+void render_search()
+{
+    clean_root();
+    draw_system_bar();
+    box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
+    box(0, 20, 320, 22, 0x1F6FEB, 0x1F6FEB, 0);
+    label(g_root, "Search", 8, 24, 180, 15, &lv_font_montserrat_12, 0xFFFFFF);
+    label(g_root, "Esc Back", 258, 24, 56, 14, &lv_font_montserrat_10, 0xAECBFA);
+
+    if (g_search_results_active && !g_search_results.empty()) {
+        label(g_root, "QUERY", 10, 48, 42, 12, &lv_font_montserrat_10, 0x7ED957);
+        box(54, 44, 116, 20, 0x111923, 0x2EA043, 1, 2);
+        label(g_root, one_line(upper_ascii(g_search_input), 12), 60, 49, 104, 12,
+              &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
+        std::string count = std::to_string(g_search_results.size()) + " RESULTS";
+        label(g_root, count, 182, 48, 128, 12, &lv_font_montserrat_10, 0xB8B8B8,
+              LV_LABEL_LONG_DOT);
+
+        int total = static_cast<int>(g_search_results.size());
+        if (g_search_selected >= total) g_search_selected = total - 1;
+        if (g_search_selected < 0) g_search_selected = 0;
+        int first = std::max(0, g_search_selected - 1);
+        int last = std::min(total - 1, first + 3);
+        first = std::max(0, last - 3);
+
+        for (int result_index = first; result_index <= last; ++result_index) {
+            int row = result_index - first;
+            int y = 68 + row * 18;
+            bool selected = result_index == g_search_selected;
+            const StoreApp &app = g_apps[g_search_results[result_index]];
+            if (selected) {
+                box(10, y - 2, 300, 17, 0x142817, 0x7ED957, 1, 2);
+            }
+            std::string name = one_line(upper_ascii(app.name), 18);
+            strong_label(g_root, name, 16, y, 138, 13,
+                         font_for_text(name, selected ? &lv_font_montserrat_12 : &lv_font_montserrat_10),
+                         selected ? 0xFFFFFF : 0xB8B8B8, LV_LABEL_LONG_DOT);
+            std::string meta = one_line(app.category.empty() ? app.author : app.category, 14);
+            label(g_root, meta, 164, y + 1, 88, 12, &lv_font_montserrat_10,
+                  selected ? 0x7ED957 : 0x8B949E, LV_LABEL_LONG_DOT);
+            label(g_root, "V" + one_line(app.version.empty() ? "0" : app.version, 5),
+                  260, y + 1, 48, 12, &lv_font_montserrat_10, 0x8B8B8B, LV_LABEL_LONG_DOT);
+        }
+
+        label(g_root, "Up/Down Select   Enter Open   Backspace Edit",
+              10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+        return;
+    }
+
+    center_strong_label(g_root, "SEARCH APPS", 68, 51, 184, 16,
+                        &lv_font_montserrat_12, 0x7ED957, LV_LABEL_LONG_DOT);
+    box(50, 69, 220, 45, 0x111923, 0x7ED957, 2, 3);
+    std::string display = g_search_input.empty() ? "app name" : upper_ascii(g_search_input);
+    center_strong_label(g_root, one_line(display, 16), 60, 81, 200, 23,
+                        &lv_font_montserrat_20,
+                        g_search_input.empty() ? 0x6E7681 : 0xE6EDF3,
+                        LV_LABEL_LONG_DOT);
+
+    center_label(g_root, one_line(g_search_message, 48), 10, 122, 300, 14,
+                 &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
+    label(g_root, "Enter Open   Backspace Delete   Esc Back", 10, 153, 300, 12,
+          &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+}
+
+void render_screenshots()
+{
+    clean_root();
+    box(0, 0, 320, 170, 0x05070A, 0x05070A, 0);
+    StoreApp *app = ensure_selected_app();
+    if (!app) {
+        box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
+        label(g_root, "No selected app", 10, 50, 304, 14, &lv_font_montserrat_12, 0xE6EDF3);
+        return;
+    }
+    std::vector<std::string> screenshots = detail_screenshot_paths(*app);
+    normalize_detail_image_state(*app, screenshots);
+    if (!screenshots.empty()) {
+        draw_detail_background(*app);
+    }
+
+    if (screenshots.empty()) {
+        box(0, 0, 320, 23, 0x05070A, 0x05070A, 0, 0, static_cast<lv_opa_t>(210));
+        box(0, 145, 320, 25, 0x05070A, 0x05070A, 0, 0, static_cast<lv_opa_t>(210));
+        label(g_root, "Screenshots", 8, 5, 120, 14, &lv_font_montserrat_12, 0xFFFFFF);
+        center_strong_label(g_root, "NO SCREENSHOTS", 52, 76, 216, 16,
+                            &lv_font_montserrat_14, 0xCCCC33, LV_LABEL_LONG_DOT);
+        label(g_root, "Esc Back", 258, 5, 56, 14, &lv_font_montserrat_10, 0xAECBFA);
+        return;
+    }
+
+    if (g_screenshots_overlay_visible && lv_tick_elaps(g_screenshots_activity_tick) >= 2000) {
+        g_screenshots_overlay_visible = false;
+    }
+    if (!g_screenshots_overlay_visible) return;
+
+    box(0, 0, 320, 23, 0x05070A, 0x05070A, 0, 0, static_cast<lv_opa_t>(210));
+    box(0, 145, 320, 25, 0x05070A, 0x05070A, 0, 0, static_cast<lv_opa_t>(210));
+    label(g_root, "Screenshots", 8, 5, 120, 14, &lv_font_montserrat_12, 0xFFFFFF);
+    std::string count = std::to_string(g_detail_image_index + 1) + "/" +
+                        std::to_string(screenshots.size());
+    center_strong_label(g_root, count, 136, 5, 48, 14,
+                        &lv_font_montserrat_10, 0xAECBFA, LV_LABEL_LONG_DOT);
+    label(g_root, "Esc Back", 258, 5, 56, 14, &lv_font_montserrat_10, 0xAECBFA);
+    center_label(g_root, "Z / < previous        C / > next", 36, 153, 248, 12,
+                 &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+}
+
 void render()
 {
     switch (g_screen) {
@@ -1349,13 +1795,22 @@ void render()
         case Screen::Registry: render_registry(); break;
         case Screen::RegistryEdit: render_registry_edit(); break;
         case Screen::ShareCode: render_share_code(); break;
+        case Screen::Search: render_search(); break;
+        case Screen::Screenshots: render_screenshots(); break;
     }
 }
 
 void refresh_timer_cb(lv_timer_t *)
 {
     if (g_screen == Screen::Home) {
-        refresh_summary();
+        if (g_home_refresh_tick == 0 || lv_tick_elaps(g_home_refresh_tick) >= 5000) {
+            g_home_refresh_tick = lv_tick_get();
+            refresh_summary();
+            render();
+        }
+    } else if (g_screen == Screen::Screenshots && g_screenshots_overlay_visible &&
+               lv_tick_elaps(g_screenshots_activity_tick) >= 2000) {
+        g_screenshots_overlay_visible = false;
         render();
     }
 }
@@ -1480,6 +1935,12 @@ void navigate_back()
         case Screen::ShareCode:
             g_screen = Screen::Home;
             break;
+        case Screen::Search:
+            g_screen = Screen::Home;
+            break;
+        case Screen::Screenshots:
+            g_screen = Screen::Detail;
+            break;
     }
 }
 
@@ -1594,6 +2055,39 @@ void open_share_code_screen()
     g_screen = Screen::ShareCode;
 }
 
+void clear_search_results()
+{
+    g_search_results.clear();
+    g_search_selected = 0;
+    g_search_results_active = false;
+}
+
+void open_search_screen()
+{
+    g_search_input.clear();
+    g_search_message = "Search by app name, author, category, or code.";
+    clear_search_results();
+    g_screen = Screen::Search;
+}
+
+void open_screenshots_screen()
+{
+    StoreApp *app = ensure_selected_app();
+    if (!app) {
+        g_status_message = "No selected app";
+        return;
+    }
+    std::vector<std::string> screenshots = detail_screenshot_paths(*app);
+    normalize_detail_image_state(*app, screenshots);
+    if (screenshots.empty()) {
+        g_status_message = "No screenshots for this app";
+        return;
+    }
+    g_status_message.clear();
+    show_screenshots_overlay();
+    g_screen = Screen::Screenshots;
+}
+
 bool select_app_index(int app_index)
 {
     if (app_index < 0 || app_index >= static_cast<int>(g_apps.size())) return false;
@@ -1651,6 +2145,64 @@ void open_share_code_match()
         }
     }
     g_share_code_message = "No app found for code: " + g_share_code_input;
+}
+
+void open_search_match()
+{
+    std::string query = match_key(g_search_input);
+    if (query.empty()) {
+        g_search_message = "Type a search term first.";
+        clear_search_results();
+        return;
+    }
+    refresh_summary();
+    g_search_results.clear();
+    for (int i = 0; i < static_cast<int>(g_apps.size()); ++i) {
+        const StoreApp &app = g_apps[i];
+        std::string haystack = match_key(app.name + " " + app.author + " " + app.category +
+                                         " " + app.share_code + " " + app.id);
+        if (haystack.find(query) != std::string::npos) {
+            g_search_results.push_back(i);
+        }
+    }
+    if (g_search_results.empty()) {
+        clear_search_results();
+        g_search_message = "No app found for: " + g_search_input;
+        return;
+    }
+    if (g_search_results.size() == 1) {
+        int app_index = g_search_results.front();
+        clear_search_results();
+        if (select_app_index(app_index)) {
+            g_status_message.clear();
+            g_search_message.clear();
+            g_screen = Screen::Detail;
+            return;
+        }
+        g_search_message = "Unable to open result.";
+        return;
+    }
+    g_search_selected = 0;
+    g_search_results_active = true;
+    g_search_message = std::to_string(g_search_results.size()) + " apps found. Select one.";
+}
+
+void open_selected_search_result()
+{
+    if (!g_search_results_active || g_search_results.empty()) {
+        open_search_match();
+        return;
+    }
+    if (g_search_selected < 0) g_search_selected = 0;
+    if (g_search_selected >= static_cast<int>(g_search_results.size())) {
+        g_search_selected = static_cast<int>(g_search_results.size()) - 1;
+    }
+    if (select_app_index(g_search_results[g_search_selected])) {
+        clear_search_results();
+        g_status_message.clear();
+        g_search_message.clear();
+        g_screen = Screen::Detail;
+    }
 }
 
 RegistryEntry *selected_registry()
@@ -1815,6 +2367,108 @@ void start_confirm(const std::string &action)
     }
 }
 
+void start_detail_install_action(StoreApp *app)
+{
+    if (!app) {
+        g_status_message = "No selected app";
+        return;
+    }
+    if (app->installed) {
+        g_status_message = "Already installed";
+        return;
+    }
+    if (!can_install_app(*app)) {
+        g_status_message = "Only approved apps can install";
+        return;
+    }
+    start_confirm("install");
+}
+
+void start_detail_reinstall_action(StoreApp *app)
+{
+    if (!app) {
+        g_status_message = "No selected app";
+        return;
+    }
+    if (!app->installed) {
+        g_status_message = "App is not installed";
+        return;
+    }
+    if (!can_reinstall_app(*app)) {
+        g_status_message = "Only approved apps can install";
+        return;
+    }
+    start_confirm("reinstall");
+}
+
+void start_detail_upgrade_action(StoreApp *app)
+{
+    if (!app) {
+        g_status_message = "No selected app";
+        return;
+    }
+    if (!app->installed) {
+        g_status_message = "App is not installed";
+        return;
+    }
+    if (!can_install_app(*app)) {
+        g_status_message = "Only approved apps can install";
+        return;
+    }
+    if (!can_upgrade_app(*app)) {
+        g_status_message = "Already latest";
+        return;
+    }
+    start_confirm("upgrade");
+}
+
+void start_detail_delete_action(StoreApp *app)
+{
+    if (!app) {
+        g_status_message = "No selected app";
+    } else if (!app->installed) {
+        g_status_message = "App is not installed";
+    } else {
+        start_confirm("uninstall");
+    }
+}
+
+void cycle_detail_screenshot(int delta)
+{
+    StoreApp *app = ensure_selected_app();
+    if (!app) {
+        g_status_message = "No selected app";
+        return;
+    }
+    std::vector<std::string> screenshots = detail_screenshot_paths(*app);
+    normalize_detail_image_state(*app, screenshots);
+    int count = static_cast<int>(screenshots.size());
+    if (count == 0) {
+        g_status_message = "No screenshots for this app";
+        return;
+    }
+    g_detail_image_index = (g_detail_image_index + delta + count) % count;
+    g_status_message.clear();
+    show_screenshots_overlay();
+}
+
+void scroll_detail_description(int delta)
+{
+    StoreApp *app = ensure_selected_app();
+    if (!app) {
+        g_status_message = "No selected app";
+        return;
+    }
+    std::vector<std::string> lines = detail_description_lines(*app);
+    if (lines.empty()) lines.push_back("-");
+    normalize_detail_description_state(*app, lines);
+    int max_scroll = std::max(0, static_cast<int>(lines.size()) - 2);
+    if (max_scroll == 0) return;
+    int next = g_detail_description_scroll + delta;
+    g_detail_description_scroll = std::max(0, std::min(max_scroll, next));
+    g_status_message.clear();
+}
+
 void start_backend_job(const std::string &action, StoreApp *app)
 {
     if (!app) return;
@@ -1890,25 +2544,53 @@ void handle_key(const KeyEvent &key)
             } else if ((key.code == KEY_LEFT || key.code == KEY_Z || key.ch == 'z' || key.ch == '<') && !g_categories.empty()) {
                 g_category = g_category == 0 ? static_cast<int>(g_categories.size()) - 1 : g_category - 1;
                 rebuild_visible();
-            } else if ((key.code == KEY_RIGHT || key.ch == '>') && !g_categories.empty()) {
+            } else if ((key.code == KEY_RIGHT || key.code == KEY_C || key.ch == 'c' || key.ch == '>') && !g_categories.empty()) {
                 g_category = (g_category + 1) % static_cast<int>(g_categories.size());
                 rebuild_visible();
+            } else if (key_matches(key, '4', KEY_4)) {
+                open_registry_screen();
+            } else if (key_matches(key, '5', KEY_5)) {
+                open_share_code_screen();
+            } else if (key_matches(key, '6', KEY_6)) {
+                open_search_screen();
+            } else if (key_matches(key, '7', KEY_7)) {
+                StoreApp *app = selected_app();
+                if (app && can_install_app(*app)) {
+                    start_confirm(app->installed ? "reinstall" : "install");
+                } else if (app) {
+                    g_status_message = "Only approved apps can install";
+                } else {
+                    g_status_message = "No selected app";
+                }
+            } else if (key_matches(key, '8', KEY_8)) {
+                open_detail_screen();
             } else if (key.code == KEY_TAB) {
                 cycle_sort_rule();
-            } else if (key.code == KEY_ENTER && selected_app()) {
-                g_screen = Screen::Detail;
+            } else if (key.code == KEY_ENTER) {
+                open_detail_screen();
             } else if (key_matches(key, 's', KEY_S)) {
                 open_registry_screen();
-            } else if (key_matches(key, 'c', KEY_C)) {
-                open_share_code_screen();
             } else if (key_matches(key, 'q', KEY_Q)) {
                 request_quit();
             }
             break;
         case Screen::Detail: {
-            StoreApp *app = selected_app();
-            if (key_matches(key, 'b', KEY_B)) {
+            StoreApp *app = ensure_selected_app();
+            if (key.code == KEY_UP || key.code == KEY_F || key.ch == 'f') {
+                scroll_detail_description(-1);
+            } else if (key.code == KEY_DOWN || key.code == KEY_X || key.ch == 'x') {
+                scroll_detail_description(1);
+            } else if (key_matches(key, '4', KEY_4) || key_matches(key, 'b', KEY_B)) {
                 g_screen = Screen::Home;
+            } else if (key_matches(key, '5', KEY_5)) {
+                open_screenshots_screen();
+            } else if (key_matches(key, '6', KEY_6)) {
+                if (app && app->installed) start_detail_reinstall_action(app);
+                else start_detail_install_action(app);
+            } else if (key_matches(key, '7', KEY_7)) {
+                start_detail_upgrade_action(app);
+            } else if (key_matches(key, '8', KEY_8)) {
+                start_detail_delete_action(app);
             } else if (app && key_matches(key, 'i', KEY_I)) {
                 if (can_install_app(*app)) {
                     start_confirm(app->installed ? "reinstall" : "install");
@@ -1922,6 +2604,15 @@ void handle_key(const KeyEvent &key)
             }
             break;
         }
+        case Screen::Screenshots:
+            if (key.code == KEY_LEFT || key.code == KEY_Z || key.ch == 'z' || key.ch == '<') {
+                cycle_detail_screenshot(-1);
+            } else if (key.code == KEY_RIGHT || key.code == KEY_C || key.ch == 'c' || key.ch == '>') {
+                cycle_detail_screenshot(1);
+            } else if (key_matches(key, '4', KEY_4) || key_matches(key, 'b', KEY_B)) {
+                g_screen = Screen::Detail;
+            }
+            break;
         case Screen::Confirm:
             if (key_matches(key, 'b', KEY_B) || key_matches(key, 'n', KEY_N)) {
                 g_screen = Screen::Detail;
@@ -2001,6 +2692,26 @@ void handle_key(const KeyEvent &key)
                 }
                 g_share_code_input.push_back(key.ch);
                 g_share_code_message = "Enter opens the app detail page.";
+            }
+            break;
+        case Screen::Search:
+            if (g_search_results_active && !g_search_results.empty() &&
+                (key.code == KEY_UP || key.code == KEY_F || key.ch == 'f')) {
+                g_search_selected = g_search_selected == 0 ?
+                    static_cast<int>(g_search_results.size()) - 1 : g_search_selected - 1;
+            } else if (g_search_results_active && !g_search_results.empty() &&
+                       (key.code == KEY_DOWN || key.code == KEY_X || key.ch == 'x')) {
+                g_search_selected = (g_search_selected + 1) % static_cast<int>(g_search_results.size());
+            } else if (key.code == KEY_BACKSPACE && !g_search_input.empty()) {
+                g_search_input.pop_back();
+                clear_search_results();
+                g_search_message = "Enter searches matching apps.";
+            } else if (key.code == KEY_ENTER) {
+                open_selected_search_result();
+            } else if (key.ch >= 32 && key.ch <= 126 && g_search_input.size() < 64) {
+                g_search_input.push_back(key.ch);
+                clear_search_results();
+                g_search_message = "Enter searches matching apps.";
             }
             break;
     }
@@ -2187,10 +2898,11 @@ int main(int argc, char **argv)
     build_ui();
     refresh_summary();
     render();
+    g_home_refresh_tick = lv_tick_get();
     g_sync_timer = lv_timer_create(sync_timer_cb, 200, nullptr);
     sync_catalog();
     render();
-    g_refresh_timer = lv_timer_create(refresh_timer_cb, 5000, nullptr);
+    g_refresh_timer = lv_timer_create(refresh_timer_cb, 250, nullptr);
     g_esc_hold_timer = lv_timer_create(esc_hold_timer_cb, 50, nullptr);
     g_job_timer = lv_timer_create(job_timer_cb, kJobPollIntervalMs, nullptr);
 
