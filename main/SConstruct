@@ -1,7 +1,8 @@
 import os
+import shutil
 import shlex
 import subprocess
-
+from pathlib import Path
 Import("env")
 with open(env["PROJECT_TOOL_S"]) as f:
     exec(f.read())
@@ -12,22 +13,56 @@ if "CONFIG_TOOLCHAIN_PREFIX" in os.environ:
     env["ARFLAGS"] = ["rcs"]
 
 SRCS = Glob("src/*.c*")
-INCLUDE = [ADir("."), ADir("include")]
+SRCS += append_srcs_dir(ADir("ui"))
+INCLUDE = [ADir(".")]
+ext_components_path = os.environ.get("EXT_COMPONENTS_PATH")
+if ext_components_path:
+    INCLUDE += [os.path.join(ext_components_path, "cp0_lvgl", "include")]
+INCLUDE += [ADir("include")]
 PRIVATE_INCLUDE = []
-REQUIREMENTS = ["lvgl_component", "pthread"]
-if "CONFIG_V9_5_LV_USE_SDL" not in os.environ:
-    REQUIREMENTS += ["input", "xkbcommon", "udev"]
+REQUIREMENTS = ["cp0_lvgl", "eventpp", "lvgl_component", "pthread", "RadioLib"]
 STATIC_LIB = []
 DYNAMIC_LIB = []
 DEFINITIONS = []
 DEFINITIONS_PRIVATE = []
 LDFLAGS = []
-if "CONFIG_V9_5_LV_USE_SDL" not in os.environ:
-    LDFLAGS += ["-lutil"]
 LINK_SEARCH_PATH = []
 STATIC_FILES = []
 FREETYPE_INCLUDE = None
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.getcwd(), ".."))
+APPSTORE_STATIC_ROOT = os.path.join(PROJECT_ROOT, "APPLaunch")
+APPLAUNCH_STATIC_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, "..", "APPLaunch", "APPLaunch"))
+STAGED_STATIC_ROOT = os.path.abspath(os.path.join("build", "static"))
+STAGED_APPLAUNCH = os.path.join(STAGED_STATIC_ROOT, "APPLaunch")
+
+
+def stage_appstore_static_files():
+    if os.path.exists(STAGED_APPLAUNCH):
+        shutil.rmtree(STAGED_APPLAUNCH)
+    shutil.copytree(APPSTORE_STATIC_ROOT, STAGED_APPLAUNCH)
+    status_images = [
+        "status_ethernet.png",
+        "status_time_background.png",
+        "status_battery_background.png",
+    ]
+    dst_images = os.path.join(STAGED_APPLAUNCH, "share", "images")
+    os.makedirs(dst_images, exist_ok=True)
+    for image in status_images:
+        shutil.copy2(
+            os.path.join(APPLAUNCH_STATIC_ROOT, "share", "images", image),
+            os.path.join(dst_images, image),
+        )
+    dst_fonts = os.path.join(STAGED_APPLAUNCH, "share", "font")
+    os.makedirs(dst_fonts, exist_ok=True)
+    shutil.copy2(
+        os.path.join(APPLAUNCH_STATIC_ROOT, "share", "font", "AlibabaPuHuiTi-3-55-Regular.ttf"),
+        os.path.join(dst_fonts, "AlibabaPuHuiTi-3-55-Regular.ttf"),
+    )
+
+
+stage_appstore_static_files()
+STATIC_FILES += [(STAGED_APPLAUNCH, "APPLaunch")]
 
 def pkg_config_flags(kind, package):
     try:

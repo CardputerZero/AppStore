@@ -1,1 +1,0 @@
-../appstore.py

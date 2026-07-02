@@ -15,6 +15,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -34,6 +35,18 @@ REGION_REGISTRIES = {
 BUILTIN_REGISTRY_URLS = {item["url"] for item in REGION_REGISTRIES.values()}
 USER_AGENT = "CardputerZero-AppStore/0.1"
 CACHE_BUST_PARAM = "_cz_appstore_ts"
+_DPKG_STATUS_CACHE: Optional[dict[str, tuple[bool, str]]] = None
+DEBUG_LOG_PATH = Path(os.environ.get("M5APPSTORE_DEBUG_LOG", "/tmp/appstore-backend.log"))
+
+
+def log_debug(message: str) -> None:
+    line = f"[AppStore] {now_text()} pid={os.getpid()} {message}"
+    print(line, file=sys.stderr, flush=True)
+    try:
+        with DEBUG_LOG_PATH.open("a", encoding="utf-8") as fp:
+            fp.write(line + "\n")
+    except Exception:
+        pass
 
 
 def state_dir() -> Path:
@@ -45,7 +58,7 @@ def app_root() -> Path:
 
 
 def cache_dir() -> Path:
-    return state_dir() / "cache"
+    return Path(os.environ.get("M5APPSTORE_CACHE_DIR", app_root() / "cache")).expanduser()
 
 
 def config_path() -> Path:
@@ -123,6 +136,15 @@ def normalize_region(value: Any) -> str:
     return "default"
 
 
+def normalize_region_mode(value: Any) -> str:
+    text = str(value or "auto").strip()
+    if not text:
+        return "auto"
+    if text.lower() == "auto":
+        return "auto"
+    return normalize_region(text)
+
+
 def region_registry(region: str) -> dict[str, Any]:
     code = normalize_region(region)
     item = REGION_REGISTRIES[code]
@@ -144,11 +166,15 @@ def load_config() -> dict[str, Any]:
     data = read_json(config_path(), {})
     if not isinstance(data, dict):
         data = {}
-    selected_region = normalize_region(data.get("region", "default"))
+    selected_mode = normalize_region_mode(data.get("region", "auto"))
+    active_region = normalize_region(data.get(
+        "active_region",
+        "default" if selected_mode == "auto" else selected_mode,
+    ))
     registries = data.get("registries")
     if not isinstance(registries, list):
         registries = []
-    builtin = region_registry(selected_region)
+    builtin = region_registry(active_region)
     normalized = [builtin]
     seen = {builtin["url"]}
     for item in registries:
@@ -169,8 +195,14 @@ def load_config() -> dict[str, Any]:
             "url": url,
             "enabled": enabled_value(item.get("enabled", True)),
         })
-    data["region"] = selected_region
+    data["region"] = selected_mode
+    data["active_region"] = active_region
     data["registries"] = normalized
+    log_debug(
+        "load_config "
+        f"path={config_path()} region={selected_mode} active={active_region} "
+        f"registries={len(normalized)} cache_dir={cache_dir()}"
+    )
     return data
 
 
@@ -189,6 +221,75 @@ def enabled_value(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
     return bool(value)
+
+
+def curl_text(url: str, timeout: int = 5) -> str:
+    curl = shutil.which("curl")
+    if not curl:
+        log_debug("region_detect skip: curl not found")
+        return ""
+    try:
+        result = subprocess.run(
+            [curl, "-fsSL", "--max-time", str(timeout), url],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        log_debug(f"region_detect curl failed url={url} error={compact_error(exc)}")
+        return ""
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or "").strip()
+        log_debug(f"region_detect curl error url={url} rc={result.returncode} error={compact_error(error)}")
+        return ""
+    return result.stdout.strip()
+
+
+def detect_country_code() -> str:
+    ip = curl_text("ifconfig.me")
+    if not ip:
+        return ""
+    quoted_ip = urllib.parse.quote(ip.splitlines()[0].strip(), safe=":.")
+    country = curl_text(f"https://ipinfo.io/{quoted_ip}/country").splitlines()
+    if not country:
+        return ""
+    code = country[0].strip().upper()
+    if len(code) >= 2:
+        return code[:2]
+    return ""
+
+
+def auto_region_for_sync() -> str:
+    country = detect_country_code()
+    region = "CN" if country == "CN" else "default"
+    log_debug(f"region_detect country={country or '-'} selected={region}")
+    return region
+
+
+def config_with_region(config: dict[str, Any], region: str) -> dict[str, Any]:
+    mode = normalize_region_mode(region)
+    selected = normalize_region(config.get("active_region", "default") if mode == "auto" else mode)
+    custom_registries = [
+        item for item in config.get("registries", [])
+        if isinstance(item, dict) and not item.get("builtin") and not is_builtin_registry_url(str(item.get("url", "")))
+    ]
+    config["region"] = mode
+    config["active_region"] = selected
+    config["registries"] = [region_registry(selected), *custom_registries]
+    return config
+
+
+def config_for_sync(config: dict[str, Any]) -> dict[str, Any]:
+    mode = normalize_region_mode(config.get("region", "auto"))
+    active = auto_region_for_sync() if mode == "auto" else normalize_region(mode)
+    config = config_with_region(config, mode)
+    config["active_region"] = active
+    custom_registries = [
+        item for item in config.get("registries", [])
+        if isinstance(item, dict) and not item.get("builtin") and not is_builtin_registry_url(str(item.get("url", "")))
+    ]
+    config["registries"] = [region_registry(active), *custom_registries]
+    return config
 
 
 def cache_busted_url(url: str) -> str:
@@ -228,9 +329,18 @@ def request_json(url: str) -> Any:
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
-    request = urllib.request.Request(cache_busted_url(url), headers=headers)
-    with urllib.request.urlopen(request, timeout=15) as response:
-        return json.loads(response.read().decode("utf-8"))
+    fetch_url = cache_busted_url(url)
+    log_debug(f"request_json start url={url} fetch_url={fetch_url}")
+    request = urllib.request.Request(fetch_url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read()
+            status = getattr(response, "status", "file")
+            log_debug(f"request_json ok url={url} status={status} bytes={len(raw)}")
+            return json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        log_debug(f"request_json failed url={url} error={compact_error(exc)}")
+        raise
 
 
 def content_range_total(value: str) -> int:
@@ -241,24 +351,36 @@ def content_range_total(value: str) -> int:
 
 
 def download_file(url: str, dest: Path, progress_stage: str = "", resume: bool = False) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
     existing = dest.stat().st_size if resume and dest.exists() else 0
     headers = {"User-Agent": USER_AGENT}
     if existing:
         headers["Range"] = f"bytes={existing}-"
+    log_debug(
+        f"download start url={url} dest={dest} resume={int(resume)} existing={existing} "
+        f"stage={progress_stage or '-'}"
+    )
     request = urllib.request.Request(url, headers=headers)
     try:
         response_ctx = urllib.request.urlopen(request, timeout=30)
-    except Exception:
+    except Exception as exc:
         if existing:
+            log_debug(f"download resume failed url={url} error={compact_error(exc)}; retry full")
             headers.pop("Range", None)
             request = urllib.request.Request(url, headers=headers)
-            response_ctx = urllib.request.urlopen(request, timeout=30)
+            try:
+                response_ctx = urllib.request.urlopen(request, timeout=30)
+            except Exception as retry_exc:
+                log_debug(f"download failed url={url} dest={dest} error={compact_error(retry_exc)}")
+                raise
             existing = 0
         else:
+            log_debug(f"download failed url={url} dest={dest} error={compact_error(exc)}")
             raise
     with response_ctx as response:
         append = existing and getattr(response, "status", 200) == 206
         mode = "ab" if append else "wb"
+        status = getattr(response, "status", "file")
         total_text = response.headers.get("Content-Length") or "0"
         try:
             total = int(total_text)
@@ -268,6 +390,10 @@ def download_file(url: str, dest: Path, progress_stage: str = "", resume: bool =
             total = content_range_total(response.headers.get("Content-Range") or "") or (existing + total)
         else:
             existing = 0
+        log_debug(
+            f"download response url={url} status={status} dest={dest} mode={mode} "
+            f"content_length={total_text} total={total}"
+        )
         done = 0
         if progress_stage and existing:
             percent = int(existing * 100 / total) if total else -1
@@ -288,6 +414,11 @@ def download_file(url: str, dest: Path, progress_stage: str = "", resume: bool =
             if progress_stage:
                 percent = 100 if total and done >= total else -1
                 emit("PROGRESS", progress_stage, done, total, percent, "Download complete")
+    try:
+        final_size = dest.stat().st_size
+    except OSError:
+        final_size = -1
+    log_debug(f"download ok url={url} dest={dest} bytes={final_size}")
 
 
 def registry_site_root(index_url: str) -> str:
@@ -314,7 +445,9 @@ def cache_media(index_url: str, media_ref: str, subdir: str) -> str:
     if not media_ref:
         return ""
     if media_ref.startswith("file://"):
-        return urllib.parse.urlparse(media_ref).path
+        path = urllib.parse.urlparse(media_ref).path
+        log_debug(f"cache_media file subdir={subdir} media_ref={media_ref} path={path}")
+        return path
     if media_ref.startswith(("http://", "https://")):
         media_url = media_ref
     else:
@@ -322,11 +455,14 @@ def cache_media(index_url: str, media_ref: str, subdir: str) -> str:
     suffix = Path(urllib.parse.urlparse(media_url).path).suffix or ".png"
     dest = cache_dir() / subdir / f"{short_hash(media_url)}{suffix}"
     if dest.exists() and dest.stat().st_size > 0:
+        log_debug(f"cache_media hit subdir={subdir} url={media_url} dest={dest} bytes={dest.stat().st_size}")
         return str(dest)
     try:
+        log_debug(f"cache_media fetch subdir={subdir} index={index_url} ref={media_ref} url={media_url} dest={dest}")
         download_file(media_url, dest)
         return str(dest)
-    except Exception:
+    except Exception as exc:
+        log_debug(f"cache_media failed subdir={subdir} url={media_url} dest={dest} error={compact_error(exc)}")
         return ""
 
 
@@ -340,6 +476,8 @@ def cache_screenshot(index_url: str, screenshot_ref: str) -> str:
 
 def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
     url = source["url"]
+    cache_path = cache_file_for(url)
+    log_debug(f"sync_registry start name={source.get('name') or '-'} url={url} cache={cache_path}")
     record: dict[str, Any] = {
         "name": source.get("name") or registry_name_from_url(url),
         "url": url,
@@ -394,19 +532,25 @@ def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
                     local_screenshots.append(local)
             if local_screenshots:
                 record["screenshots"][key] = local_screenshots
-        write_json(cache_file_for(url), record)
+        write_json(cache_path, record)
+        log_debug(
+            f"sync_registry ok url={url} apps={len(index_apps)} full_apps={len(full_apps)} "
+            f"icons={len(record['icons'])} screenshots={len(record['screenshots'])} cache={cache_path}"
+        )
     except Exception as exc:
+        log_debug(f"sync_registry failed url={url} error={compact_error(exc)} cache={cache_path}")
         record["status"] = "error"
         record["error"] = registry_error_message(url, exc)
         record["last_attempt_at"] = now_text()
-        cached = read_json(cache_file_for(url), {})
+        cached = read_json(cache_path, {})
         if isinstance(cached, dict) and cached.get("index"):
             cached["status"] = "cached"
             cached["error"] = record["error"]
             cached["last_attempt_at"] = record["last_attempt_at"]
-            write_json(cache_file_for(url), cached)
+            write_json(cache_path, cached)
+            log_debug(f"sync_registry fallback_cached url={url} cache={cache_path}")
             return cached
-        write_json(cache_file_for(url), record)
+        write_json(cache_path, record)
     return record
 
 
@@ -427,6 +571,14 @@ def validated_registry_record(name: str, url: str) -> tuple[str, dict[str, Any],
 
 def sync_all() -> list[dict[str, Any]]:
     config = load_config()
+    config = config_for_sync(config)
+    save_config(config)
+    log_debug(
+        "sync_all "
+        f"region={config.get('region')} active={config.get('active_region')} "
+        f"enabled={sum(1 for item in config['registries'] if item.get('enabled', True))} "
+        f"registries={len(config['registries'])}"
+    )
     records = []
     for source in config["registries"]:
         if source.get("enabled", True):
@@ -436,15 +588,29 @@ def sync_all() -> list[dict[str, Any]]:
 
 def load_registry_records(sync_if_empty: bool = False) -> list[dict[str, Any]]:
     config = load_config()
+    log_debug(f"load_registry_records start sync_if_empty={sync_if_empty} registries={len(config['registries'])}")
     records = []
     for source in config["registries"]:
         if not source.get("enabled", True):
+            log_debug(f"load_registry_records skip disabled url={source.get('url')}")
             continue
-        cached = read_json(cache_file_for(source["url"]), {})
+        cache_path = cache_file_for(source["url"])
+        cached = read_json(cache_path, {})
         if isinstance(cached, dict) and (cached.get("index") or cached.get("status") == "error"):
             records.append(cached)
+            app_count = 0
+            if isinstance(cached.get("index"), dict):
+                app_count = len(cached.get("index", {}).get("apps", []))
+            log_debug(
+                "load_registry_records hit "
+                f"url={source['url']} cache={cache_path} status={cached.get('status')} apps={app_count}"
+            )
+        else:
+            log_debug(f"load_registry_records miss url={source['url']} cache={cache_path}")
     if not records and sync_if_empty:
+        log_debug("load_registry_records empty: syncing")
         records = sync_all()
+    log_debug(f"load_registry_records done records={len(records)}")
     return records
 
 
@@ -618,34 +784,45 @@ def executable_exists(exec_value: str) -> bool:
     return bool(binary) and is_executable_file(binary)
 
 
-def package_installed(package: str) -> bool:
-    if not package or not shutil.which("dpkg-query"):
-        return False
+def dpkg_status_cache() -> dict[str, tuple[bool, str]]:
+    global _DPKG_STATUS_CACHE
+    if _DPKG_STATUS_CACHE is not None:
+        return _DPKG_STATUS_CACHE
+    _DPKG_STATUS_CACHE = {}
+    if not shutil.which("dpkg-query"):
+        return _DPKG_STATUS_CACHE
     try:
         result = subprocess.run(
-            ["dpkg-query", "-W", "-f=${Status}", package],
+            ["dpkg-query", "-W", "-f=${Package}\t${Status}\t${Version}\n"],
             check=False,
             capture_output=True,
             text=True,
         )
-        return "install ok installed" in result.stdout
     except Exception:
+        return _DPKG_STATUS_CACHE
+    if result.returncode != 0:
+        return _DPKG_STATUS_CACHE
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 3:
+            continue
+        package, status, version = parts
+        if package:
+            _DPKG_STATUS_CACHE[package] = ("install ok installed" in status, version.strip())
+    return _DPKG_STATUS_CACHE
+
+
+def package_installed(package: str) -> bool:
+    if not package:
         return False
+    return dpkg_status_cache().get(package, (False, ""))[0]
 
 
 def package_version(package: str) -> str:
-    if not package or not shutil.which("dpkg-query"):
+    if not package:
         return ""
-    try:
-        result = subprocess.run(
-            ["dpkg-query", "-W", "-f=${Version}", package],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip() if result.returncode == 0 else ""
-    except Exception:
-        return ""
+    installed, version = dpkg_status_cache().get(package, (False, ""))
+    return version if installed else ""
 
 
 def candidate_execs(app: dict[str, Any], files: list[str]) -> list[str]:
@@ -711,14 +888,14 @@ def installed_records() -> dict[str, Any]:
 
 def is_installed(app: dict[str, Any]) -> bool:
     package = deb_package_name(app)
-    if package and shutil.which("dpkg-query"):
+    if package:
         return package_installed(package)
     key = app_key(app)
     records = installed_records()
     if key in records:
         record = records[key] if isinstance(records[key], dict) else {}
         package = record.get("package") if isinstance(record, dict) else ""
-        if package and shutil.which("dpkg-query"):
+        if package:
             return package_installed(str(package))
         files = record.get("files", [])
         if any(Path(path).exists() for path in files):
@@ -804,6 +981,11 @@ def summary(sync_if_empty: bool = False) -> None:
         status = f"{len(apps)} apps/cache"
     else:
         status = f"{len(apps)} apps/{usable} registries"
+    log_debug(
+        "summary "
+        f"sync_if_empty={sync_if_empty} records={len(records)} apps={len(apps)} "
+        f"ok={ok} cached={cached} failed={failed} usable={usable} status={status}"
+    )
     emit("META", 1, status, free_space_text(), app_root())
     warning = ""
     if failed:
@@ -874,29 +1056,29 @@ def registries() -> None:
 
 def regions() -> None:
     config = load_config()
-    selected = normalize_region(config.get("region", "default"))
-    current = REGION_REGISTRIES[selected]
-    emit("REGION", selected, current["label"], current["url"])
+    selected = normalize_region_mode(config.get("region", "auto"))
+    active = normalize_region(config.get("active_region", "default"))
+    current = REGION_REGISTRIES[active]
+    label = "Auto" if selected == "auto" else REGION_REGISTRIES[normalize_region(selected)]["label"]
+    emit("REGION", selected, label, current["url"], active)
+    emit("REGION_OPTION", "auto", "Auto", current["url"], "1" if selected == "auto" else "0")
     for code, item in REGION_REGISTRIES.items():
         emit("REGION_OPTION", code, item["label"], item["url"], "1" if code == selected else "0")
 
 
 def set_region(region: str) -> int:
     requested = str(region or "").strip()
-    selected = normalize_region(requested)
-    if requested and selected == "default" and requested.lower() not in {"default", "global"}:
+    selected = normalize_region_mode(requested)
+    if requested and selected == "default" and requested.lower() not in {"auto", "default", "global"}:
         emit("ERROR", "unknown region", requested)
         return 1
     config = load_config()
-    custom_registries = [
-        item for item in config["registries"]
-        if not item.get("builtin") and not is_builtin_registry_url(item["url"])
-    ]
-    config["region"] = selected
-    config["registries"] = [region_registry(selected), *custom_registries]
+    config = config_with_region(config, selected)
     save_config(config)
-    item = REGION_REGISTRIES[selected]
-    emit("REGION", selected, item["label"], item["url"])
+    active = normalize_region(config.get("active_region", "default"))
+    item = REGION_REGISTRIES[active]
+    label = "Auto" if selected == "auto" else REGION_REGISTRIES[normalize_region(selected)]["label"]
+    emit("REGION", selected, label, item["url"], active)
     return 0
 
 
@@ -988,12 +1170,15 @@ def download_deb(app: dict[str, Any]) -> Path:
         raise RuntimeError("download md5 is required")
     dest = deb_cache_path(url)
     partial = partial_deb_path(dest)
+    log_debug(f"download_deb start app={app_key(app)} url={url} dest={dest} partial={partial}")
     if dest.exists():
         try:
             verify_md5(dest, expected_md5)
             partial.unlink(missing_ok=True)
+            log_debug(f"download_deb cache_valid app={app_key(app)} dest={dest}")
             return dest
-        except Exception:
+        except Exception as exc:
+            log_debug(f"download_deb cache_invalid app={app_key(app)} dest={dest} error={compact_error(exc)}")
             dest.unlink(missing_ok=True)
     download_file(url, partial, progress_stage="download", resume=True)
     try:
@@ -1002,6 +1187,7 @@ def download_deb(app: dict[str, Any]) -> Path:
         partial.unlink(missing_ok=True)
         raise
     partial.replace(dest)
+    log_debug(f"download_deb ok app={app_key(app)} dest={dest}")
     return dest
 
 
@@ -1019,13 +1205,25 @@ def package_command_args(args: list[str]) -> list[str]:
     sudo = shutil.which("sudo")
     if not sudo:
         raise RuntimeError("root privileges are required for package operations")
+    password = os.environ.get("M5APPSTORE_SUDO_PASSWORD")
+    if password is not None:
+        return [sudo, "-S", "-p", "", "env", "DEBIAN_FRONTEND=noninteractive", *args]
     return [sudo, "-n", "env", "DEBIAN_FRONTEND=noninteractive", *args]
 
 
 def run_package_command(args: list[str]) -> None:
     env = os.environ.copy()
     env["DEBIAN_FRONTEND"] = "noninteractive"
-    result = subprocess.run(package_command_args(args), check=False, capture_output=True, text=True, env=env)
+    password = env.get("M5APPSTORE_SUDO_PASSWORD")
+    input_text = f"{password}\n" if os.geteuid() != 0 and password is not None else None
+    result = subprocess.run(
+        package_command_args(args),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        input=input_text,
+    )
     if result.returncode != 0:
         raise RuntimeError(command_error(result))
 
@@ -1245,6 +1443,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     ensure_dirs()
     args = parse_args()
+    log_debug(
+        "main "
+        f"argv={shlex.join(sys.argv[1:])} app_root={app_root()} cache_dir={cache_dir()} "
+        f"state_dir={state_dir()} config={config_path()} debug_log={DEBUG_LOG_PATH}"
+    )
     if args.summary:
         summary(sync_if_empty=args.summary_sync_if_empty)
         return 0
