@@ -44,6 +44,7 @@ constexpr uint32_t kJobPollIntervalMs = 250;
 constexpr uint32_t kTopStatusRefreshMs = 5000;
 constexpr uint32_t kBatteryChargeAnimRefreshMs = 120;
 constexpr uint32_t kSyncAnimRefreshMs = 200;
+constexpr uint32_t kStatusScrollVisibleMs = 6000;
 constexpr const char *kDefaultRegistryUrl = "https://cardputerzero.github.io/generated/registry.json";
 
 enum class Screen {
@@ -77,6 +78,9 @@ volatile sig_atomic_t g_quit_requested = 0;
 
 std::string g_app_dir = ".";
 std::string g_status_message;
+std::string g_status_scroll_text;
+uint32_t g_status_scroll_start_tick = 0;
+uint32_t g_status_scroll_hide_after_ms = 0;
 std::string g_repo_status = "built-in";
 std::string g_free_space = "-";
 std::string g_root_path = "-";
@@ -95,6 +99,7 @@ bool g_default_category_applied = false;
 SortRule g_sort_rule = SortRule::Default;
 std::string g_confirm_action;
 std::vector<std::string> g_confirm_lines;
+int g_confirm_focus = 0;
 std::string g_sudo_password_input;
 std::string g_sudo_message = "Enter sudo password for package operation.";
 std::string g_sudo_action;
@@ -452,6 +457,46 @@ void center_strong_label(lv_obj_t *parent, const std::string &text, int x, int y
 {
     center_label(parent, text, x, y, w, h, font, color, mode);
     center_label(parent, text, x + 1, y, w, h, font, color, mode);
+}
+
+bool status_message_visible(int w)
+{
+    (void)w;
+    if (g_status_message.empty()) {
+        g_status_scroll_text.clear();
+        g_status_scroll_start_tick = 0;
+        g_status_scroll_hide_after_ms = 0;
+        return false;
+    }
+    if (g_status_scroll_text != g_status_message) {
+        g_status_scroll_text = g_status_message;
+        g_status_scroll_start_tick = lv_tick_get();
+        g_status_scroll_hide_after_ms = kStatusScrollVisibleMs;
+        return true;
+    }
+    if (g_status_scroll_start_tick != 0 &&
+        lv_tick_elaps(g_status_scroll_start_tick) >= g_status_scroll_hide_after_ms) {
+        g_status_message.clear();
+        g_status_scroll_text.clear();
+        g_status_scroll_start_tick = 0;
+        g_status_scroll_hide_after_ms = 0;
+        return false;
+    }
+    return true;
+}
+
+void scrolling_status_label(lv_obj_t *parent, const std::string &text, int x, int y, int w, int h,
+                            uint32_t color = 0xCCCC33)
+{
+    lv_obj_t *obj = lv_label_create(parent);
+    lv_obj_set_pos(obj, x, y);
+    lv_obj_set_size(obj, w, h);
+    lv_obj_set_style_text_font(obj, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(obj, lv_color_hex(color), 0);
+    lv_obj_set_style_text_letter_space(obj, 0, 0);
+    lv_obj_set_style_anim_duration(obj, 40, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_label_set_long_mode(obj, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_label_set_text(obj, text.c_str());
 }
 
 bool draw_packaged_image(const std::string &name, int x, int y);
@@ -1023,9 +1068,8 @@ void render_home()
                      LV_LABEL_LONG_DOT);
     }
 
-    if (!g_status_message.empty()) {
-        strong_label(g_root, one_line(g_status_message, 26), 106, 128, 172, 10,
-                     &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+    if (status_message_visible(172)) {
+        scrolling_status_label(g_root, g_status_message, 106, 128, 172, 10);
     }
     draw_shortcuts_bar();
 }
@@ -1070,9 +1114,9 @@ void render_detail()
     label(g_root, "Deps  :", 10, 107, 48, 12, &lv_font_montserrat_10, 0x58A6FF);
     label(g_root, one_line(app->dependencies.empty() ? "-" : app->dependencies, 42), 62, 107, 246, 12,
           &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
-    if (!g_status_message.empty() && !g_job_running) {
-        label(g_root, one_line(g_status_message, 54), 10, 122, 300, 12,
-              &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+    if (!g_job_running && status_message_visible(300)) {
+        box(8, 119, 304, 13, 0x0D1117, 0x0D1117, 0, 0, LV_OPA_COVER);
+        scrolling_status_label(g_root, g_status_message, 10, 121, 300, 10);
     } else {
         std::vector<std::string> lines = detail_description_lines(*app);
         if (lines.empty()) lines.push_back("-");
@@ -1128,11 +1172,15 @@ void render_confirm()
         if (y > 109) break;
     }
 
-    box(54, 119, 84, 17, 0x1A6A2A, 0x2EA043, 1);
+    const bool yes_focused = g_confirm_focus == 0;
+    const bool no_focused = g_confirm_focus == 1;
+    box(54, 119, 84, 17, yes_focused ? 0x2EA043 : 0x1A6A2A,
+        yes_focused ? 0xCCCC33 : 0x2EA043, yes_focused ? 2 : 1);
     center_strong_label(g_root, "Y YES", 58, 122, 76, 12, &lv_font_montserrat_10, 0xFFFFFF);
-    box(182, 119, 84, 17, 0x4B1F24, 0xF85149, 1);
+    box(182, 119, 84, 17, no_focused ? 0x8B2F34 : 0x4B1F24,
+        no_focused ? 0xCCCC33 : 0xF85149, no_focused ? 2 : 1);
     center_strong_label(g_root, "N NO", 186, 122, 76, 12, &lv_font_montserrat_10, 0xFFFFFF);
-    center_strong_label(g_root, "This will start the package operation.", 34, 149, 252, 12,
+    center_strong_label(g_root, "Left/Right or Tab select   Enter confirm", 28, 149, 264, 12,
                         &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
@@ -1452,6 +1500,14 @@ void refresh_timer_cb(lv_timer_t *)
     if (poll_summary_refresh()) {
         render();
     }
+    if (!g_status_message.empty() && g_status_scroll_start_tick != 0 &&
+        lv_tick_elaps(g_status_scroll_start_tick) >= g_status_scroll_hide_after_ms) {
+        g_status_message.clear();
+        g_status_scroll_text.clear();
+        g_status_scroll_start_tick = 0;
+        g_status_scroll_hide_after_ms = 0;
+        render();
+    }
     bool battery_charging = g_top_battery_status.valid && (g_top_battery_status.flags & 1);
     if ((battery_charging &&
          lv_tick_elaps(g_top_status_last_render_tick) >= kBatteryChargeAnimRefreshMs) ||
@@ -1570,6 +1626,9 @@ void navigate_back()
             break;
         case Screen::Confirm:
             g_screen = Screen::Detail;
+            g_confirm_action.clear();
+            g_confirm_lines.clear();
+            g_confirm_focus = 0;
             break;
         case Screen::SudoPassword:
             g_screen = Screen::Confirm;
@@ -2028,6 +2087,14 @@ bool parse_plan(const std::string &out)
     return false;
 }
 
+void cancel_confirm()
+{
+    g_screen = Screen::Detail;
+    g_confirm_action.clear();
+    g_confirm_lines.clear();
+    g_confirm_focus = 0;
+}
+
 void start_confirm(const std::string &action)
 {
     StoreApp *app = selected_app();
@@ -2037,6 +2104,7 @@ void start_confirm(const std::string &action)
         return;
     }
     g_confirm_action = action;
+    g_confirm_focus = 0;
     if (action == "uninstall") {
         g_confirm_lines = {"Delete " + app->name, "Remove installed Debian package.", "Disk free: " + g_free_space};
         g_screen = Screen::Confirm;
@@ -2331,11 +2399,18 @@ void handle_key(const KeyEvent &key)
             break;
         case Screen::Confirm:
             if (key_matches(key, 'b', KEY_B) || key_matches(key, 'n', KEY_N)) {
-                g_screen = Screen::Detail;
-                g_confirm_action.clear();
-                g_confirm_lines.clear();
+                cancel_confirm();
             } else if (key_matches(key, 'y', KEY_Y)) {
                 execute_confirm();
+            } else if (key.code == KEY_LEFT || key.code == KEY_Z || key.ch == 'z' || key.ch == '<') {
+                g_confirm_focus = 0;
+            } else if (key.code == KEY_RIGHT || key.code == KEY_C || key.ch == 'c' || key.ch == '>') {
+                g_confirm_focus = 1;
+            } else if (key.code == KEY_TAB) {
+                g_confirm_focus = 1 - g_confirm_focus;
+            } else if (key.code == KEY_ENTER) {
+                if (g_confirm_focus == 0) execute_confirm();
+                else cancel_confirm();
             }
             break;
         case Screen::SudoPassword:
