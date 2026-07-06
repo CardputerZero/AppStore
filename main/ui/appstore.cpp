@@ -636,16 +636,14 @@ void draw_system_bar()
     lv_obj_set_size(battery_bar, 33, 14);
     lv_obj_set_align(battery_bar, LV_ALIGN_CENTER);
     lv_obj_set_style_radius(battery_bar, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(battery_bar, lv_color_hex(charging ? 0x2A2608 : 0x484847),
+    lv_obj_set_style_bg_color(battery_bar, lv_color_hex(0x484847),
                               LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(battery_bar, charging ? 70 : 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(battery_bar, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_radius(battery_bar, 0, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(battery_bar, lv_color_hex(charging ? 0xFFD24A : 0x66CC33),
+    lv_obj_set_style_bg_color(battery_bar, lv_color_hex(0x66CC33),
                               LV_PART_INDICATOR | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(battery_bar, 170, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_color(battery_panel, lv_color_hex(charging ? 0xF3B51B : 0x000000),
-                              LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(battery_panel, charging ? 80 : 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(battery_bar, 0, LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(battery_panel, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     if (charging) {
         lv_obj_t *charge_wave = lv_obj_create(battery_panel);
         int wave_x = -8 + static_cast<int>((lv_tick_get() % 850) * 44 / 850);
