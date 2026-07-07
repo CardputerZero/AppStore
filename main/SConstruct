@@ -7,6 +7,8 @@ Import("env")
 with open(env["PROJECT_TOOL_S"]) as f:
     exec(f.read())
 
+cpp_httplib = wget_github("https://github.com/yhirose/cpp-httplib.git")
+
 if "CONFIG_TOOLCHAIN_PREFIX" in os.environ:
     env["RANLIB"] = '${_concat(GCCPREFIX, "ranlib", GCCSUFFIX, __env__)}'
     env["RANLIBCOM"] = "$RANLIB $TARGET"
@@ -14,16 +16,16 @@ if "CONFIG_TOOLCHAIN_PREFIX" in os.environ:
 
 SRCS = Glob("src/*.c*")
 SRCS += append_srcs_dir(ADir("ui"))
-INCLUDE = [ADir(".")]
+INCLUDE = [ADir("."), cpp_httplib]
 ext_components_path = os.environ.get("EXT_COMPONENTS_PATH")
 if ext_components_path:
     INCLUDE += [os.path.join(ext_components_path, "cp0_lvgl", "include")]
 INCLUDE += [ADir("include")]
 PRIVATE_INCLUDE = []
-REQUIREMENTS = ["cp0_lvgl", "eventpp", "lvgl_component", "pthread", "RadioLib"]
+REQUIREMENTS = ["cp0_lvgl", "eventpp", "lvgl_component", "pthread", "RadioLib", "ssl", "crypto"]
 STATIC_LIB = []
 DYNAMIC_LIB = []
-DEFINITIONS = []
+DEFINITIONS = ["-DCPPHTTPLIB_OPENSSL_SUPPORT"]
 DEFINITIONS_PRIVATE = []
 LDFLAGS = []
 LINK_SEARCH_PATH = []

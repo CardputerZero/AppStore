@@ -9,17 +9,21 @@ packages into /usr/share/APPLaunch.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
 
@@ -37,6 +41,7 @@ USER_AGENT = "CardputerZero-AppStore/0.1"
 CACHE_BUST_PARAM = "_cz_appstore_ts"
 _DPKG_STATUS_CACHE: Optional[dict[str, tuple[bool, str]]] = None
 DEBUG_LOG_PATH = Path(os.environ.get("M5APPSTORE_DEBUG_LOG", "/tmp/appstore-backend.log"))
+SERVICE_LOCK = threading.Lock()
 
 
 def log_debug(message: str) -> None:
@@ -58,7 +63,7 @@ def app_root() -> Path:
 
 
 def cache_dir() -> Path:
-    return Path(os.environ.get("M5APPSTORE_CACHE_DIR", app_root() / "cache")).expanduser()
+    return Path(os.environ.get("M5APPSTORE_CACHE_DIR", "/var/cache/APPLaunch")).expanduser()
 
 
 def config_path() -> Path:
@@ -76,6 +81,33 @@ def now_text() -> str:
 def tsv_escape(value: Any) -> str:
     text = "" if value is None else str(value)
     return text.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+
+
+def tsv_unescape(value: str) -> str:
+    out = []
+    escaped = False
+    for ch in value:
+        if escaped:
+            if ch == "t":
+                out.append("\t")
+            elif ch == "n":
+                out.append("\n")
+            elif ch == "r":
+                out.append("\r")
+            else:
+                out.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        else:
+            out.append(ch)
+    if escaped:
+        out.append("\\")
+    return "".join(out)
+
+
+def split_tsv_line(line: str) -> list[str]:
+    return [tsv_unescape(field) for field in line.rstrip("\r\n").split("\t")]
 
 
 def emit(*fields: Any) -> None:
@@ -876,7 +908,11 @@ def repair_applaunch_desktop(app: dict[str, Any], files: list[str]) -> str:
     for exec_value in candidate_execs(app, files):
         binary = exec_binary_path(exec_value)
         if binary and is_executable_file(binary):
-            rewrite_desktop_exec(desktop, binary)
+            try:
+                rewrite_desktop_exec(desktop, binary)
+            except PermissionError as exc:
+                log_debug(f"desktop repair skipped path={desktop} error={compact_error(exc)}")
+                return binary
             return binary
     return ""
 
@@ -1418,7 +1454,7 @@ def edit_registry(old_url: str, new_url: str, name: str = "") -> int:
     return 0
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--summary", action="store_true")
     parser.add_argument("--summary-sync-if-empty", action="store_true")
@@ -1437,17 +1473,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reinstall")
     parser.add_argument("--upgrade")
     parser.add_argument("--uninstall")
-    return parser.parse_args()
+    parser.add_argument("--serve", action="store_true")
+    parser.add_argument("--port", type=int, default=8895)
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    ensure_dirs()
-    args = parse_args()
-    log_debug(
-        "main "
-        f"argv={shlex.join(sys.argv[1:])} app_root={app_root()} cache_dir={cache_dir()} "
-        f"state_dir={state_dir()} config={config_path()} debug_log={DEBUG_LOG_PATH}"
-    )
+def execute_args(args: argparse.Namespace) -> int:
     if args.summary:
         summary(sync_if_empty=args.summary_sync_if_empty)
         return 0
@@ -1500,6 +1531,115 @@ def main() -> int:
         return uninstall(args.uninstall)
     summary()
     return 0
+
+
+class AppStoreHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+
+class AppStoreRequestHandler(BaseHTTPRequestHandler):
+    server_version = "CardputerZeroAppStore/0.1"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        log_debug("http " + (fmt % args))
+
+    def do_GET(self) -> None:
+        if self.path != "/health":
+            self.send_error(404, "not found")
+            return
+        body = b"OK\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        if self.path != "/run":
+            self.send_error(404, "not found")
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+            body = self.rfile.read(length).decode("utf-8")
+            fields = split_tsv_line(body.splitlines()[0] if body else "")
+            password = fields[0] if fields else ""
+            argv = fields[1:] if len(fields) > 1 else []
+            output, rc = run_service_command(argv, password)
+            raw = output.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/tab-separated-values; charset=utf-8")
+            self.send_header("X-AppStore-RC", str(rc))
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        except Exception as exc:
+            log_debug(f"http run failed error={compact_error(exc)}")
+            output = f"ERROR\t{tsv_escape(str(exc))}\n".encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "text/tab-separated-values; charset=utf-8")
+            self.send_header("X-AppStore-RC", "1")
+            self.send_header("Content-Length", str(len(output)))
+            self.end_headers()
+            self.wfile.write(output)
+
+
+def run_service_command(argv: list[str], password: str) -> tuple[str, int]:
+    with SERVICE_LOCK:
+        old_argv = sys.argv[:]
+        old_password = os.environ.get("M5APPSTORE_SUDO_PASSWORD")
+        if password:
+            os.environ["M5APPSTORE_SUDO_PASSWORD"] = password
+        elif "M5APPSTORE_SUDO_PASSWORD" in os.environ:
+            del os.environ["M5APPSTORE_SUDO_PASSWORD"]
+        buffer = io.StringIO()
+        rc = 1
+        try:
+            sys.argv = [old_argv[0], *argv]
+            log_debug(f"http run argv={shlex.join(argv)} password_len={len(password)}")
+            args = parse_args(argv)
+            with contextlib.redirect_stdout(buffer):
+                rc = execute_args(args)
+        except SystemExit as exc:
+            rc = int(exc.code or 0) if isinstance(exc.code, int) else 1
+        except Exception as exc:
+            rc = 1
+            print("ERROR", str(exc), sep="\t", file=buffer)
+            log_debug(f"http command exception argv={shlex.join(argv)} error={compact_error(exc)}")
+        finally:
+            sys.argv = old_argv
+            if old_password is None:
+                os.environ.pop("M5APPSTORE_SUDO_PASSWORD", None)
+            else:
+                os.environ["M5APPSTORE_SUDO_PASSWORD"] = old_password
+        return buffer.getvalue(), rc
+
+
+def serve(port: int) -> int:
+    ensure_dirs()
+    address = ("127.0.0.1", int(port))
+    log_debug(
+        f"serve start host={address[0]} port={address[1]} app_root={app_root()} "
+        f"cache_dir={cache_dir()} state_dir={state_dir()} config={config_path()} debug_log={DEBUG_LOG_PATH}"
+    )
+    server = AppStoreHTTPServer(address, AppStoreRequestHandler)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return 0
+
+
+def main() -> int:
+    ensure_dirs()
+    args = parse_args()
+    log_debug(
+        "main "
+        f"argv={shlex.join(sys.argv[1:])} app_root={app_root()} cache_dir={cache_dir()} "
+        f"state_dir={state_dir()} config={config_path()} debug_log={DEBUG_LOG_PATH}"
+    )
+    if args.serve:
+        return serve(args.port)
+    return execute_args(args)
 
 
 if __name__ == "__main__":

@@ -1,15 +1,22 @@
 #include "appstore_business.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdarg>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <httplib.h>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 
 #include "cp0_lvgl_app.h"
+
+void cp0_zmq_log(const char *topic, const char *message);
 
 namespace appstore {
 
@@ -17,6 +24,20 @@ namespace {
 
 std::string g_backend_script_path = "appstore.py";
 std::mutex g_backend_mutex;
+cp0_pid_t g_backend_service_pid = -1;
+constexpr int kBackendPort = 8895;
+constexpr const char *kBackendHost = "127.0.0.1";
+
+void business_tracef(const char *fmt, ...)
+{
+    char buf[1024] = {};
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    std::fprintf(stderr, "[AppStore TRACE] %s\n", buf);
+    cp0_zmq_log("appstore", buf);
+}
 
 std::vector<const char *> make_backend_argv(const std::vector<std::string> &args)
 {
@@ -57,6 +78,172 @@ std::string file_probe(const std::string &path)
     if (stat(path.c_str(), &st) != 0) return "missing";
     if (S_ISDIR(st.st_mode)) return "dir";
     return "file size=" + std::to_string(static_cast<long long>(st.st_size));
+}
+
+std::string shell_quote(const std::string &value)
+{
+    std::string out = "'";
+    for (char ch : value) {
+        if (ch == '\'') out += "'\\''";
+        else out += ch;
+    }
+    out += "'";
+    return out;
+}
+
+std::string tsv_escape_cpp(const std::string &value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (char ch : value) {
+        switch (ch) {
+            case '\\': out += "\\\\"; break;
+            case '\t': out += "\\t"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            default: out += ch; break;
+        }
+    }
+    return out;
+}
+
+std::string make_backend_body(const std::vector<std::string> &args, const std::string &password)
+{
+    std::string body = tsv_escape_cpp(password);
+    for (const auto &arg : args) {
+        body += '\t';
+        body += tsv_escape_cpp(arg);
+    }
+    body += '\n';
+    return body;
+}
+
+void configure_backend_client(httplib::Client &client, int read_timeout_secs)
+{
+    client.set_connection_timeout(1);
+    client.set_read_timeout(read_timeout_secs);
+    client.set_write_timeout(30);
+    client.set_keep_alive(false);
+}
+
+bool backend_health_check()
+{
+    auto start = std::chrono::steady_clock::now();
+    httplib::Client client(kBackendHost, kBackendPort);
+    configure_backend_client(client, 1);
+    auto res = client.Get("/health");
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    bool ok = res && res->status == 200 && res->body.find("OK") != std::string::npos;
+    business_tracef("backend health elapsed=%lldms ok=%d status=%d",
+                    static_cast<long long>(elapsed), ok ? 1 : 0, res ? res->status : -1);
+    return ok;
+}
+
+bool start_backend_service_locked()
+{
+    auto start = std::chrono::steady_clock::now();
+    if (backend_health_check()) {
+        business_tracef("backend service already healthy elapsed=0ms");
+        return true;
+    }
+
+    if (g_backend_service_pid > 0) {
+        business_tracef("backend service stopping stale pid=%d",
+                        static_cast<int>(g_backend_service_pid));
+        cp0_process_stop(g_backend_service_pid);
+        g_backend_service_pid = -1;
+    }
+
+    std::string command = "python3 " + shell_quote(g_backend_script_path) +
+        " --serve --port " + std::to_string(kBackendPort);
+    std::fprintf(stderr, "[AppStore UI] backend service start command=%s\n", command.c_str());
+    business_tracef("backend service start command=%s", command.c_str());
+    g_backend_service_pid = cp0_process_spawn(command.c_str(), 1);
+    if (g_backend_service_pid < 0) {
+        std::fprintf(stderr, "[AppStore UI] backend service spawn failed\n");
+        business_tracef("backend service spawn failed");
+        return false;
+    }
+
+    for (int i = 0; i < 30; ++i) {
+        if (backend_health_check()) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            business_tracef("backend service healthy pid=%d elapsed=%lldms polls=%d",
+                            static_cast<int>(g_backend_service_pid),
+                            static_cast<long long>(elapsed), i + 1);
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    std::fprintf(stderr, "[AppStore UI] backend service health timeout pid=%d\n",
+                 static_cast<int>(g_backend_service_pid));
+    business_tracef("backend service health timeout pid=%d",
+                    static_cast<int>(g_backend_service_pid));
+    return false;
+}
+
+std::string backend_http_capture_locked(const std::vector<std::string> &args,
+                                        const std::string &password,
+                                        int *rc)
+{
+    auto total_start = std::chrono::steady_clock::now();
+    {
+        auto start = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(g_backend_mutex);
+        if (!start_backend_service_locked()) {
+            if (rc) *rc = 1;
+            return "ERROR\tbackend service unavailable\n";
+        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        business_tracef("backend ensure_service elapsed=%lldms args=%s",
+                        static_cast<long long>(elapsed), join_args(args).c_str());
+    }
+
+    httplib::Client client(kBackendHost, kBackendPort);
+    configure_backend_client(client, 3600);
+    const std::string body = make_backend_body(args, password);
+    auto post_start = std::chrono::steady_clock::now();
+    business_tracef("backend post begin args=%s body_bytes=%zu sudo=%d",
+                    join_args(args).c_str(), body.size(), password.empty() ? 0 : 1);
+    auto res = client.Post("/run", body, "text/tab-separated-values; charset=utf-8");
+    auto post_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - post_start).count();
+    if (!res) {
+        std::fprintf(stderr, "[AppStore UI] backend http failed error=%s args=%s\n",
+                     httplib::to_string(res.error()).c_str(), join_args(args).c_str());
+        business_tracef("backend post fail elapsed=%lldms error=%s args=%s",
+                        static_cast<long long>(post_ms), httplib::to_string(res.error()).c_str(),
+                        join_args(args).c_str());
+        if (rc) *rc = 1;
+        return "ERROR\tbackend service unavailable\n";
+    }
+
+    int ret = 1;
+    auto header = res->headers.find("X-AppStore-RC");
+    if (header != res->headers.end())
+        ret = std::atoi(header->second.c_str());
+    else if (res->status >= 200 && res->status < 300)
+        ret = 0;
+    if (res->status < 200 || res->status >= 300) {
+        if (rc) *rc = ret == 0 ? 1 : ret;
+        business_tracef("backend post http_error post=%lldms total=%lldms status=%d rc=%d bytes=%zu args=%s",
+                        static_cast<long long>(post_ms),
+                        static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - total_start).count()),
+                        res->status, ret, res->body.size(), join_args(args).c_str());
+        return res->body.empty() ? "ERROR\tbackend service error\n" : res->body;
+    }
+    if (rc) *rc = ret;
+    business_tracef("backend post done post=%lldms total=%lldms status=%d rc=%d bytes=%zu args=%s preview=%s",
+                    static_cast<long long>(post_ms),
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - total_start).count()),
+                    res->status, ret, res->body.size(), join_args(args).c_str(),
+                    preview_output(res->body).c_str());
+    return res->body;
 }
 
 }  // namespace
@@ -407,17 +594,29 @@ const std::string &backend_script_path()
     return g_backend_script_path;
 }
 
-std::string backend_capture(const std::vector<std::string> &args, int *rc)
+bool start_backend_service()
 {
     std::lock_guard<std::mutex> lock(g_backend_mutex);
-    std::fprintf(stderr, "[AppStore UI] backend start script=%s (%s) args=%s\n",
+    return start_backend_service_locked();
+}
+
+void stop_backend_service()
+{
+    std::lock_guard<std::mutex> lock(g_backend_mutex);
+    if (g_backend_service_pid > 0) {
+        cp0_process_stop(g_backend_service_pid);
+        g_backend_service_pid = -1;
+    }
+}
+
+std::string backend_capture(const std::vector<std::string> &args, int *rc)
+{
+    std::fprintf(stderr, "[AppStore UI] backend http start script=%s (%s) args=%s\n",
                  g_backend_script_path.c_str(), file_probe(g_backend_script_path).c_str(),
                  join_args(args).c_str());
-    std::vector<const char *> argv = make_backend_argv(args);
-    std::vector<char> output(256 * 1024, '\0');
-    int ret = cp0_process_capture_argv(argv.data(), output.data(), static_cast<int>(output.size()));
-    std::string text(output.data());
-    std::fprintf(stderr, "[AppStore UI] backend done rc=%d bytes=%zu script=%s args=%s preview=%s\n",
+    int ret = -1;
+    std::string text = backend_http_capture_locked(args, "", &ret);
+    std::fprintf(stderr, "[AppStore UI] backend http done rc=%d bytes=%zu script=%s args=%s preview=%s\n",
                  ret, text.size(), g_backend_script_path.c_str(), join_args(args).c_str(),
                  preview_output(text).c_str());
     if (rc) *rc = ret;
@@ -428,22 +627,12 @@ std::string backend_capture_with_sudo(const std::vector<std::string> &args,
                                       const std::string &password,
                                       int *rc)
 {
-    std::lock_guard<std::mutex> lock(g_backend_mutex);
-    std::fprintf(stderr, "[AppStore UI] backend sudo start script=%s (%s) args=%s password_len=%zu\n",
+    std::fprintf(stderr, "[AppStore UI] backend http sudo start script=%s (%s) args=%s password_len=%zu\n",
                  g_backend_script_path.c_str(), file_probe(g_backend_script_path).c_str(),
                  join_args(args).c_str(), password.size());
-    const char *old_password = std::getenv("M5APPSTORE_SUDO_PASSWORD");
-    std::string saved_password = old_password ? old_password : "";
-    setenv("M5APPSTORE_SUDO_PASSWORD", password.c_str(), 1);
-
-    std::vector<const char *> argv = make_backend_argv(args);
-    std::vector<char> output(256 * 1024, '\0');
-    int ret = cp0_process_capture_argv(argv.data(), output.data(), static_cast<int>(output.size()));
-
-    if (old_password) setenv("M5APPSTORE_SUDO_PASSWORD", saved_password.c_str(), 1);
-    else unsetenv("M5APPSTORE_SUDO_PASSWORD");
-    std::string text(output.data());
-    std::fprintf(stderr, "[AppStore UI] backend sudo done rc=%d bytes=%zu args=%s preview=%s\n",
+    int ret = -1;
+    std::string text = backend_http_capture_locked(args, password, &ret);
+    std::fprintf(stderr, "[AppStore UI] backend http sudo done rc=%d bytes=%zu args=%s preview=%s\n",
                  ret, text.size(), join_args(args).c_str(), preview_output(text).c_str());
     if (rc) *rc = ret;
     return text;

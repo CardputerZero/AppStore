@@ -11,6 +11,7 @@
 #include "hal_lvgl_bsp.h"
 
 #include <algorithm>
+#include <cstdarg>
 #include <cctype>
 #include <csignal>
 #include <cstdio>
@@ -19,9 +20,13 @@
 #include <list>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <pthread.h>
+
+void cp0_zmq_log_init(void);
+void cp0_zmq_log(const char *topic, const char *message);
 
 namespace {
 
@@ -44,6 +49,7 @@ constexpr uint32_t kJobPollIntervalMs = 250;
 constexpr uint32_t kTopStatusRefreshMs = 5000;
 constexpr uint32_t kBatteryChargeAnimRefreshMs = 120;
 constexpr uint32_t kSyncAnimRefreshMs = 200;
+constexpr uint32_t kRegionDebounceMs = 2000;
 constexpr uint32_t kStatusScrollVisibleMs = 6000;
 constexpr const char *kDefaultRegistryUrl = "https://cardputerzero.github.io/generated/registry.json";
 
@@ -60,12 +66,51 @@ enum class Screen {
     Screenshots,
 };
 
+enum class RegistryOpKind {
+    None,
+    SetRegion,
+    AddRegistry,
+    EditRegistry,
+    ToggleRegistry,
+    DeleteRegistry,
+};
+
 struct KeyEvent {
     uint32_t code = 0;
     uint32_t mods = 0;
     char ch = 0;
     bool release = false;
     bool repeated = false;
+};
+
+struct RegistryOpRequest {
+    RegistryOpKind kind = RegistryOpKind::None;
+    uint64_t generation = 0;
+    std::string region;
+    std::string url;
+    std::string old_url;
+    std::string name;
+    bool enable = false;
+};
+
+struct RegistryOpResult {
+    RegistryOpRequest request;
+    std::string output;
+    int rc = -1;
+};
+
+struct RegistryRefreshRequest {
+    std::string fallback;
+    uint64_t generation = 0;
+};
+
+struct SyncRequest {
+    uint64_t generation = 0;
+};
+
+struct SummaryRequest {
+    SortRule rule = SortRule::Default;
+    uint64_t generation = 0;
 };
 
 lv_obj_t *g_root = nullptr;
@@ -151,17 +196,90 @@ bool g_sync_done = false;
 bool g_sync_refresh_registries = false;
 std::string g_sync_output;
 uint32_t g_sync_visible_until_tick = 0;
+uint64_t g_sync_generation = 0;
 pthread_mutex_t g_summary_mutex = PTHREAD_MUTEX_INITIALIZER;
 bool g_summary_running = false;
 bool g_summary_done = false;
 bool g_summary_pending = false;
 SortRule g_summary_rule = SortRule::Default;
 SummaryData g_summary_result;
+uint64_t g_summary_generation = 0;
+pthread_mutex_t g_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+bool g_registry_refresh_running = false;
+bool g_registry_refresh_done = false;
+bool g_registry_refresh_pending = false;
+bool g_registry_loading = false;
+RegistryData g_registry_result;
+uint64_t g_registry_refresh_generation = 0;
+pthread_mutex_t g_registry_op_mutex = PTHREAD_MUTEX_INITIALIZER;
+bool g_registry_op_running = false;
+bool g_registry_op_done = false;
+RegistryOpResult g_registry_op_result;
+RegistryOpKind g_registry_op_kind = RegistryOpKind::None;
+uint64_t g_registry_op_generation = 0;
+pthread_mutex_t g_plan_mutex = PTHREAD_MUTEX_INITIALIZER;
+bool g_plan_running = false;
+bool g_plan_done = false;
+std::string g_plan_action;
+std::string g_plan_app_id;
+std::string g_plan_output;
+int g_plan_rc = -1;
 cp0_wifi_status_t g_top_wifi_status = {};
 cp0_battery_info_t g_top_battery_status = {};
 uint32_t g_top_status_tick = 0;
 uint32_t g_top_status_last_render_tick = 0;
 int g_sync_anim_phase = -1;
+bool g_region_commit_pending = false;
+std::string g_region_pending_code;
+uint32_t g_region_change_tick = 0;
+
+const char *screen_name(Screen screen)
+{
+    switch (screen) {
+        case Screen::Home: return "Home";
+        case Screen::Detail: return "Detail";
+        case Screen::Confirm: return "Confirm";
+        case Screen::SudoPassword: return "SudoPassword";
+        case Screen::Progress: return "Progress";
+        case Screen::Registry: return "Registry";
+        case Screen::RegistryEdit: return "RegistryEdit";
+        case Screen::ShareCode: return "ShareCode";
+        case Screen::Search: return "Search";
+        case Screen::Screenshots: return "Screenshots";
+    }
+    return "Unknown";
+}
+
+void app_tracef(const char *fmt, ...)
+{
+    char buf[1024] = {};
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    std::fprintf(stderr, "[AppStore TRACE] %s\n", buf);
+    cp0_zmq_log("appstore", buf);
+}
+
+struct TraceScope {
+    const char *name;
+    uint32_t start;
+    bool always;
+
+    TraceScope(const char *scope_name, bool log_always = false)
+        : name(scope_name), start(lv_tick_get()), always(log_always)
+    {
+        if (always) app_tracef("%s begin screen=%s", name, screen_name(g_screen));
+    }
+
+    ~TraceScope()
+    {
+        uint32_t elapsed = lv_tick_elaps(start);
+        if (always || elapsed >= 20) {
+            app_tracef("%s end elapsed=%ums screen=%s", name, elapsed, screen_name(g_screen));
+        }
+    }
+};
 
 void request_quit()
 {
@@ -296,13 +414,28 @@ void update_top_status_cache(bool force = false)
     if (!force && g_top_status_tick != 0 && lv_tick_elaps(g_top_status_tick) < kTopStatusRefreshMs) {
         return;
     }
+    uint32_t start = lv_tick_get();
+    uint32_t wifi_start = start;
     g_top_wifi_status = get_wifi_status();
+    uint32_t wifi_ms = lv_tick_elaps(wifi_start);
+    uint32_t battery_start = lv_tick_get();
     g_top_battery_status = cp0_battery_read();
+    uint32_t battery_ms = lv_tick_elaps(battery_start);
     g_top_status_tick = lv_tick_get();
+    uint32_t total_ms = lv_tick_elaps(start);
+    if (force || total_ms >= 10 || g_screen == Screen::Registry || g_screen == Screen::RegistryEdit) {
+        app_tracef("top_status update force=%d total=%ums wifi=%ums battery=%ums screen=%s wifi_connected=%d battery_valid=%d flags=%d",
+                   force ? 1 : 0, total_ms, wifi_ms, battery_ms, screen_name(g_screen),
+                   g_top_wifi_status.connected, g_top_battery_status.valid,
+                   g_top_battery_status.flags);
+    }
 }
 
-void refresh_summary_now();
 void request_summary_refresh();
+void sync_catalog(bool refresh_registries_after = false);
+bool poll_plan_check();
+void start_plan_check(const std::string &action, const std::string &app_id);
+bool poll_region_debounce();
 
 StoreApp *ensure_selected_app()
 {
@@ -317,17 +450,7 @@ StoreApp *ensure_selected_app()
         if (app) return app;
     }
 
-    refresh_summary_now();
-    app = selected_app();
-    if (app) return app;
-
-    if (!g_apps.empty()) {
-        select_default_category();
-        rebuild_visible();
-        g_selected = 0;
-        app = selected_app();
-        if (app) return app;
-    }
+    request_summary_refresh();
     return nullptr;
 }
 
@@ -337,7 +460,7 @@ bool open_detail_screen()
         g_screen = Screen::Detail;
         return true;
     }
-    g_status_message = "No app selected";
+    g_status_message = g_apps.empty() ? "Catalog is still loading" : "No app selected";
     g_screen = Screen::Home;
     return false;
 }
@@ -396,9 +519,8 @@ void apply_summary(const SummaryData &summary)
     }
 }
 
-void refresh_registries()
+void apply_registry_data(const RegistryData &registries)
 {
-    RegistryData registries = load_registries(g_region_registry_url);
     g_region_code = registries.region.code;
     g_region_label = registries.region.label;
     g_region_registry_url = registries.region.registry_url;
@@ -408,6 +530,376 @@ void refresh_registries()
     if (g_registry_selected >= static_cast<int>(g_registry_entries.size())) {
         g_registry_selected = std::max(0, static_cast<int>(g_registry_entries.size()) - 1);
     }
+    if (g_registry_selected < 0) g_registry_selected = 0;
+}
+
+void *registry_refresh_thread_main(void *arg)
+{
+    RegistryRefreshRequest request = *static_cast<RegistryRefreshRequest *>(arg);
+    delete static_cast<RegistryRefreshRequest *>(arg);
+    uint32_t start = lv_tick_get();
+    app_tracef("registry_refresh worker begin gen=%llu fallback=%s",
+               static_cast<unsigned long long>(request.generation),
+               request.fallback.empty() ? "-" : request.fallback.c_str());
+    RegistryData registries = load_registries(request.fallback);
+    uint32_t elapsed = lv_tick_elaps(start);
+    app_tracef("registry_refresh worker end gen=%llu elapsed=%ums entries=%zu region=%s",
+               static_cast<unsigned long long>(request.generation), elapsed,
+               registries.entries.size(), registries.region.code.c_str());
+    pthread_mutex_lock(&g_registry_mutex);
+    if (request.generation == g_registry_refresh_generation) {
+        g_registry_result = std::move(registries);
+        g_registry_refresh_done = true;
+    } else {
+        app_tracef("registry_refresh worker stale gen=%llu current=%llu",
+                   static_cast<unsigned long long>(request.generation),
+                   static_cast<unsigned long long>(g_registry_refresh_generation));
+    }
+    pthread_mutex_unlock(&g_registry_mutex);
+    return nullptr;
+}
+
+void request_registry_refresh()
+{
+    std::fprintf(stderr, "[AppStore UI] request_registry_refresh\n");
+    app_tracef("registry_refresh request screen=%s loading=%d entries=%zu",
+               screen_name(g_screen), g_registry_loading ? 1 : 0, g_registry_entries.size());
+    pthread_mutex_lock(&g_registry_mutex);
+    if (g_registry_refresh_running) {
+        g_registry_refresh_pending = true;
+        g_registry_loading = true;
+        pthread_mutex_unlock(&g_registry_mutex);
+        std::fprintf(stderr, "[AppStore UI] request_registry_refresh pending: already running\n");
+        return;
+    }
+    g_registry_refresh_running = true;
+    g_registry_refresh_done = false;
+    g_registry_loading = true;
+    uint64_t generation = ++g_registry_refresh_generation;
+    std::string fallback = g_region_registry_url;
+    pthread_mutex_unlock(&g_registry_mutex);
+
+    pthread_t thread_id;
+    auto *thread_arg = new RegistryRefreshRequest{fallback, generation};
+    if (pthread_create(&thread_id, nullptr, registry_refresh_thread_main, thread_arg) != 0) {
+        delete thread_arg;
+        pthread_mutex_lock(&g_registry_mutex);
+        g_registry_refresh_running = false;
+        g_registry_loading = false;
+        pthread_mutex_unlock(&g_registry_mutex);
+        g_status_message = "Unable to refresh registries";
+        std::fprintf(stderr, "[AppStore UI] request_registry_refresh failed: pthread_create\n");
+        return;
+    }
+    pthread_detach(thread_id);
+}
+
+bool poll_registry_refresh()
+{
+    uint32_t start = lv_tick_get();
+    RegistryData registries;
+    bool done = false;
+    bool start_next = false;
+
+    pthread_mutex_lock(&g_registry_mutex);
+    if (g_registry_refresh_done) {
+        done = true;
+        registries = std::move(g_registry_result);
+        g_registry_refresh_done = false;
+        g_registry_refresh_running = false;
+        g_registry_loading = false;
+        start_next = g_registry_refresh_pending;
+        g_registry_refresh_pending = false;
+    }
+    pthread_mutex_unlock(&g_registry_mutex);
+
+    if (!done) return false;
+
+    std::fprintf(stderr, "[AppStore UI] poll_registry_refresh done start_next=%d entries=%zu region=%s\n",
+                 start_next ? 1 : 0, registries.entries.size(), registries.region.code.c_str());
+    apply_registry_data(registries);
+    app_tracef("registry_refresh poll apply elapsed=%ums start_next=%d entries=%zu region=%s selected=%d",
+               lv_tick_elaps(start), start_next ? 1 : 0, g_registry_entries.size(),
+               g_region_code.c_str(), g_registry_selected);
+    if (start_next) request_registry_refresh();
+    return true;
+}
+
+std::string registry_op_busy_message()
+{
+    return "Registry operation running";
+}
+
+bool registry_op_is_running()
+{
+    pthread_mutex_lock(&g_registry_op_mutex);
+    bool running = g_registry_op_running;
+    pthread_mutex_unlock(&g_registry_op_mutex);
+    return running;
+}
+
+bool registry_refresh_is_running()
+{
+    pthread_mutex_lock(&g_registry_mutex);
+    bool running = g_registry_refresh_running || g_registry_loading;
+    pthread_mutex_unlock(&g_registry_mutex);
+    return running;
+}
+
+bool sync_is_running()
+{
+    pthread_mutex_lock(&g_sync_mutex);
+    bool running = g_sync_running;
+    pthread_mutex_unlock(&g_sync_mutex);
+    return running;
+}
+
+void cancel_registry_online_work(const char *reason)
+{
+    app_tracef("registry_online cancel reason=%s screen=%s",
+               reason ? reason : "-", screen_name(g_screen));
+
+    pthread_mutex_lock(&g_registry_mutex);
+    ++g_registry_refresh_generation;
+    g_registry_refresh_running = false;
+    g_registry_refresh_done = false;
+    g_registry_refresh_pending = false;
+    g_registry_loading = false;
+    pthread_mutex_unlock(&g_registry_mutex);
+
+    pthread_mutex_lock(&g_sync_mutex);
+    ++g_sync_generation;
+    g_sync_running = false;
+    g_sync_done = false;
+    g_sync_refresh_registries = false;
+    g_sync_output.clear();
+    g_sync_anim_phase = -1;
+    pthread_mutex_unlock(&g_sync_mutex);
+
+    pthread_mutex_lock(&g_summary_mutex);
+    ++g_summary_generation;
+    g_summary_running = false;
+    g_summary_done = false;
+    g_summary_pending = false;
+    pthread_mutex_unlock(&g_summary_mutex);
+
+    pthread_mutex_lock(&g_registry_op_mutex);
+    if (g_registry_op_running && g_registry_op_kind == RegistryOpKind::SetRegion) {
+        ++g_registry_op_generation;
+        g_registry_op_running = false;
+        g_registry_op_done = false;
+        g_registry_op_kind = RegistryOpKind::None;
+    }
+    pthread_mutex_unlock(&g_registry_op_mutex);
+
+    if (!g_job_running && !g_job_pending_start) {
+        stop_backend_service();
+    }
+}
+
+bool registry_op_available()
+{
+    if (registry_op_is_running()) {
+        g_status_message = registry_op_busy_message();
+        app_tracef("registry_op unavailable reason=registry_op screen=%s", screen_name(g_screen));
+        return false;
+    }
+    if (registry_refresh_is_running()) {
+        g_status_message = "Loading registries...";
+        app_tracef("registry_op unavailable reason=registry_refresh screen=%s", screen_name(g_screen));
+        return false;
+    }
+    if (sync_is_running()) {
+        g_status_message = "Syncing catalog...";
+        app_tracef("registry_op unavailable reason=sync screen=%s", screen_name(g_screen));
+        return false;
+    }
+    return true;
+}
+
+void *registry_op_thread_main(void *arg)
+{
+    RegistryOpRequest request = *static_cast<RegistryOpRequest *>(arg);
+    delete static_cast<RegistryOpRequest *>(arg);
+    uint32_t start = lv_tick_get();
+
+    std::vector<std::string> args;
+    switch (request.kind) {
+        case RegistryOpKind::SetRegion:
+            args = {"--set-region", request.region};
+            break;
+        case RegistryOpKind::AddRegistry:
+            args = {"--add-registry", request.url, "--registry-name", request.name};
+            break;
+        case RegistryOpKind::EditRegistry:
+            args = {"--edit-registry", request.old_url, request.url, "--registry-name", request.name};
+            break;
+        case RegistryOpKind::ToggleRegistry:
+            args = {request.enable ? "--enable-registry" : "--disable-registry", request.url};
+            break;
+        case RegistryOpKind::DeleteRegistry:
+            args = {"--remove-registry", request.url};
+            break;
+        case RegistryOpKind::None:
+        default:
+            break;
+    }
+
+    app_tracef("registry_op worker begin kind=%d url=%s region=%s",
+               static_cast<int>(request.kind),
+               request.url.empty() ? "-" : request.url.c_str(),
+               request.region.empty() ? "-" : request.region.c_str());
+    int rc = -1;
+    std::string out = args.empty() ? "ERROR\tunknown registry operation\n" : backend_capture(args, &rc);
+    app_tracef("registry_op worker end kind=%d elapsed=%ums rc=%d bytes=%zu",
+               static_cast<int>(request.kind), lv_tick_elaps(start), rc, out.size());
+    pthread_mutex_lock(&g_registry_op_mutex);
+    if (request.generation == g_registry_op_generation) {
+        g_registry_op_result = {request, out, rc};
+        g_registry_op_done = true;
+    } else {
+        app_tracef("registry_op worker stale kind=%d gen=%llu current=%llu",
+                   static_cast<int>(request.kind),
+                   static_cast<unsigned long long>(request.generation),
+                   static_cast<unsigned long long>(g_registry_op_generation));
+    }
+    pthread_mutex_unlock(&g_registry_op_mutex);
+    return nullptr;
+}
+
+void start_registry_op(const RegistryOpRequest &request, const std::string &status)
+{
+    app_tracef("registry_op start request kind=%d status=%s screen=%s",
+               static_cast<int>(request.kind), status.c_str(), screen_name(g_screen));
+    pthread_mutex_lock(&g_registry_op_mutex);
+    if (g_registry_op_running) {
+        pthread_mutex_unlock(&g_registry_op_mutex);
+        g_status_message = "Registry operation running";
+        return;
+    }
+    g_registry_op_running = true;
+    g_registry_op_done = false;
+    g_registry_op_kind = request.kind;
+    uint64_t generation = ++g_registry_op_generation;
+    pthread_mutex_unlock(&g_registry_op_mutex);
+
+    g_status_message = status;
+    pthread_t thread_id;
+    auto *thread_arg = new RegistryOpRequest(request);
+    thread_arg->generation = generation;
+    if (pthread_create(&thread_id, nullptr, registry_op_thread_main, thread_arg) != 0) {
+        delete thread_arg;
+        pthread_mutex_lock(&g_registry_op_mutex);
+        g_registry_op_running = false;
+        g_registry_op_kind = RegistryOpKind::None;
+        pthread_mutex_unlock(&g_registry_op_mutex);
+        g_status_message = "Unable to start registry operation";
+        std::fprintf(stderr, "[AppStore UI] start_registry_op failed: pthread_create\n");
+        return;
+    }
+    pthread_detach(thread_id);
+}
+
+void apply_region_output(const std::string &out)
+{
+    std::istringstream stream(out);
+    std::string line;
+    while (std::getline(stream, line)) {
+        auto fields = split_tab(line);
+        if (fields.size() >= 4 && fields[0] == "REGION") {
+            g_region_code = fields[1];
+            g_region_label = fields[2];
+            g_region_registry_url = fields[3];
+            if (fields.size() >= 5) g_region_active = fields[4];
+            return;
+        }
+    }
+}
+
+std::string registry_count_message(const std::string &out, bool editing)
+{
+    std::istringstream stream(out);
+    std::string line;
+    while (std::getline(stream, line)) {
+        auto fields = split_tab(line);
+        if (fields.size() >= 5 && fields[0] == "REGISTRY") {
+            std::string count = fields[1] == "UPDATED" && fields.size() >= 6 ? fields[5] : fields[4];
+            return (editing ? "Registry updated" : "Registry added") +
+                (count.empty() ? std::string() : " (" + count + " apps)");
+        }
+    }
+    return editing ? "Registry updated" : "Registry added";
+}
+
+bool poll_registry_op()
+{
+    uint32_t start = lv_tick_get();
+    RegistryOpResult result;
+    bool done = false;
+
+    pthread_mutex_lock(&g_registry_op_mutex);
+    if (g_registry_op_done) {
+        done = true;
+        result = std::move(g_registry_op_result);
+        g_registry_op_done = false;
+        g_registry_op_running = false;
+        g_registry_op_kind = RegistryOpKind::None;
+    }
+    pthread_mutex_unlock(&g_registry_op_mutex);
+
+    if (!done) return false;
+
+    bool ok = result.rc == 0 && result.output.find("ERROR") == std::string::npos;
+    std::fprintf(stderr, "[AppStore UI] poll_registry_op done kind=%d rc=%d ok=%d preview=%s\n",
+                 static_cast<int>(result.request.kind), result.rc, ok ? 1 : 0,
+                 one_line(result.output, 180).c_str());
+    if (!ok) {
+        g_status_message = one_line(backend_error_message(result.output), 54);
+        app_tracef("registry_op poll fail elapsed=%ums kind=%d rc=%d message=%s",
+                   lv_tick_elaps(start), static_cast<int>(result.request.kind), result.rc,
+                   g_status_message.c_str());
+        return true;
+    }
+
+    switch (result.request.kind) {
+        case RegistryOpKind::SetRegion:
+            apply_region_output(result.output);
+            g_status_message = "Region: " + g_region_label;
+            request_registry_refresh();
+            request_summary_refresh();
+            sync_catalog(true);
+            break;
+        case RegistryOpKind::AddRegistry:
+        case RegistryOpKind::EditRegistry:
+            g_status_message = registry_count_message(
+                result.output, result.request.kind == RegistryOpKind::EditRegistry);
+            g_registry_edit_url.clear();
+            g_screen = Screen::Registry;
+            request_registry_refresh();
+            sync_catalog(true);
+            break;
+        case RegistryOpKind::ToggleRegistry:
+            g_status_message = result.request.enable ? "Registry enabled" : "Registry disabled";
+            request_registry_refresh();
+            request_summary_refresh();
+            if (result.request.enable) sync_catalog(true);
+            break;
+        case RegistryOpKind::DeleteRegistry:
+            g_status_message = "Registry deleted";
+            g_registry_edit_url.clear();
+            request_registry_refresh();
+            request_summary_refresh();
+            break;
+        case RegistryOpKind::None:
+        default:
+            g_status_message = "Registry updated";
+            request_registry_refresh();
+            break;
+    }
+    app_tracef("registry_op poll ok elapsed=%ums kind=%d screen=%s status=%s",
+               lv_tick_elaps(start), static_cast<int>(result.request.kind),
+               screen_name(g_screen), g_status_message.c_str());
+    return true;
 }
 
 void clean_root()
@@ -517,7 +1009,9 @@ void box(int x, int y, int w, int h, uint32_t color, uint32_t border = 0x2A3A46,
 
 void draw_system_bar()
 {
+    uint32_t start = lv_tick_get();
     update_top_status_cache();
+    uint32_t status_ms = lv_tick_elaps(start);
     g_top_status_last_render_tick = lv_tick_get();
 
     auto clear_status_panel_style = [](lv_obj_t *obj) {
@@ -664,6 +1158,11 @@ void draw_system_bar()
                                 LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(power_label, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_move_foreground(power_label);
+    uint32_t elapsed = lv_tick_elaps(start);
+    if (elapsed >= 15 || g_screen == Screen::Registry || g_screen == Screen::RegistryEdit) {
+        app_tracef("draw_system_bar elapsed=%ums status=%ums screen=%s",
+                   elapsed, status_ms, screen_name(g_screen));
+    }
 }
 
 std::string app_initial(const StoreApp &app)
@@ -831,23 +1330,21 @@ void draw_home_icon_panel(const StoreApp *app)
     }
 }
 
-void refresh_summary_now()
-{
-    std::fprintf(stderr, "[AppStore UI] refresh_summary_now start\n");
-    apply_summary(load_summary(g_sort_rule));
-    std::fprintf(stderr, "[AppStore UI] refresh_summary_now done apps=%zu visible=%zu cats=%zu status=%s\n",
-                 g_apps.size(), g_visible.size(), g_categories.size(), g_repo_status.c_str());
-}
-
 void *summary_thread_main(void *arg)
 {
-    SortRule rule = *static_cast<SortRule *>(arg);
-    delete static_cast<SortRule *>(arg);
-    SummaryData summary = load_summary(rule);
+    SummaryRequest request = *static_cast<SummaryRequest *>(arg);
+    delete static_cast<SummaryRequest *>(arg);
+    SummaryData summary = load_summary(request.rule);
     pthread_mutex_lock(&g_summary_mutex);
-    g_summary_result = std::move(summary);
-    g_summary_done = true;
-    g_summary_running = false;
+    if (request.generation == g_summary_generation) {
+        g_summary_result = std::move(summary);
+        g_summary_done = true;
+        g_summary_running = false;
+    } else {
+        app_tracef("summary worker stale gen=%llu current=%llu",
+                   static_cast<unsigned long long>(request.generation),
+                   static_cast<unsigned long long>(g_summary_generation));
+    }
     pthread_mutex_unlock(&g_summary_mutex);
     return nullptr;
 }
@@ -866,12 +1363,13 @@ void request_summary_refresh()
     g_summary_done = false;
     SortRule rule_value = g_sort_rule;
     g_summary_rule = rule_value;
+    uint64_t generation = ++g_summary_generation;
     pthread_mutex_unlock(&g_summary_mutex);
 
     pthread_t thread_id;
-    auto *rule = new SortRule(rule_value);
-    if (pthread_create(&thread_id, nullptr, summary_thread_main, rule) != 0) {
-        delete rule;
+    auto *thread_arg = new SummaryRequest{rule_value, generation};
+    if (pthread_create(&thread_id, nullptr, summary_thread_main, thread_arg) != 0) {
+        delete thread_arg;
         pthread_mutex_lock(&g_summary_mutex);
         g_summary_running = false;
         pthread_mutex_unlock(&g_summary_mutex);
@@ -1263,6 +1761,7 @@ void draw_radio_option(int x, int y, const std::string &text, bool selected, boo
 
 void render_registry()
 {
+    TraceScope trace("render_registry", true);
     clean_root();
     draw_system_bar();
     box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
@@ -1282,7 +1781,7 @@ void render_registry()
     }
 
     if (g_registry_entries.empty()) {
-        label(g_root, "No registries configured.", 10, 82, 300, 14,
+        label(g_root, g_registry_loading ? "Loading registries..." : "No registries configured.", 10, 82, 300, 14,
               &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
     } else {
         const RegistryEntry &entry = g_registry_entries[g_registry_selected];
@@ -1303,7 +1802,8 @@ void render_registry()
         label(g_root, entry.builtin ? "URL (region)" : "URL", 24, 96, 80, 12,
               &lv_font_montserrat_10, 0x58A6FF);
         box(24, 109, 272, 26, 0x111923, 0x2A3A46, 1, 2);
-        label(g_root, entry.url, 30, 112, 260, 20, &lv_font_montserrat_10, 0xE6EDF3,
+        std::string display_url = entry.builtin ? g_region_registry_url : entry.url;
+        label(g_root, display_url, 30, 112, 260, 20, &lv_font_montserrat_10, 0xE6EDF3,
               LV_LABEL_LONG_WRAP);
         if (!entry.error.empty()) {
             label(g_root, one_line(entry.error, 45), 24, 136, 272, 12, &lv_font_montserrat_10,
@@ -1311,15 +1811,18 @@ void render_registry()
         }
     }
 
-    std::string hint = region_focused ?
+    bool op_running = registry_op_is_running();
+    std::string hint = g_region_commit_pending ? "Region update pending..." :
+        (op_running ? "Registry operation running..." : (region_focused ?
         "A add registry  Up/Down focus  < > region" :
-        "A add registry  E edit  T toggle  D del  R sync";
+        "A add registry  E edit  T toggle  D del  R sync"));
     label(g_root, hint, 10, 153, 300, 12, &lv_font_montserrat_10,
           0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
 void render_registry_edit()
 {
+    TraceScope trace("render_registry_edit", true);
     clean_root();
     draw_system_bar();
     box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
@@ -1493,30 +1996,75 @@ void render()
     }
 }
 
+bool allow_fast_top_status_render()
+{
+    return g_screen != Screen::Registry && g_screen != Screen::RegistryEdit;
+}
+
+bool allow_sync_anim_render()
+{
+    return g_screen != Screen::Registry && g_screen != Screen::RegistryEdit;
+}
+
 void refresh_timer_cb(lv_timer_t *)
 {
-    if (poll_summary_refresh()) {
+    uint32_t start = lv_tick_get();
+    bool region_debounce = poll_region_debounce();
+    if (region_debounce) {
         render();
     }
+    bool registry_refresh_done = poll_registry_refresh();
+    if (registry_refresh_done) {
+        render();
+    }
+    bool registry_op_done = poll_registry_op();
+    if (registry_op_done) {
+        render();
+    }
+    bool plan_done = poll_plan_check();
+    if (plan_done) {
+        render();
+    }
+    bool summary_done = poll_summary_refresh();
+    if (summary_done) {
+        render();
+    }
+    bool status_timeout = false;
     if (!g_status_message.empty() && g_status_scroll_start_tick != 0 &&
         lv_tick_elaps(g_status_scroll_start_tick) >= g_status_scroll_hide_after_ms) {
         g_status_message.clear();
         g_status_scroll_text.clear();
         g_status_scroll_start_tick = 0;
         g_status_scroll_hide_after_ms = 0;
+        status_timeout = true;
         render();
     }
     bool battery_charging = g_top_battery_status.valid && (g_top_battery_status.flags & 1);
-    if ((battery_charging &&
+    bool fast_top_status = battery_charging && allow_fast_top_status_render();
+    bool top_status_render = false;
+    if ((fast_top_status &&
          lv_tick_elaps(g_top_status_last_render_tick) >= kBatteryChargeAnimRefreshMs) ||
-        (!battery_charging && g_top_status_tick != 0 &&
+        (!fast_top_status && g_top_status_tick != 0 &&
          lv_tick_elaps(g_top_status_tick) >= kTopStatusRefreshMs)) {
+        top_status_render = true;
         render();
     }
+    bool screenshots_hide = false;
     if (g_screen == Screen::Screenshots && g_screenshots_overlay_visible &&
         lv_tick_elaps(g_screenshots_activity_tick) >= 2000) {
         g_screenshots_overlay_visible = false;
+        screenshots_hide = true;
         render();
+    }
+    uint32_t elapsed = lv_tick_elaps(start);
+    if (elapsed >= 20 || region_debounce || registry_refresh_done || registry_op_done || plan_done ||
+        summary_done || status_timeout || top_status_render || screenshots_hide ||
+        g_screen == Screen::Registry || g_screen == Screen::RegistryEdit) {
+        app_tracef("refresh_timer elapsed=%ums screen=%s region_debounce=%d registry_refresh=%d registry_op=%d plan=%d summary=%d status_timeout=%d top_status=%d screenshots=%d",
+                   elapsed, screen_name(g_screen), region_debounce ? 1 : 0, registry_refresh_done ? 1 : 0,
+                   registry_op_done ? 1 : 0, plan_done ? 1 : 0, summary_done ? 1 : 0,
+                   status_timeout ? 1 : 0, top_status_render ? 1 : 0,
+                   screenshots_hide ? 1 : 0);
     }
 }
 
@@ -1680,24 +2228,35 @@ void apply_sync_output(const std::string &out, bool refresh_registries_after)
         g_status_message.clear();
     }
     request_summary_refresh();
-    if (refresh_registries_after) refresh_registries();
+    if (refresh_registries_after) request_registry_refresh();
 }
 
-void *sync_thread_main(void *)
+void *sync_thread_main(void *arg)
 {
+    SyncRequest request = *static_cast<SyncRequest *>(arg);
+    delete static_cast<SyncRequest *>(arg);
     std::fprintf(stderr, "[AppStore UI] sync thread start\n");
+    app_tracef("sync worker begin gen=%llu", static_cast<unsigned long long>(request.generation));
     std::string out = backend_capture({"--sync"});
     std::fprintf(stderr, "[AppStore UI] sync thread backend returned bytes=%zu preview=%s\n",
                  out.size(), one_line(out, 180).c_str());
+    app_tracef("sync worker end gen=%llu bytes=%zu",
+               static_cast<unsigned long long>(request.generation), out.size());
     pthread_mutex_lock(&g_sync_mutex);
-    g_sync_output = out;
-    g_sync_done = true;
-    g_sync_running = false;
+    if (request.generation == g_sync_generation) {
+        g_sync_output = out;
+        g_sync_done = true;
+        g_sync_running = false;
+    } else {
+        app_tracef("sync worker stale gen=%llu current=%llu",
+                   static_cast<unsigned long long>(request.generation),
+                   static_cast<unsigned long long>(g_sync_generation));
+    }
     pthread_mutex_unlock(&g_sync_mutex);
     return nullptr;
 }
 
-void sync_catalog(bool refresh_registries_after = false)
+void sync_catalog(bool refresh_registries_after)
 {
     std::fprintf(stderr, "[AppStore UI] sync_catalog request refresh_registries=%d\n",
                  refresh_registries_after ? 1 : 0);
@@ -1714,11 +2273,14 @@ void sync_catalog(bool refresh_registries_after = false)
     g_sync_output.clear();
     g_sync_anim_phase = -1;
     g_sync_visible_until_tick = lv_tick_get();
+    uint64_t generation = ++g_sync_generation;
     pthread_mutex_unlock(&g_sync_mutex);
 
     g_status_message = "Syncing catalog...";
     pthread_t thread_id;
-    if (pthread_create(&thread_id, nullptr, sync_thread_main, nullptr) != 0) {
+    auto *thread_arg = new SyncRequest{generation};
+    if (pthread_create(&thread_id, nullptr, sync_thread_main, thread_arg) != 0) {
+        delete thread_arg;
         pthread_mutex_lock(&g_sync_mutex);
         g_sync_running = false;
         g_sync_done = false;
@@ -1753,7 +2315,12 @@ void sync_timer_cb(lv_timer_t *)
         int phase = static_cast<int>((lv_tick_get() / kSyncAnimRefreshMs) % 4);
         if (phase != g_sync_anim_phase) {
             g_sync_anim_phase = phase;
-            render();
+            if (allow_sync_anim_render()) {
+                app_tracef("sync_timer anim render phase=%d screen=%s", phase, screen_name(g_screen));
+                render();
+            } else {
+                app_tracef("sync_timer anim skip phase=%d screen=%s", phase, screen_name(g_screen));
+            }
         }
         return;
     }
@@ -1766,12 +2333,18 @@ void sync_timer_cb(lv_timer_t *)
 
 void open_registry_screen()
 {
-    refresh_registries();
+    app_tracef("open_registry_screen begin from=%s entries=%zu loading=%d refresh_running=%d",
+               screen_name(g_screen), g_registry_entries.size(), g_registry_loading ? 1 : 0,
+               g_registry_refresh_running ? 1 : 0);
     g_screen = Screen::Registry;
+    g_status_message = "Loading registries...";
+    request_registry_refresh();
+    app_tracef("open_registry_screen end screen=%s", screen_name(g_screen));
 }
 
 void open_registry_add_screen()
 {
+    if (!registry_op_available()) return;
     g_registry_edit_url.clear();
     g_registry_name_input.clear();
     g_registry_input = kDefaultRegistryUrl;
@@ -1864,7 +2437,11 @@ void open_share_code_match()
         g_share_code_message = "Type a share code first.";
         return;
     }
-    refresh_summary_now();
+    if (g_apps.empty()) {
+        g_share_code_message = "Catalog is still loading.";
+        request_summary_refresh();
+        return;
+    }
     for (int i = 0; i < static_cast<int>(g_apps.size()); ++i) {
         const StoreApp &app = g_apps[i];
         if (match_key(app.share_code) == code || match_key(app.id) == code ||
@@ -1888,7 +2465,12 @@ void open_search_match()
         clear_search_results();
         return;
     }
-    refresh_summary_now();
+    if (g_apps.empty()) {
+        clear_search_results();
+        g_search_message = "Catalog is still loading.";
+        request_summary_refresh();
+        return;
+    }
     g_search_results.clear();
     for (int i = 0; i < static_cast<int>(g_apps.size()); ++i) {
         const StoreApp &app = g_apps[i];
@@ -1944,20 +2526,75 @@ RegistryEntry *selected_registry()
     return &g_registry_entries[g_registry_selected];
 }
 
+std::string region_label_for_code(const std::string &region)
+{
+    if (region == "CN") return "China";
+    if (region == "default") return "Default";
+    return "Auto";
+}
+
+std::string region_registry_url_for_code(const std::string &region)
+{
+    if (region == "CN") {
+        return "https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/packages/cn/registry.json";
+    }
+    if (region == "default") return kDefaultRegistryUrl;
+    if (g_region_active == "CN") {
+        return "https://cardputer-zero-repo.oss-cn-shenzhen.aliyuncs.com/packages/cn/registry.json";
+    }
+    return kDefaultRegistryUrl;
+}
+
+void apply_local_region_selection(const std::string &region)
+{
+    g_region_code = region;
+    g_region_label = region_label_for_code(region);
+    g_region_registry_url = region_registry_url_for_code(region);
+    if (region != "auto") g_region_active = region;
+    for (RegistryEntry &entry : g_registry_entries) {
+        if (entry.builtin || entry.region == "CN" || entry.region == "default") {
+            entry.url = g_region_registry_url;
+            entry.region = region == "auto" ? g_region_active : region;
+            if (entry.name.empty() || entry.name == entry.url) {
+                entry.name = "CardputerZero Hub";
+            }
+        }
+    }
+}
+
+void start_debounced_region_commit()
+{
+    if (!g_region_commit_pending) return;
+    if (registry_op_is_running()) return;
+
+    std::string region = g_region_pending_code;
+    g_region_commit_pending = false;
+    RegistryOpRequest request;
+    request.kind = RegistryOpKind::SetRegion;
+    request.region = region;
+    start_registry_op(request, "Changing region...");
+}
+
+bool poll_region_debounce()
+{
+    if (!g_region_commit_pending) return false;
+    if (lv_tick_elaps(g_region_change_tick) < kRegionDebounceMs) return false;
+    start_debounced_region_commit();
+    return true;
+}
+
 void select_region(const std::string &region)
 {
     if (region == g_region_code) {
         return;
     }
-    std::string out = backend_capture({"--set-region", region});
-    if (out.find("ERROR") != std::string::npos) {
-        g_status_message = one_line(backend_error_message(out), 54);
-        return;
-    }
-    refresh_registries();
-    g_status_message = "Region: " + g_region_label;
-    request_summary_refresh();
-    sync_catalog(true);
+    cancel_registry_online_work("region_input");
+    apply_local_region_selection(region);
+    g_region_pending_code = region;
+    g_region_commit_pending = true;
+    g_region_change_tick = lv_tick_get();
+    g_status_message = "Region: " + g_region_label + " (waiting...)";
+    app_tracef("region debounce select region=%s label=%s", region.c_str(), g_region_label.c_str());
 }
 
 std::string adjacent_region(int delta)
@@ -1976,74 +2613,47 @@ void add_registry_from_input()
         g_status_message = "Name and URL required";
         return;
     }
+    if (!registry_op_available()) return;
     bool editing = !g_registry_edit_url.empty();
-    g_status_message = editing ? "Updating registry..." : "Adding registry...";
+    RegistryOpRequest request;
+    request.kind = editing ? RegistryOpKind::EditRegistry : RegistryOpKind::AddRegistry;
+    request.old_url = g_registry_edit_url;
+    request.url = g_registry_input;
+    request.name = g_registry_name_input;
+    start_registry_op(request, editing ? "Updating registry..." : "Adding registry...");
     render();
-    std::string out = editing ?
-        backend_capture({"--edit-registry", g_registry_edit_url, g_registry_input,
-                         "--registry-name", g_registry_name_input}) :
-        backend_capture({"--add-registry", g_registry_input,
-                         "--registry-name", g_registry_name_input});
-    if (out.find("ERROR") != std::string::npos) {
-        g_status_message = one_line(backend_error_message(out), 54);
-    } else {
-        std::string count = "";
-        std::istringstream stream(out);
-        std::string line;
-        while (std::getline(stream, line)) {
-            auto fields = split_tab(line);
-            if (fields.size() >= 5 && fields[0] == "REGISTRY") {
-                count = fields[1] == "UPDATED" && fields.size() >= 6 ? fields[5] : fields[4];
-                break;
-            }
-        }
-        g_status_message = (editing ? "Registry updated" : "Registry added") +
-                           (count.empty() ? std::string() : " (" + count + " apps)");
-        g_registry_edit_url.clear();
-        g_screen = Screen::Registry;
-    }
-    refresh_registries();
-    sync_catalog(true);
 }
 
 void toggle_selected_registry()
 {
+    if (!registry_op_available()) return;
     RegistryEntry *entry = selected_registry();
     if (!entry) return;
-    bool was_enabled = entry->enabled;
-    std::string flag = entry->enabled ? "--disable-registry" : "--enable-registry";
-    std::string out = backend_capture({flag, entry->url});
-    if (out.find("ERROR") != std::string::npos) {
-        g_status_message = one_line(out, 44);
-    } else {
-        g_status_message = entry->enabled ? "Registry disabled" : "Registry enabled";
-    }
-    refresh_registries();
-    request_summary_refresh();
-    if (!was_enabled) sync_catalog(true);
+    RegistryOpRequest request;
+    request.kind = RegistryOpKind::ToggleRegistry;
+    request.url = entry->url;
+    request.enable = !entry->enabled;
+    start_registry_op(request, entry->enabled ? "Disabling registry..." : "Enabling registry...");
 }
 
 void delete_selected_registry()
 {
+    if (!registry_op_available()) return;
     RegistryEntry *entry = selected_registry();
     if (!entry) return;
     if (entry->builtin) {
         g_status_message = "Use region setting";
         return;
     }
-    std::string out = backend_capture({"--remove-registry", entry->url});
-    if (out.find("ERROR") != std::string::npos) {
-        g_status_message = one_line(out, 44);
-    } else {
-        g_status_message = "Registry deleted";
-    }
-    g_registry_edit_url.clear();
-    refresh_registries();
-    request_summary_refresh();
+    RegistryOpRequest request;
+    request.kind = RegistryOpKind::DeleteRegistry;
+    request.url = entry->url;
+    start_registry_op(request, "Deleting registry...");
 }
 
 void edit_selected_registry()
 {
+    if (!registry_op_available()) return;
     RegistryEntry *entry = selected_registry();
     if (!entry) return;
     if (entry->builtin) {
@@ -2085,6 +2695,84 @@ bool parse_plan(const std::string &out)
     return false;
 }
 
+void *plan_thread_main(void *)
+{
+    std::string app_id;
+    pthread_mutex_lock(&g_plan_mutex);
+    app_id = g_plan_app_id;
+    pthread_mutex_unlock(&g_plan_mutex);
+
+    int rc = -1;
+    std::string out = backend_capture({"--plan", app_id}, &rc);
+    pthread_mutex_lock(&g_plan_mutex);
+    g_plan_output = out;
+    g_plan_rc = rc;
+    g_plan_done = true;
+    pthread_mutex_unlock(&g_plan_mutex);
+    return nullptr;
+}
+
+void start_plan_check(const std::string &action, const std::string &app_id)
+{
+    pthread_mutex_lock(&g_plan_mutex);
+    if (g_plan_running) {
+        pthread_mutex_unlock(&g_plan_mutex);
+        g_status_message = "Plan check already running";
+        return;
+    }
+    g_plan_running = true;
+    g_plan_done = false;
+    g_plan_action = action;
+    g_plan_app_id = app_id;
+    g_plan_output.clear();
+    g_plan_rc = -1;
+    pthread_mutex_unlock(&g_plan_mutex);
+
+    g_status_message = "Checking install plan...";
+    pthread_t thread_id;
+    if (pthread_create(&thread_id, nullptr, plan_thread_main, nullptr) != 0) {
+        pthread_mutex_lock(&g_plan_mutex);
+        g_plan_running = false;
+        pthread_mutex_unlock(&g_plan_mutex);
+        g_status_message = "Unable to check install plan";
+        return;
+    }
+    pthread_detach(thread_id);
+}
+
+bool poll_plan_check()
+{
+    std::string action;
+    std::string out;
+    int rc = -1;
+    bool done = false;
+
+    pthread_mutex_lock(&g_plan_mutex);
+    if (g_plan_done) {
+        done = true;
+        action = g_plan_action;
+        out = std::move(g_plan_output);
+        rc = g_plan_rc;
+        g_plan_done = false;
+        g_plan_running = false;
+        g_plan_action.clear();
+        g_plan_app_id.clear();
+        g_plan_rc = -1;
+    }
+    pthread_mutex_unlock(&g_plan_mutex);
+
+    if (!done) return false;
+
+    g_confirm_action = action;
+    if (rc == 0 && parse_plan(out)) {
+        g_status_message.clear();
+        g_screen = Screen::Confirm;
+    } else {
+        g_status_message = one_line(backend_error_message(out), 44);
+    }
+    return true;
+}
+
 void cancel_confirm()
 {
     g_screen = Screen::Detail;
@@ -2101,6 +2789,10 @@ void start_confirm(const std::string &action)
         g_status_message = "Operation already running";
         return;
     }
+    if (g_plan_running) {
+        g_status_message = "Plan check already running";
+        return;
+    }
     g_confirm_action = action;
     g_confirm_focus = 0;
     if (action == "uninstall") {
@@ -2108,15 +2800,7 @@ void start_confirm(const std::string &action)
         g_screen = Screen::Confirm;
         return;
     }
-    g_status_message = "Checking install plan...";
-    render();
-    std::string out = backend_capture({"--plan", app->id});
-    if (parse_plan(out)) {
-        g_status_message.clear();
-        g_screen = Screen::Confirm;
-    } else {
-        g_status_message = one_line(backend_error_message(out), 44);
-    }
+    start_plan_check(action, app->id);
 }
 
 void start_detail_install_action(StoreApp *app)
@@ -2295,6 +2979,11 @@ void execute_sudo_password()
 
 void handle_key(const KeyEvent &key)
 {
+    uint32_t key_start = lv_tick_get();
+    Screen before_screen = g_screen;
+    app_tracef("handle_key begin screen=%s code=%u ch=%d release=%d repeat=%d",
+               screen_name(before_screen), key.code, static_cast<int>(key.ch),
+               key.release ? 1 : 0, key.repeated ? 1 : 0);
     if (key.code == KEY_ESC) {
         if (key.release) {
             bool do_back = g_esc_pressed && !g_esc_long_consumed &&
@@ -2314,9 +3003,17 @@ void handle_key(const KeyEvent &key)
             g_esc_long_consumed = true;
             request_quit();
         }
+        app_tracef("handle_key end elapsed=%ums before=%s after=%s code=%u esc=1",
+                   lv_tick_elaps(key_start), screen_name(before_screen),
+                   screen_name(g_screen), key.code);
         return;
     }
-    if (key.release) return;
+    if (key.release) {
+        app_tracef("handle_key end elapsed=%ums before=%s after=%s code=%u release=1",
+                   lv_tick_elaps(key_start), screen_name(before_screen),
+                   screen_name(g_screen), key.code);
+        return;
+    }
     switch (g_screen) {
         case Screen::Home:
             if ((key.code == KEY_UP || key.code == KEY_F || key.ch == 'f') && !g_visible.empty()) {
@@ -2516,6 +3213,9 @@ void handle_key(const KeyEvent &key)
             break;
     }
     render();
+    app_tracef("handle_key end elapsed=%ums before=%s after=%s code=%u ch=%d",
+               lv_tick_elaps(key_start), screen_name(before_screen), screen_name(g_screen),
+               key.code, static_cast<int>(key.ch));
 }
 
 char lower_printable(const char *utf8)
@@ -2559,23 +3259,26 @@ void ui_init(int, char **argv)
 {
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
+    cp0_zmq_log_init();
 
     g_app_dir = dirname_of(argv && argv[0] ? argv[0] : nullptr);
     set_backend_script_path(resolve_script_path(g_app_dir));
     std::fprintf(stderr, "[AppStore UI] ui_init argv0=%s app_dir=%s backend=%s\n",
                  argv && argv[0] ? argv[0] : "-", g_app_dir.c_str(), backend_script_path().c_str());
+    app_tracef("ui_init argv0=%s app_dir=%s backend=%s",
+               argv && argv[0] ? argv[0] : "-", g_app_dir.c_str(), backend_script_path().c_str());
 
     init_runtime_fonts(g_app_dir);
     build_ui();
     update_top_status_cache(true);
-    refresh_summary_now();
     render();
     g_sync_timer = lv_timer_create(sync_timer_cb, kSyncAnimRefreshMs, nullptr);
-    sync_catalog();
-    render();
     g_refresh_timer = lv_timer_create(refresh_timer_cb, 250, nullptr);
     g_esc_hold_timer = lv_timer_create(esc_hold_timer_cb, 50, nullptr);
     g_job_timer = lv_timer_create(job_timer_cb, kJobPollIntervalMs, nullptr);
+    request_summary_refresh();
+    sync_catalog();
+    render();
 }
 
 void ui_loop()
@@ -2588,6 +3291,7 @@ void ui_deinit()
     if (g_refresh_timer) lv_timer_delete(g_refresh_timer);
     if (g_job_timer) lv_timer_delete(g_job_timer);
     if (g_sync_timer) lv_timer_delete(g_sync_timer);
+    stop_backend_service();
 }
 
 bool ui_should_quit()

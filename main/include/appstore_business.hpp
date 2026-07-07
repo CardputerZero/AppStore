@@ -96,6 +96,8 @@ void sort_apps(std::vector<StoreApp> &apps, SortRule rule);
 
 void set_backend_script_path(std::string path);
 const std::string &backend_script_path();
+bool start_backend_service();
+void stop_backend_service();
 std::string backend_capture(const std::vector<std::string> &args, int *rc = nullptr);
 std::string backend_capture_with_sudo(const std::vector<std::string> &args,
                                       const std::string &password,
