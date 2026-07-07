@@ -92,5 +92,12 @@ std::string lvgl_posix_src(const std::string &path)
     if (path.rfind(kAppRoot, 0) == 0) {
         return "A:/" + path.substr(std::strlen(kAppRoot));
     }
+    static constexpr const char *kCacheRoot = "/var/cache/APPLaunch/";
+    if (path.rfind(kCacheRoot, 0) == 0) {
+        return "A:/../../../var/cache/APPLaunch/" + path.substr(std::strlen(kCacheRoot));
+    }
+    if (!path.empty() && path[0] == '/') {
+        return path;
+    }
     return "A:" + path;
 }

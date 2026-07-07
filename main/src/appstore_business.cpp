@@ -118,6 +118,51 @@ std::string make_backend_body(const std::vector<std::string> &args, const std::s
     return body;
 }
 
+std::string json_escape_cpp(const std::string &value)
+{
+    std::string out;
+    out.reserve(value.size() + 8);
+    for (char ch : value) {
+        switch (ch) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(ch) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(ch));
+                    out += buf;
+                } else {
+                    out += ch;
+                }
+                break;
+        }
+    }
+    return out;
+}
+
+std::string registry_config_json(const RegistryConfig &config)
+{
+    std::string out = "{\"region\":\"" + json_escape_cpp(config.region) +
+        "\",\"active_region\":\"" + json_escape_cpp(config.active_region) +
+        "\",\"registries\":[";
+    for (size_t i = 0; i < config.entries.size(); ++i) {
+        const RegistryEntry &entry = config.entries[i];
+        if (i) out += ',';
+        out += "{\"name\":\"" + json_escape_cpp(entry.name) +
+            "\",\"url\":\"" + json_escape_cpp(entry.url) +
+            "\",\"enabled\":" + std::string(entry.enabled ? "true" : "false") +
+            ",\"builtin\":" + std::string(entry.builtin ? "true" : "false") +
+            ",\"region\":\"" + json_escape_cpp(entry.region) + "\"}";
+    }
+    out += "]}";
+    return out;
+}
+
 void configure_backend_client(httplib::Client &client, int read_timeout_secs)
 {
     client.set_connection_timeout(1);
@@ -636,6 +681,102 @@ std::string backend_capture_with_sudo(const std::vector<std::string> &args,
                  ret, text.size(), join_args(args).c_str(), preview_output(text).c_str());
     if (rc) *rc = ret;
     return text;
+}
+
+SyncStatus load_sync_status()
+{
+    SyncStatus status;
+    {
+        std::lock_guard<std::mutex> lock(g_backend_mutex);
+        if (!start_backend_service_locked()) {
+            status.detail = "backend service unavailable";
+            return status;
+        }
+    }
+
+    httplib::Client client(kBackendHost, kBackendPort);
+    configure_backend_client(client, 2);
+    auto res = client.Get("/sync-status");
+    if (!res || res->status < 200 || res->status >= 300) {
+        status.detail = "sync status unavailable";
+        return status;
+    }
+
+    std::istringstream stream(res->body);
+    std::string line;
+    while (std::getline(stream, line)) {
+        auto fields = split_tab(line);
+        if (fields.size() >= 8 && fields[0] == "STATUS") {
+            status.running = fields[1] != "0";
+            status.cancel_requested = fields[2] != "0";
+            status.url = fields[3];
+            status.detail = fields[4];
+            status.percent = std::atoi(fields[5].c_str());
+            status.phase = fields[6];
+            status.updated_at = fields[7];
+            break;
+        }
+    }
+    return status;
+}
+
+bool cancel_sync()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_backend_mutex);
+        if (!start_backend_service_locked()) {
+            return false;
+        }
+    }
+
+    httplib::Client client(kBackendHost, kBackendPort);
+    configure_backend_client(client, 2);
+    auto res = client.Post("/cancel-sync", "", "text/plain; charset=utf-8");
+    bool ok = res && res->status >= 200 && res->status < 300;
+    business_tracef("backend cancel_sync ok=%d status=%d", ok ? 1 : 0, res ? res->status : -1);
+    return ok;
+}
+
+RegistryConfig load_registry_config()
+{
+    RegistryConfig config;
+    int rc = -1;
+    std::string output = backend_capture({"--registry-config"}, &rc);
+    if (rc != 0) {
+        std::fprintf(stderr, "[AppStore UI] registry config load failed rc=%d preview=%s\n",
+                     rc, preview_output(output).c_str());
+        return config;
+    }
+    std::istringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line)) {
+        auto fields = split_tab(line);
+        if (fields.empty()) continue;
+        if (fields[0] == "CONFIG" && fields.size() >= 4) {
+            config.region = fields[1];
+            config.active_region = fields[2];
+        } else if (fields[0] == "CONFIG_REG" && fields.size() >= 7) {
+            RegistryEntry entry;
+            entry.name = fields[2];
+            entry.url = fields[3];
+            entry.enabled = fields[4] != "0";
+            entry.builtin = fields[5] == "1";
+            entry.region = fields[6];
+            config.entries.push_back(entry);
+        }
+    }
+    return config;
+}
+
+bool replace_registry_config(const RegistryConfig &config)
+{
+    int rc = -1;
+    std::string payload = registry_config_json(config);
+    std::string output = backend_capture({"--replace-registry-config", payload}, &rc);
+    bool ok = rc == 0 && output.find("ERROR") == std::string::npos;
+    std::fprintf(stderr, "[AppStore UI] registry config replace rc=%d ok=%d preview=%s\n",
+                 rc, ok ? 1 : 0, preview_output(output).c_str());
+    return ok;
 }
 
 SummaryData load_summary(SortRule rule)

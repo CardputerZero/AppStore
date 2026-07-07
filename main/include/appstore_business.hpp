@@ -61,6 +61,22 @@ struct RegistryData {
     std::vector<std::string> lines;
 };
 
+struct RegistryConfig {
+    std::string region = "auto";
+    std::string active_region = "default";
+    std::vector<RegistryEntry> entries;
+};
+
+struct SyncStatus {
+    bool running = false;
+    bool cancel_requested = false;
+    std::string url;
+    std::string detail;
+    int percent = -1;
+    std::string phase;
+    std::string updated_at;
+};
+
 enum class SortRule {
     Default,
     New,
@@ -102,6 +118,10 @@ std::string backend_capture(const std::vector<std::string> &args, int *rc = null
 std::string backend_capture_with_sudo(const std::vector<std::string> &args,
                                       const std::string &password,
                                       int *rc = nullptr);
+SyncStatus load_sync_status();
+bool cancel_sync();
+RegistryConfig load_registry_config();
+bool replace_registry_config(const RegistryConfig &config);
 SummaryData load_summary(SortRule rule);
 RegistryData load_registries(const std::string &fallback_registry_url);
 

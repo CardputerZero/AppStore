@@ -42,6 +42,21 @@ CACHE_BUST_PARAM = "_cz_appstore_ts"
 _DPKG_STATUS_CACHE: Optional[dict[str, tuple[bool, str]]] = None
 DEBUG_LOG_PATH = Path(os.environ.get("M5APPSTORE_DEBUG_LOG", "/tmp/appstore-backend.log"))
 SERVICE_LOCK = threading.Lock()
+SYNC_STATUS_LOCK = threading.Lock()
+SYNC_CANCEL_EVENT = threading.Event()
+SYNC_STATUS: dict[str, Any] = {
+    "running": False,
+    "cancel_requested": False,
+    "url": "",
+    "detail": "Idle",
+    "percent": -1,
+    "phase": "idle",
+    "updated_at": "",
+}
+
+
+class SyncCancelled(RuntimeError):
+    pass
 
 
 def log_debug(message: str) -> None:
@@ -112,6 +127,61 @@ def split_tsv_line(line: str) -> list[str]:
 
 def emit(*fields: Any) -> None:
     print("\t".join(tsv_escape(field) for field in fields), flush=True)
+
+
+def update_sync_status(
+    *,
+    running: Optional[bool] = None,
+    url: Optional[str] = None,
+    detail: Optional[str] = None,
+    percent: Optional[int] = None,
+    phase: Optional[str] = None,
+    cancel_requested: Optional[bool] = None,
+) -> None:
+    with SYNC_STATUS_LOCK:
+        if running is not None:
+            SYNC_STATUS["running"] = running
+        if url is not None:
+            SYNC_STATUS["url"] = url
+        if detail is not None:
+            SYNC_STATUS["detail"] = detail
+        if percent is not None:
+            SYNC_STATUS["percent"] = percent
+        if phase is not None:
+            SYNC_STATUS["phase"] = phase
+        if cancel_requested is not None:
+            SYNC_STATUS["cancel_requested"] = cancel_requested
+        SYNC_STATUS["updated_at"] = now_text()
+
+
+def sync_status_snapshot() -> dict[str, Any]:
+    with SYNC_STATUS_LOCK:
+        return dict(SYNC_STATUS)
+
+
+def emit_sync_status() -> None:
+    status = sync_status_snapshot()
+    emit(
+        "STATUS",
+        1 if status.get("running") else 0,
+        1 if status.get("cancel_requested") else 0,
+        status.get("url", ""),
+        status.get("detail", ""),
+        status.get("percent", -1),
+        status.get("phase", ""),
+        status.get("updated_at", ""),
+    )
+
+
+def request_sync_cancel() -> None:
+    SYNC_CANCEL_EVENT.set()
+    update_sync_status(cancel_requested=True, detail="Cancelling sync...", phase="cancel")
+
+
+def check_sync_cancel() -> None:
+    if SYNC_CANCEL_EVENT.is_set() and sync_status_snapshot().get("running"):
+        update_sync_status(cancel_requested=True, detail="Sync cancelled", percent=-1, phase="cancelled")
+        raise SyncCancelled("sync cancelled")
 
 
 def short_hash(value: str) -> str:
@@ -354,7 +424,7 @@ def registry_error_message(url: str, exc: Exception) -> str:
     return f"Unable to load {name}: {compact_error(exc)}"
 
 
-def request_json(url: str) -> Any:
+def request_json(url: str, detail: str = "") -> Any:
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json",
@@ -362,6 +432,8 @@ def request_json(url: str) -> Any:
         "Pragma": "no-cache",
     }
     fetch_url = cache_busted_url(url)
+    if detail:
+        update_sync_status(url=url, detail=detail, percent=-1, phase="download")
     log_debug(f"request_json start url={url} fetch_url={fetch_url}")
     request = urllib.request.Request(fetch_url, headers=headers)
     try:
@@ -369,6 +441,8 @@ def request_json(url: str) -> Any:
             raw = response.read()
             status = getattr(response, "status", "file")
             log_debug(f"request_json ok url={url} status={status} bytes={len(raw)}")
+            if detail:
+                update_sync_status(url=url, detail=f"{detail} complete", percent=-1, phase="parse")
             return json.loads(raw.decode("utf-8"))
     except Exception as exc:
         log_debug(f"request_json failed url={url} error={compact_error(exc)}")
@@ -509,6 +583,8 @@ def cache_screenshot(index_url: str, screenshot_ref: str) -> str:
 def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
     url = source["url"]
     cache_path = cache_file_for(url)
+    update_sync_status(url=url, detail="Accessing registry", percent=-1, phase="registry")
+    check_sync_cancel()
     log_debug(f"sync_registry start name={source.get('name') or '-'} url={url} cache={cache_path}")
     record: dict[str, Any] = {
         "name": source.get("name") or registry_name_from_url(url),
@@ -521,14 +597,18 @@ def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
         "screenshots": {},
     }
     try:
-        index = request_json(url)
+        index = request_json(url, "Downloading registry index")
         record["index"] = index
+        check_sync_cancel()
         try:
             full_url = full_registry_url(url)
-            record["full"] = index if clean_json_url(full_url) == clean_json_url(url) else request_json(full_url)
+            record["full"] = index if clean_json_url(full_url) == clean_json_url(url) else request_json(
+                full_url, "Downloading full registry"
+            )
         except Exception as exc:
             record["full_error"] = str(exc)
             record["full"] = {}
+        check_sync_cancel()
         index_apps = [app for app in index.get("apps", []) if isinstance(app, dict)]
         full_apps = [app for app in record["full"].get("apps", []) if isinstance(app, dict)]
         full_by_key = {app_key(app): app for app in full_apps if app_key(app)}
@@ -548,10 +628,14 @@ def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
                 merged_for_assets.append(item)
                 seen_asset_keys.add(key)
 
-        for app in merged_for_assets:
+        total_assets = max(1, len(merged_for_assets))
+        for index, app in enumerate(merged_for_assets):
+            check_sync_cancel()
             key = app_key(app)
             if not key:
                 continue
+            percent = min(95, 20 + int((index + 1) * 70 / total_assets))
+            update_sync_status(url=url, detail="Caching app artwork", percent=percent, phase="assets")
             assets = app.get("assets") if isinstance(app.get("assets"), dict) else {}
             icon = app.get("icon") or assets.get("icon")
             local_icon = cache_icon(url, str(icon or ""))
@@ -564,12 +648,16 @@ def sync_one_registry(source: dict[str, Any]) -> dict[str, Any]:
                     local_screenshots.append(local)
             if local_screenshots:
                 record["screenshots"][key] = local_screenshots
+        update_sync_status(url=url, detail="Writing registry cache", percent=98, phase="cache")
         write_json(cache_path, record)
         log_debug(
             f"sync_registry ok url={url} apps={len(index_apps)} full_apps={len(full_apps)} "
             f"icons={len(record['icons'])} screenshots={len(record['screenshots'])} cache={cache_path}"
         )
     except Exception as exc:
+        if isinstance(exc, SyncCancelled):
+            log_debug(f"sync_registry cancelled url={url} cache={cache_path}")
+            raise
         log_debug(f"sync_registry failed url={url} error={compact_error(exc)} cache={cache_path}")
         record["status"] = "error"
         record["error"] = registry_error_message(url, exc)
@@ -602,7 +690,17 @@ def validated_registry_record(name: str, url: str) -> tuple[str, dict[str, Any],
 
 
 def sync_all() -> list[dict[str, Any]]:
+    SYNC_CANCEL_EVENT.clear()
+    update_sync_status(
+        running=True,
+        cancel_requested=False,
+        url="",
+        detail="Loading registry configuration",
+        percent=-1,
+        phase="config",
+    )
     config = load_config()
+    check_sync_cancel()
     config = config_for_sync(config)
     save_config(config)
     log_debug(
@@ -612,9 +710,31 @@ def sync_all() -> list[dict[str, Any]]:
         f"registries={len(config['registries'])}"
     )
     records = []
-    for source in config["registries"]:
-        if source.get("enabled", True):
+    enabled_sources = [source for source in config["registries"] if source.get("enabled", True)]
+    total = max(1, len(enabled_sources))
+    try:
+        for index, source in enumerate(enabled_sources):
+            check_sync_cancel()
+            update_sync_status(
+                url=source.get("url", ""),
+                detail=f"Syncing registry {index + 1}/{total}",
+                percent=int(index * 100 / total),
+                phase="registry",
+            )
             records.append(sync_one_registry(source))
+            update_sync_status(
+                url=source.get("url", ""),
+                detail=f"Registry {index + 1}/{total} synced",
+                percent=int((index + 1) * 100 / total),
+                phase="registry",
+            )
+    except SyncCancelled:
+        update_sync_status(running=False, cancel_requested=True, detail="Sync cancelled", percent=-1, phase="cancelled")
+        raise
+    except Exception as exc:
+        update_sync_status(running=False, detail=f"Sync error: {compact_error(exc)}", percent=-1, phase="error")
+        raise
+    update_sync_status(running=False, cancel_requested=False, detail="Catalog synced", percent=100, phase="complete")
     return records
 
 
@@ -842,6 +962,12 @@ def dpkg_status_cache() -> dict[str, tuple[bool, str]]:
         if package:
             _DPKG_STATUS_CACHE[package] = ("install ok installed" in status, version.strip())
     return _DPKG_STATUS_CACHE
+
+
+def invalidate_dpkg_status_cache(reason: str = "") -> None:
+    global _DPKG_STATUS_CACHE
+    _DPKG_STATUS_CACHE = None
+    log_debug(f"dpkg_status_cache invalidated reason={reason or '-'}")
 
 
 def package_installed(package: str) -> bool:
@@ -1315,6 +1441,7 @@ def uninstall(app_id: str) -> int:
             run_package_command(["dpkg", "-r", package])
         else:
             raise RuntimeError("apt-get or dpkg is required to uninstall deb packages")
+        invalidate_dpkg_status_cache("uninstall")
         write_json(installed_path(), records)
         emit("PROGRESS", "uninstall", 1, 1, 100, "Remove complete")
         emit("UNINSTALLED", app_id)
@@ -1352,9 +1479,17 @@ def install(app_id: str, reinstall: bool = False, upgrade: bool = False) -> int:
             run_package_command(["dpkg", "-i", str(deb_path)])
         else:
             raise RuntimeError("apt-get or dpkg is required to install deb packages")
+        invalidate_dpkg_status_cache(stage)
         records = installed_records()
         files = package_files(package)
         repaired_exec = repair_applaunch_desktop(app, files)
+        installed_now = package_installed(package)
+        installed_now_version = package_version(package)
+        log_debug(
+            "install package result "
+            f"app={app_key(app)} package={package} installed={int(installed_now)} "
+            f"version={installed_now_version or '-'} files={len(files)} exec={repaired_exec or applaunch_exec(app) or '-'}"
+        )
         records[app_key(app)] = {
             "installed_at": now_text(),
             "title": localized_text(app, "title", resolve_locale()) or app.get("title"),
@@ -1454,6 +1589,80 @@ def edit_registry(old_url: str, new_url: str, name: str = "") -> int:
     return 0
 
 
+def registry_config() -> int:
+    config = load_config()
+    emit(
+        "CONFIG",
+        config.get("region", "auto"),
+        config.get("active_region", "default"),
+        len(config.get("registries", [])),
+    )
+    for index, item in enumerate(config.get("registries", [])):
+        if not isinstance(item, dict):
+            continue
+        emit(
+            "CONFIG_REG",
+            index,
+            item.get("name") or registry_name_from_url(str(item.get("url", ""))),
+            item.get("url", ""),
+            "1" if item.get("enabled", True) else "0",
+            "1" if item.get("builtin") else "0",
+            item.get("region") or "",
+        )
+    return 0
+
+
+def replace_registry_config(payload: str) -> int:
+    try:
+        incoming = json.loads(payload)
+    except Exception as exc:
+        emit("ERROR", f"invalid registry config: {compact_error(exc)}")
+        return 1
+    if not isinstance(incoming, dict):
+        emit("ERROR", "invalid registry config: object required")
+        return 1
+
+    config: dict[str, Any] = {
+        "region": normalize_region_mode(incoming.get("region", "auto")),
+        "active_region": normalize_region(incoming.get("active_region", "default")),
+        "registries": [],
+    }
+    registries = incoming.get("registries")
+    if not isinstance(registries, list):
+        registries = []
+    for item in registries:
+        if not isinstance(item, dict):
+            continue
+        url = normalize_registry_url(str(item.get("url", "")))
+        if not url:
+            continue
+        entry: dict[str, Any] = {
+            "name": item.get("name") or registry_name_from_url(url),
+            "url": url,
+            "enabled": enabled_value(item.get("enabled", True)),
+        }
+        if item.get("builtin") or is_builtin_registry_url(url):
+            entry["builtin"] = True
+            entry["region"] = normalize_region(item.get("region", config["active_region"]))
+        elif item.get("region"):
+            entry["region"] = str(item.get("region"))
+        config["registries"].append(entry)
+
+    config = config_with_region(config, config["region"])
+    if config["region"] == "auto":
+        config["active_region"] = normalize_region(incoming.get("active_region", config.get("active_region", "default")))
+    else:
+        config["active_region"] = normalize_region(config["region"])
+    custom_registries = [
+        item for item in config.get("registries", [])
+        if isinstance(item, dict) and not item.get("builtin") and not is_builtin_registry_url(str(item.get("url", "")))
+    ]
+    config["registries"] = [region_registry(config["active_region"]), *custom_registries]
+    save_config(config)
+    emit("CONFIG", config.get("region", "auto"), config.get("active_region", "default"), len(config["registries"]))
+    return 0
+
+
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--summary", action="store_true")
@@ -1468,6 +1677,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--enable-registry")
     parser.add_argument("--disable-registry")
     parser.add_argument("--edit-registry", nargs=2, metavar=("OLD_URL", "NEW_URL"))
+    parser.add_argument("--registry-config", action="store_true")
+    parser.add_argument("--replace-registry-config")
     parser.add_argument("--plan")
     parser.add_argument("--install")
     parser.add_argument("--reinstall")
@@ -1491,7 +1702,11 @@ def execute_args(args: argparse.Namespace) -> int:
     if args.set_region:
         return set_region(args.set_region)
     if args.sync:
-        records = sync_all()
+        try:
+            records = sync_all()
+        except SyncCancelled:
+            emit("ERROR", "sync cancelled")
+            return 1
         ok = sum(1 for record in records if record.get("status") == "ok")
         cached = sum(1 for record in records if record.get("status") == "cached")
         failed = sum(1 for record in records if record.get("status") == "error")
@@ -1519,6 +1734,10 @@ def execute_args(args: argparse.Namespace) -> int:
         return set_registry_enabled(args.disable_registry, False)
     if args.edit_registry:
         return edit_registry(args.edit_registry[0], args.edit_registry[1], args.registry_name or "")
+    if args.registry_config:
+        return registry_config()
+    if args.replace_registry_config:
+        return replace_registry_config(args.replace_registry_config)
     if args.plan:
         return plan(args.plan)
     if args.install:
@@ -1544,6 +1763,17 @@ class AppStoreRequestHandler(BaseHTTPRequestHandler):
         log_debug("http " + (fmt % args))
 
     def do_GET(self) -> None:
+        if self.path == "/sync-status":
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                emit_sync_status()
+            body = buffer.getvalue().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/tab-separated-values; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path != "/health":
             self.send_error(404, "not found")
             return
@@ -1555,6 +1785,18 @@ class AppStoreRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:
+        if self.path == "/cancel-sync":
+            request_sync_cancel()
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                emit_sync_status()
+            raw = buffer.getvalue().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/tab-separated-values; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if self.path != "/run":
             self.send_error(404, "not found")
             return

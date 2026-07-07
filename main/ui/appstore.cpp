@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <pthread.h>
+#include <sys/stat.h>
 
 void cp0_zmq_log_init(void);
 void cp0_zmq_log(const char *topic, const char *message);
@@ -51,14 +52,18 @@ constexpr uint32_t kBatteryChargeAnimRefreshMs = 120;
 constexpr uint32_t kSyncAnimRefreshMs = 200;
 constexpr uint32_t kRegionDebounceMs = 2000;
 constexpr uint32_t kStatusScrollVisibleMs = 6000;
+constexpr int kSharedRegistryMaxEntries = 16;
 constexpr const char *kDefaultRegistryUrl = "https://cardputerzero.github.io/generated/registry.json";
+constexpr const char *kSharedRegistryPrefix = "appstore.registry.";
 
 enum class Screen {
+    StartupSync,
     Home,
     Detail,
     Confirm,
     SudoPassword,
     Progress,
+    ErrorDialog,
     Registry,
     RegistryEdit,
     ShareCode,
@@ -150,6 +155,9 @@ std::string g_sudo_message = "Enter sudo password for package operation.";
 std::string g_sudo_action;
 std::string g_sudo_app_id;
 std::string g_sudo_app_title;
+std::string g_error_title;
+std::string g_error_message;
+std::string g_error_detail;
 std::string g_registry_input = kDefaultRegistryUrl;
 std::string g_registry_edit_url;
 std::string g_registry_name_input;
@@ -195,8 +203,11 @@ bool g_sync_running = false;
 bool g_sync_done = false;
 bool g_sync_refresh_registries = false;
 std::string g_sync_output;
+SyncStatus g_sync_status;
 uint32_t g_sync_visible_until_tick = 0;
 uint64_t g_sync_generation = 0;
+bool g_startup_sync_active = false;
+bool g_startup_sync_cancelled = false;
 pthread_mutex_t g_summary_mutex = PTHREAD_MUTEX_INITIALIZER;
 bool g_summary_running = false;
 bool g_summary_done = false;
@@ -236,11 +247,13 @@ uint32_t g_region_change_tick = 0;
 const char *screen_name(Screen screen)
 {
     switch (screen) {
+        case Screen::StartupSync: return "StartupSync";
         case Screen::Home: return "Home";
         case Screen::Detail: return "Detail";
         case Screen::Confirm: return "Confirm";
         case Screen::SudoPassword: return "SudoPassword";
         case Screen::Progress: return "Progress";
+        case Screen::ErrorDialog: return "ErrorDialog";
         case Screen::Registry: return "Registry";
         case Screen::RegistryEdit: return "RegistryEdit";
         case Screen::ShareCode: return "ShareCode";
@@ -259,6 +272,187 @@ void app_tracef(const char *fmt, ...)
     va_end(args);
     std::fprintf(stderr, "[AppStore TRACE] %s\n", buf);
     cp0_zmq_log("appstore", buf);
+}
+
+std::string probe_file_for_log(const std::string &path)
+{
+    struct stat st {};
+    if (path.empty()) return "empty-path";
+    if (stat(path.c_str(), &st) != 0) return "missing";
+    if (S_ISDIR(st.st_mode)) return "dir";
+    return "file size=" + std::to_string(static_cast<long long>(st.st_size));
+}
+
+std::string config_key(const std::string &suffix)
+{
+    return std::string(kSharedRegistryPrefix) + suffix;
+}
+
+std::string shared_config_get(const std::string &key, const std::string &fallback = "")
+{
+    std::string value = fallback;
+    cp0_signal_config_api({"GetStr", key, fallback}, [&](int code, std::string data) {
+        if (code == 0) value = std::move(data);
+    });
+    return value;
+}
+
+void shared_config_set(const std::string &key, const std::string &value)
+{
+    cp0_signal_config_api({"SetStr", key, value}, nullptr);
+}
+
+void shared_config_save()
+{
+    cp0_signal_config_api({"Save"}, nullptr);
+}
+
+std::string pack_field_escape(const std::string &value)
+{
+    std::string out;
+    out.reserve(value.size());
+    for (char ch : value) {
+        switch (ch) {
+            case '\\': out += "\\\\"; break;
+            case '\t': out += "\\t"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            default: out += ch; break;
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> split_packed_entry(const std::string &value)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    bool escaped = false;
+    for (char ch : value) {
+        if (escaped) {
+            if (ch == 't') cur += '\t';
+            else if (ch == 'n') cur += '\n';
+            else if (ch == 'r') cur += '\r';
+            else cur += ch;
+            escaped = false;
+        } else if (ch == '\\') {
+            escaped = true;
+        } else if (ch == '\t') {
+            out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += ch;
+        }
+    }
+    if (escaped) cur += '\\';
+    out.push_back(cur);
+    return out;
+}
+
+std::string pack_registry_entry(const RegistryEntry &entry)
+{
+    return pack_field_escape(entry.name) + "\t" +
+        pack_field_escape(entry.url) + "\t" +
+        (entry.enabled ? "1" : "0") + "\t" +
+        (entry.builtin ? "1" : "0") + "\t" +
+        pack_field_escape(entry.region);
+}
+
+bool unpack_registry_entry(const std::string &packed, RegistryEntry &entry)
+{
+    auto fields = split_packed_entry(packed);
+    if (fields.size() < 5 || fields[1].empty()) return false;
+    entry.name = fields[0];
+    entry.url = fields[1];
+    entry.enabled = fields[2] != "0";
+    entry.builtin = fields[3] == "1";
+    entry.region = fields[4];
+    return true;
+}
+
+bool load_shared_registry_config(RegistryConfig &config)
+{
+    std::string count_text = shared_config_get(config_key("count"), "");
+    if (count_text.empty()) return false;
+    int count = std::atoi(count_text.c_str());
+    if (count <= 0) return false;
+    count = std::min(count, kSharedRegistryMaxEntries);
+
+    config = RegistryConfig{};
+    config.region = shared_config_get(config_key("region"), "auto");
+    config.active_region = shared_config_get(config_key("active_region"), "default");
+    for (int i = 0; i < count; ++i) {
+        RegistryEntry entry;
+        std::string packed = shared_config_get(config_key(std::to_string(i) + ".entry"), "");
+        if (unpack_registry_entry(packed, entry)) {
+            config.entries.push_back(entry);
+        }
+    }
+    return !config.entries.empty();
+}
+
+bool save_shared_registry_config(const RegistryConfig &config)
+{
+    int count = std::min(static_cast<int>(config.entries.size()), kSharedRegistryMaxEntries);
+    shared_config_set(config_key("region"), config.region.empty() ? "auto" : config.region);
+    shared_config_set(config_key("active_region"), config.active_region.empty() ? "default" : config.active_region);
+    shared_config_set(config_key("count"), std::to_string(count));
+    for (int i = 0; i < kSharedRegistryMaxEntries; ++i) {
+        std::string key = config_key(std::to_string(i) + ".entry");
+        if (i < count) shared_config_set(key, pack_registry_entry(config.entries[i]));
+        else shared_config_set(key, "");
+    }
+    shared_config_save();
+    app_tracef("shared_registry save region=%s active=%s entries=%d",
+               config.region.c_str(), config.active_region.c_str(), count);
+    return true;
+}
+
+void apply_shared_registry_hint(const RegistryConfig &config)
+{
+    g_region_code = config.region.empty() ? "auto" : config.region;
+    g_region_active = config.active_region.empty() ? "default" : config.active_region;
+    for (const RegistryEntry &entry : config.entries) {
+        if (entry.builtin || entry.region == g_region_active) {
+            g_region_registry_url = entry.url;
+            return;
+        }
+    }
+    if (!config.entries.empty()) {
+        g_region_registry_url = config.entries.front().url;
+    }
+}
+
+void sync_shared_registry_config_on_startup()
+{
+    RegistryConfig shared;
+    if (load_shared_registry_config(shared)) {
+        app_tracef("shared_registry startup import entries=%zu region=%s active=%s",
+                   shared.entries.size(), shared.region.c_str(), shared.active_region.c_str());
+        apply_shared_registry_hint(shared);
+        if (!replace_registry_config(shared)) {
+            g_status_message = "Unable to apply saved registry settings";
+        }
+        return;
+    }
+
+    RegistryConfig backend = load_registry_config();
+    if (!backend.entries.empty()) {
+        save_shared_registry_config(backend);
+        apply_shared_registry_hint(backend);
+        app_tracef("shared_registry migrated entries=%zu region=%s active=%s",
+                   backend.entries.size(), backend.region.c_str(), backend.active_region.c_str());
+    }
+}
+
+void save_backend_registry_config_to_shared()
+{
+    RegistryConfig backend = load_registry_config();
+    if (backend.entries.empty()) {
+        app_tracef("shared_registry save skipped: backend config empty");
+        return;
+    }
+    save_shared_registry_config(backend);
 }
 
 struct TraceScope {
@@ -433,9 +627,12 @@ void update_top_status_cache(bool force = false)
 
 void request_summary_refresh();
 void sync_catalog(bool refresh_registries_after = false);
+void cancel_startup_sync_and_open_registry();
+void open_registry_screen();
 bool poll_plan_check();
 void start_plan_check(const std::string &action, const std::string &app_id);
 bool poll_region_debounce();
+void update_local_job_app_state(bool ok, const std::string &out);
 
 StoreApp *ensure_selected_app()
 {
@@ -506,6 +703,14 @@ void apply_summary(const SummaryData &summary)
     }
     rebuild_visible();
     select_visible_app_by_id(previous_app_id);
+    StoreApp *selected_after = selected_app();
+    if (selected_after) {
+        app_tracef("summary selected id=%s name=%s installed=%d installed_version=%s images=%s",
+                   selected_after->id.c_str(), one_line(selected_after->name, 40).c_str(),
+                   selected_after->installed ? 1 : 0,
+                   selected_after->installed_version.empty() ? "-" : selected_after->installed_version.c_str(),
+                   selected_after->images.empty() ? "-" : one_line(selected_after->images, 120).c_str());
+    }
     std::fprintf(stderr,
                  "[AppStore UI] apply_summary result apps=%zu visible=%zu category=%s selected=%d previous_app=%s status=%s message=%s\n",
                  g_apps.size(), g_visible.size(), current_category_name().c_str(), g_selected,
@@ -861,6 +1066,8 @@ bool poll_registry_op()
         return true;
     }
 
+    save_backend_registry_config_to_shared();
+
     switch (result.request.kind) {
         case RegistryOpKind::SetRegion:
             apply_region_output(result.output);
@@ -1180,8 +1387,15 @@ bool draw_app_icon_image(const StoreApp &app)
 {
 #if LV_USE_LODEPNG && LV_USE_FS_POSIX
     std::string path = icon_file_path(g_app_dir, app);
-    if (path.empty()) return false;
-    g_render_image_sources.push_back(lvgl_posix_src(path));
+    if (path.empty()) {
+        app_tracef("image icon missing app=%s images=%s", app.id.c_str(),
+                   app.images.empty() ? "-" : one_line(app.images, 120).c_str());
+        return false;
+    }
+    std::string src = lvgl_posix_src(path);
+    g_render_image_sources.push_back(src);
+    app_tracef("image icon app=%s path=%s probe=%s src=%s",
+               app.id.c_str(), path.c_str(), probe_file_for_log(path).c_str(), src.c_str());
 
     constexpr int clip_x = kHomeIconX;
     constexpr int clip_y = kHomeIconY;
@@ -1270,9 +1484,18 @@ bool draw_detail_background(const StoreApp &app)
 #if LV_USE_LODEPNG && LV_USE_FS_POSIX
     std::vector<std::string> screenshots = detail_screenshot_paths(g_app_dir, app);
     normalize_detail_image_state(app, screenshots);
-    if (screenshots.empty()) return false;
+    if (screenshots.empty()) {
+        app_tracef("image screenshot missing app=%s images=%s", app.id.c_str(),
+                   app.images.empty() ? "-" : one_line(app.images, 120).c_str());
+        return false;
+    }
 
-    g_render_image_sources.push_back(lvgl_posix_src(screenshots[g_detail_image_index]));
+    std::string src = lvgl_posix_src(screenshots[g_detail_image_index]);
+    g_render_image_sources.push_back(src);
+    app_tracef("image screenshot app=%s index=%d path=%s probe=%s src=%s",
+               app.id.c_str(), g_detail_image_index,
+               screenshots[g_detail_image_index].c_str(),
+               probe_file_for_log(screenshots[g_detail_image_index]).c_str(), src.c_str());
     lv_obj_t *clip = lv_obj_create(g_root);
     lv_obj_remove_style_all(clip);
     lv_obj_set_pos(clip, 0, 0);
@@ -1746,6 +1969,81 @@ void render_progress()
                  &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
+void render_error_dialog()
+{
+    clean_root();
+    draw_system_bar();
+    box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
+
+    box(18, 34, 284, 116, 0x111923, 0xF85149, 2, 4, LV_OPA_COVER);
+    box(18, 34, 284, 23, 0x8B2F34, 0x8B2F34, 0);
+    center_strong_label(g_root, g_error_title.empty() ? "OPERATION FAILED" : g_error_title,
+                        32, 39, 256, 15, &lv_font_montserrat_12, 0xFFFFFF, LV_LABEL_LONG_DOT);
+
+    std::string message = g_error_message.empty() ? "Package operation failed." : g_error_message;
+    center_strong_label(g_root, one_line(message, 38), 30, 68, 260, 15,
+                        &lv_font_montserrat_12, 0xFFD2D2, LV_LABEL_LONG_DOT);
+
+    std::string detail = g_error_detail.empty() ? "Please try again after checking the package state." :
+                         g_error_detail;
+    std::vector<std::string> lines = wrap_display_text(detail, 44);
+    int y = 89;
+    for (size_t i = 0; i < lines.size() && i < 3; ++i) {
+        const auto &line = lines[i];
+        center_label(g_root, one_line(line, 44), 30, y, 260, 12,
+                     &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
+        y += 13;
+    }
+
+    box(118, 128, 84, 17, 0x2EA043, 0xCCCC33, 2, 2);
+    center_strong_label(g_root, "OK", 122, 131, 76, 12, &lv_font_montserrat_10, 0xFFFFFF);
+    center_label(g_root, "Enter OK", 102, 154, 116, 12, &lv_font_montserrat_10, 0xCCCC33);
+}
+
+void render_startup_sync()
+{
+    clean_root();
+    draw_system_bar();
+    box(0, 20, 320, 150, 0x080B10, 0x080B10, 0);
+    box(0, 20, 320, 22, 0x101B2D, 0x101B2D, 0);
+    label(g_root, "Syncing Catalog", 8, 24, 190, 15, &lv_font_montserrat_12, 0xFFFFFF);
+    label(g_root, "Esc Exit", 262, 24, 52, 14, &lv_font_montserrat_10, 0xAECBFA);
+
+    std::string phase = g_sync_status.phase.empty() ? "registry" : g_sync_status.phase;
+    center_strong_label(g_root, upper_ascii(phase), 28, 47, 264, 16,
+                        &lv_font_montserrat_12, 0x58A6FF, LV_LABEL_LONG_DOT);
+
+    std::string url = g_sync_status.url.empty() ? g_region_registry_url : g_sync_status.url;
+    label(g_root, one_line(url, 62), 18, 68, 284, 20,
+          &lv_font_montserrat_10, 0xC9D1D9, LV_LABEL_LONG_DOT);
+
+    box(20, 94, 280, 15, 0x111923, 0x30363D, 1, 3);
+    for (int i = 0; i < 7; ++i) {
+        int x = 24 + i * 39;
+        box(x, 98, 28, 7, 0x162235, 0x162235, 0, 2);
+    }
+    if (g_sync_status.percent >= 0) {
+        int fill = std::max(5, std::min(272, g_sync_status.percent * 272 / 100));
+        box(24, 98, fill, 7, 0x2FEC8D, 0x2FEC8D, 0, 2);
+        int spark = std::max(24, std::min(286, 24 + fill - 4));
+        box(spark, 96, 8, 11, 0xD8FF6A, 0xD8FF6A, 0, 3);
+    } else {
+        int scan = static_cast<int>((lv_tick_get() / 85) % 224);
+        box(24 + scan, 97, 52, 9, 0x2FEC8D, 0xD8FF6A, 1, 3);
+        int tail = std::max(24, 24 + scan - 18);
+        box(tail, 99, 18, 5, 0x1F6FEB, 0x1F6FEB, 0, 2);
+    }
+
+    std::string detail = g_sync_status.detail.empty() ? "Connecting to registry..." : g_sync_status.detail;
+    if (g_sync_status.percent >= 0) detail += " " + std::to_string(g_sync_status.percent) + "%";
+    center_label(g_root, one_line(detail, 52), 18, 119, 284, 14,
+                 &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
+
+    std::string cancel = g_sync_status.cancel_requested ? "Cancelling..." : "S Settings   4 Settings   Esc Exit";
+    center_strong_label(g_root, cancel, 18, 151, 284, 12,
+                        &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+}
+
 void draw_radio_option(int x, int y, const std::string &text, bool selected, bool focused)
 {
     uint32_t border = focused ? 0xCCCC33 : (selected ? 0x58A6FF : 0x6E7681);
@@ -1983,11 +2281,13 @@ void render_screenshots()
 void render()
 {
     switch (g_screen) {
+        case Screen::StartupSync: render_startup_sync(); break;
         case Screen::Home: render_home(); break;
         case Screen::Detail: render_detail(); break;
         case Screen::Confirm: render_confirm(); break;
         case Screen::SudoPassword: render_sudo_password(); break;
         case Screen::Progress: render_progress(); break;
+        case Screen::ErrorDialog: render_error_dialog(); break;
         case Screen::Registry: render_registry(); break;
         case Screen::RegistryEdit: render_registry_edit(); break;
         case Screen::ShareCode: render_share_code(); break;
@@ -2071,8 +2371,18 @@ void refresh_timer_cb(lv_timer_t *)
 void finish_backend_job(const std::string &out, const std::string &rc_text)
 {
     bool ok = trim(rc_text) == "0" && out.find("ERROR") == std::string::npos;
+    std::string finished_action = g_job_action;
+    std::string finished_title = g_job_title.empty() ? "Selected app" : g_job_title;
+    app_tracef("job finish action=%s app=%s rc=%s ok=%d output=%s",
+               g_job_action.c_str(), g_job_app_id.c_str(), rc_text.c_str(), ok ? 1 : 0,
+               one_line(out, 220).c_str());
+    update_local_job_app_state(ok, out);
     if (!ok) {
-        g_status_message = one_line(backend_error_message(out), 54);
+        g_error_title = upper_ascii(job_action_label(finished_action)) + " FAILED";
+        g_error_message = one_line(finished_title, 36);
+        g_error_detail = backend_error_message(out);
+        if (g_error_detail.empty()) g_error_detail = "Package operation failed.";
+        g_status_message.clear();
     } else if (g_job_action == "uninstall" || out.find("UNINSTALLED") != std::string::npos) {
         g_status_message = "Deleted";
     } else if (g_job_action == "upgrade" || out.find("UPGRADED") != std::string::npos) {
@@ -2093,7 +2403,7 @@ void finish_backend_job(const std::string &out, const std::string &rc_text)
     g_job_rc = -1;
     g_job_done = false;
     request_summary_refresh();
-    g_screen = Screen::Detail;
+    g_screen = ok ? Screen::Detail : Screen::ErrorDialog;
 }
 
 void poll_backend_job()
@@ -2126,7 +2436,11 @@ void *backend_job_thread_main(void *)
     else if (g_job_action == "uninstall") flag = "--uninstall";
 
     int rc = -1;
+    app_tracef("job backend start action=%s app=%s flag=%s",
+               g_job_action.c_str(), g_job_app_id.c_str(), flag.c_str());
     std::string out = backend_capture_with_sudo({flag, g_job_app_id}, g_job_sudo_password, &rc);
+    app_tracef("job backend done action=%s app=%s rc=%d bytes=%zu",
+               g_job_action.c_str(), g_job_app_id.c_str(), rc, out.size());
     pthread_mutex_lock(&g_job_mutex);
     g_job_output = out;
     g_job_rc = rc;
@@ -2162,9 +2476,34 @@ void job_timer_cb(lv_timer_t *)
     render();
 }
 
+void update_local_job_app_state(bool ok, const std::string &out)
+{
+    if (!ok || g_job_app_id.empty()) return;
+    for (StoreApp &app : g_apps) {
+        if (app.id != g_job_app_id) continue;
+        if (g_job_action == "uninstall" || out.find("UNINSTALLED") != std::string::npos) {
+            app.installed = false;
+            app.installed_version.clear();
+        } else if (out.find("INSTALLED") != std::string::npos ||
+                   out.find("UPGRADED") != std::string::npos ||
+                   g_job_action == "install" || g_job_action == "reinstall" || g_job_action == "upgrade") {
+            app.installed = true;
+            if (app.installed_version.empty()) app.installed_version = app.version;
+        }
+        app_tracef("job local_state app=%s action=%s installed=%d version=%s out=%s",
+                   app.id.c_str(), g_job_action.c_str(), app.installed ? 1 : 0,
+                   app.installed_version.empty() ? "-" : app.installed_version.c_str(),
+                   one_line(out, 140).c_str());
+        break;
+    }
+}
+
 void navigate_back()
 {
     switch (g_screen) {
+        case Screen::StartupSync:
+            request_quit();
+            break;
         case Screen::Home:
             break;
         case Screen::Detail:
@@ -2187,6 +2526,12 @@ void navigate_back()
             } else {
                 g_screen = Screen::Detail;
             }
+            break;
+        case Screen::ErrorDialog:
+            g_error_title.clear();
+            g_error_message.clear();
+            g_error_detail.clear();
+            g_screen = Screen::Detail;
             break;
         case Screen::Registry:
             g_screen = Screen::Home;
@@ -2312,6 +2657,19 @@ void sync_timer_cb(lv_timer_t *)
     }
     pthread_mutex_unlock(&g_sync_mutex);
     if (running) {
+        if (g_startup_sync_active || g_screen == Screen::StartupSync) {
+            SyncStatus status = load_sync_status();
+            bool changed = status.running != g_sync_status.running ||
+                status.cancel_requested != g_sync_status.cancel_requested ||
+                status.url != g_sync_status.url ||
+                status.detail != g_sync_status.detail ||
+                status.percent != g_sync_status.percent ||
+                status.phase != g_sync_status.phase;
+            g_sync_status = std::move(status);
+            if (changed && g_screen == Screen::StartupSync) {
+                render();
+            }
+        }
         int phase = static_cast<int>((lv_tick_get() / kSyncAnimRefreshMs) % 4);
         if (phase != g_sync_anim_phase) {
             g_sync_anim_phase = phase;
@@ -2328,7 +2686,33 @@ void sync_timer_cb(lv_timer_t *)
     std::fprintf(stderr, "[AppStore UI] sync_timer done bytes=%zu\n", out.size());
     g_sync_anim_phase = -1;
     apply_sync_output(out, refresh_registries_after);
+    if (g_startup_sync_active) {
+        g_startup_sync_active = false;
+        if (g_screen == Screen::StartupSync) {
+            g_screen = Screen::Home;
+        }
+    }
     render();
+}
+
+void cancel_startup_sync_and_open_registry()
+{
+    if (g_startup_sync_active) {
+        g_startup_sync_cancelled = true;
+        cancel_sync();
+        pthread_mutex_lock(&g_sync_mutex);
+        ++g_sync_generation;
+        g_sync_running = false;
+        g_sync_done = false;
+        g_sync_output.clear();
+        g_sync_refresh_registries = false;
+        pthread_mutex_unlock(&g_sync_mutex);
+        g_startup_sync_active = false;
+        g_sync_status.cancel_requested = true;
+        g_sync_status.detail = "Cancelling sync...";
+        g_status_message = "Startup sync cancelled";
+    }
+    open_registry_screen();
 }
 
 void open_registry_screen()
@@ -2928,6 +3312,10 @@ void start_backend_job(const std::string &action, StoreApp *app, const std::stri
     g_job_start_tick = lv_tick_get();
     g_status_message = "Preparing " + one_line(app->name, 18) + "...";
     g_screen = Screen::Progress;
+    app_tracef("job start action=%s app=%s title=%s installed_before=%d version=%s",
+               g_job_action.c_str(), g_job_app_id.c_str(), g_job_title.c_str(),
+               app->installed ? 1 : 0,
+               app->installed_version.empty() ? "-" : app->installed_version.c_str());
     render();
     lv_refr_now(nullptr);
 }
@@ -3015,6 +3403,13 @@ void handle_key(const KeyEvent &key)
         return;
     }
     switch (g_screen) {
+        case Screen::StartupSync:
+            if (key_matches(key, 's', KEY_S) || key_matches(key, '4', KEY_4)) {
+                cancel_startup_sync_and_open_registry();
+            } else if (key_matches(key, 'q', KEY_Q)) {
+                request_quit();
+            }
+            break;
         case Screen::Home:
             if ((key.code == KEY_UP || key.code == KEY_F || key.ch == 'f') && !g_visible.empty()) {
                 g_selected = g_selected == 0 ? static_cast<int>(g_visible.size()) - 1 : g_selected - 1;
@@ -3122,6 +3517,12 @@ void handle_key(const KeyEvent &key)
         case Screen::Progress:
             if (!g_job_running && !g_job_pending_start && key_matches(key, 'b', KEY_B)) {
                 g_screen = Screen::Detail;
+            }
+            break;
+        case Screen::ErrorDialog:
+            if (key.code == KEY_ENTER || key_matches(key, 'y', KEY_Y) ||
+                key_matches(key, 'b', KEY_B)) {
+                navigate_back();
             }
             break;
         case Screen::Registry:
@@ -3271,6 +3672,14 @@ void ui_init(int, char **argv)
     init_runtime_fonts(g_app_dir);
     build_ui();
     update_top_status_cache(true);
+    g_screen = Screen::StartupSync;
+    g_startup_sync_active = true;
+    g_sync_status.detail = "Preparing catalog sync...";
+    g_sync_status.phase = "startup";
+    g_sync_status.url = g_region_registry_url;
+    render();
+    sync_shared_registry_config_on_startup();
+    g_sync_status.url = g_region_registry_url;
     render();
     g_sync_timer = lv_timer_create(sync_timer_cb, kSyncAnimRefreshMs, nullptr);
     g_refresh_timer = lv_timer_create(refresh_timer_cb, 250, nullptr);
