@@ -208,6 +208,7 @@ uint32_t g_sync_visible_until_tick = 0;
 uint64_t g_sync_generation = 0;
 bool g_startup_sync_active = false;
 bool g_startup_sync_cancelled = false;
+bool g_startup_sync_failed = false;
 pthread_mutex_t g_summary_mutex = PTHREAD_MUTEX_INITIALIZER;
 bool g_summary_running = false;
 bool g_summary_done = false;
@@ -849,6 +850,38 @@ bool registry_refresh_is_running()
     bool running = g_registry_refresh_running || g_registry_loading;
     pthread_mutex_unlock(&g_registry_mutex);
     return running;
+}
+
+bool sync_output_failed_for_startup(const std::string &out, std::string *message)
+{
+    std::string fallback;
+    std::istringstream stream(out);
+    std::string line;
+    while (std::getline(stream, line)) {
+        auto fields = split_tab(line);
+        if (fields.empty()) continue;
+        if (fields[0] == "ERROR") {
+            if (fields.size() >= 2 && !fields[1].empty()) {
+                if (message) *message = fields[1];
+            } else if (message) {
+                *message = "Network connection failed";
+            }
+            return true;
+        }
+        if (fields[0] == "SYNC" && fields.size() >= 6) {
+            int cached = std::atoi(fields[3].c_str());
+            int failed = std::atoi(fields[4].c_str());
+            if (!fields[5].empty()) fallback = fields[5];
+            if (cached > 0 || failed > 0) {
+                if (message) {
+                    *message = !fields[5].empty() ? fields[5] : "Network connection failed";
+                }
+                return true;
+            }
+        }
+    }
+    if (message) *message = fallback.empty() ? "Network connection failed" : fallback;
+    return false;
 }
 
 bool sync_is_running()
@@ -2042,6 +2075,30 @@ void render_startup_sync()
     std::string cancel = g_sync_status.cancel_requested ? "Cancelling..." : "S Settings   4 Settings   Esc Exit";
     center_strong_label(g_root, cancel, 18, 151, 284, 12,
                         &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+
+    if (!g_startup_sync_failed) return;
+
+    box(18, 39, 284, 108, 0x111923, 0xF85149, 2, 4, LV_OPA_COVER);
+    box(18, 39, 284, 23, 0x8B2F34, 0x8B2F34, 0);
+    center_strong_label(g_root, g_error_title.empty() ? "NETWORK FAILED" : g_error_title,
+                        32, 44, 256, 15, &lv_font_montserrat_12, 0xFFFFFF, LV_LABEL_LONG_DOT);
+
+    std::string message = g_error_message.empty() ? "Unable to sync catalog." : g_error_message;
+    center_strong_label(g_root, one_line(message, 38), 30, 73, 260, 15,
+                        &lv_font_montserrat_12, 0xFFD2D2, LV_LABEL_LONG_DOT);
+
+    std::string alert_detail = g_error_detail.empty() ? "Check Wi-Fi, then open AppStore again." : g_error_detail;
+    std::vector<std::string> lines = wrap_display_text(alert_detail, 44);
+    int y = 94;
+    for (size_t i = 0; i < lines.size() && i < 2; ++i) {
+        center_label(g_root, one_line(lines[i], 44), 30, y, 260, 12,
+                     &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
+        y += 13;
+    }
+
+    box(118, 124, 84, 17, 0x2EA043, 0xCCCC33, 2, 2);
+    center_strong_label(g_root, "OK", 122, 127, 76, 12, &lv_font_montserrat_10, 0xFFFFFF);
+    center_label(g_root, "Enter OK", 102, 153, 116, 12, &lv_font_montserrat_10, 0xCCCC33);
 }
 
 void draw_radio_option(int x, int y, const std::string &text, bool selected, bool focused)
@@ -2685,12 +2742,28 @@ void sync_timer_cb(lv_timer_t *)
     if (!done) return;
     std::fprintf(stderr, "[AppStore UI] sync_timer done bytes=%zu\n", out.size());
     g_sync_anim_phase = -1;
-    apply_sync_output(out, refresh_registries_after);
     if (g_startup_sync_active) {
         g_startup_sync_active = false;
+        std::string startup_error;
+        if (sync_output_failed_for_startup(out, &startup_error)) {
+            g_startup_sync_failed = true;
+            g_sync_status.running = false;
+            g_sync_status.percent = -1;
+            g_sync_status.phase = "network";
+            g_sync_status.detail = "Network sync failed";
+            g_error_title = "NETWORK FAILED";
+            g_error_message = "Catalog sync failed";
+            g_error_detail = startup_error.empty() ? "Check Wi-Fi, then open AppStore again." : startup_error;
+            g_status_message.clear();
+            render();
+            return;
+        }
+        apply_sync_output(out, refresh_registries_after);
         if (g_screen == Screen::StartupSync) {
             g_screen = Screen::Home;
         }
+    } else {
+        apply_sync_output(out, refresh_registries_after);
     }
     render();
 }
@@ -3404,7 +3477,9 @@ void handle_key(const KeyEvent &key)
     }
     switch (g_screen) {
         case Screen::StartupSync:
-            if (key_matches(key, 's', KEY_S) || key_matches(key, '4', KEY_4)) {
+            if (g_startup_sync_failed && key.code == KEY_ENTER) {
+                request_quit();
+            } else if (!g_startup_sync_failed && (key_matches(key, 's', KEY_S) || key_matches(key, '4', KEY_4))) {
                 cancel_startup_sync_and_open_registry();
             } else if (key_matches(key, 'q', KEY_Q)) {
                 request_quit();
