@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import fcntl
+import functools
 import hashlib
 import io
 import json
@@ -23,6 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
@@ -42,8 +45,10 @@ CACHE_BUST_PARAM = "_cz_appstore_ts"
 _DPKG_STATUS_CACHE: Optional[dict[str, tuple[bool, str]]] = None
 DEBUG_LOG_PATH = Path(os.environ.get("M5APPSTORE_DEBUG_LOG", "/tmp/appstore-backend.log"))
 SERVICE_LOCK = threading.Lock()
+PACKAGE_COMMAND_TIMEOUT_SECONDS = 15 * 60
 SYNC_STATUS_LOCK = threading.Lock()
 SYNC_CANCEL_EVENT = threading.Event()
+PACKAGE_CANCEL_EVENT = threading.Event()
 SYNC_STATUS: dict[str, Any] = {
     "running": False,
     "cancel_requested": False,
@@ -78,7 +83,7 @@ def app_root() -> Path:
 
 
 def cache_dir() -> Path:
-    return Path(os.environ.get("M5APPSTORE_CACHE_DIR", "/var/cache/APPLaunch")).expanduser()
+    return Path(os.environ.get("M5APPSTORE_CACHE_DIR", "~/.cache/cardputerzero-appstore")).expanduser()
 
 
 def config_path() -> Path:
@@ -87,6 +92,45 @@ def config_path() -> Path:
 
 def installed_path() -> Path:
     return state_dir() / "installed.json"
+
+
+def pending_package_path() -> Path:
+    return state_dir() / "pending-package.json"
+
+
+def completed_package_path() -> Path:
+    return state_dir() / "completed-package.json"
+
+
+def completed_package_records() -> dict[str, Any]:
+    data = read_json(completed_package_path(), {})
+    if not isinstance(data, dict):
+        return {}
+    if data.get("transaction_id"):
+        return {str(data["transaction_id"]): data}
+    return data
+
+
+def record_completed_package(transaction_id: str, action: str, app_id: str,
+                             package: str, version: str) -> None:
+    records = completed_package_records()
+    records[transaction_id] = {
+        "transaction_id": transaction_id, "action": action, "app_id": app_id,
+        "package": package, "version": version, "completed_at": now_text(),
+    }
+    if len(records) > 32:
+        records = dict(sorted(records.items(), key=lambda item: item[1].get("completed_at", ""))[-32:])
+    write_json(completed_package_path(), records)
+
+
+def package_transaction_locked(function):
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        state_dir().mkdir(parents=True, exist_ok=True)
+        with (state_dir() / "package-transaction.lock").open("a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            return function(*args, **kwargs)
+    return wrapped
 
 
 def now_text() -> str:
@@ -508,6 +552,8 @@ def download_file(url: str, dest: Path, progress_stage: str = "", resume: bool =
         next_emit = 0
         with dest.open(mode) as handle:
             while True:
+                if PACKAGE_CANCEL_EVENT.is_set():
+                    raise RuntimeError("package preparation cancelled")
                 chunk = response.read(256 * 1024)
                 if not chunk:
                     break
@@ -1353,6 +1399,25 @@ def download_deb(app: dict[str, Any]) -> Path:
     return dest
 
 
+def deb_file_field(path: Path, field: str) -> str:
+    tool = shutil.which("dpkg-deb")
+    if not tool:
+        raise RuntimeError("dpkg-deb is required to inspect package version")
+    result = subprocess.run([tool, "-f", str(path), field], check=False,
+                            capture_output=True, text=True, timeout=30)
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(command_error(result))
+    return result.stdout.strip()
+
+
+def deb_file_version(path: Path) -> str:
+    return deb_file_field(path, "Version")
+
+
+def deb_file_package(path: Path) -> str:
+    return deb_file_field(path, "Package")
+
+
 def command_error(result: subprocess.CompletedProcess[str]) -> str:
     text = (result.stdout or "") + (result.stderr or "")
     text = text.strip()
@@ -1362,32 +1427,114 @@ def command_error(result: subprocess.CompletedProcess[str]) -> str:
 
 
 def package_command_args(args: list[str]) -> list[str]:
-    if os.geteuid() == 0:
-        return args
-    sudo = shutil.which("sudo")
-    if not sudo:
-        raise RuntimeError("root privileges are required for package operations")
-    password = os.environ.get("M5APPSTORE_SUDO_PASSWORD")
-    if password is not None:
-        return [sudo, "-S", "-p", "", "env", "DEBIAN_FRONTEND=noninteractive", *args]
-    return [sudo, "-n", "env", "DEBIAN_FRONTEND=noninteractive", *args]
+    if os.geteuid() != 0:
+        raise RuntimeError("package operations must run through the privileged helper")
+    return args
 
 
 def run_package_command(args: list[str]) -> None:
     env = os.environ.copy()
     env["DEBIAN_FRONTEND"] = "noninteractive"
-    password = env.get("M5APPSTORE_SUDO_PASSWORD")
-    input_text = f"{password}\n" if os.geteuid() != 0 and password is not None else None
     result = subprocess.run(
         package_command_args(args),
         check=False,
         capture_output=True,
         text=True,
         env=env,
-        input=input_text,
+        timeout=PACKAGE_COMMAND_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
         raise RuntimeError(command_error(result))
+
+
+def repair_desktop_as_root(desktop_value: str, exec_values: list[str]) -> str:
+    if not desktop_value:
+        return ""
+    desktop = Path(desktop_value)
+    allowed_root = Path("/usr/share/APPLaunch/applications").resolve()
+    try:
+        resolved = desktop.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"desktop entry unavailable: {exc}") from exc
+    if resolved.parent != allowed_root or resolved.suffix != ".desktop":
+        raise RuntimeError("desktop entry is outside the APPLaunch applications directory")
+    for exec_value in exec_values:
+        binary = exec_binary_path(exec_value)
+        if binary and Path(binary).is_absolute() and is_executable_file(binary):
+            rewrite_desktop_exec(resolved, binary)
+            return binary
+    raise RuntimeError("no installed executable found for desktop entry")
+
+
+def mark_package_helper_complete(transaction_id: str, pending_path_value: str = "") -> None:
+    if not transaction_id:
+        return
+    path = Path(pending_path_value) if pending_path_value else pending_package_path()
+    data = read_json(path, {})
+    pending = data if isinstance(data, dict) else {}
+    if str(pending.get("transaction_id") or "") != transaction_id:
+        raise RuntimeError("package transaction changed while helper was running")
+    pending["helper_completed"] = True
+    pending["helper_completed_at"] = now_text()
+    write_json(path, pending)
+
+
+@package_transaction_locked
+def package_helper(action: str, value: str, reinstall: bool = False,
+                   desktop: str = "", exec_values: Optional[list[str]] = None,
+                   transaction_id: str = "", pending_path_value: str = "") -> int:
+    if os.geteuid() != 0:
+        emit("ERROR", "package helper requires root")
+        return 1
+    try:
+        repair_dpkg_state()
+        if action == "install":
+            if shutil.which("apt-get"):
+                args = ["apt-get", "-y"]
+                if reinstall:
+                    args.append("--reinstall")
+                args += ["install", value]
+            elif shutil.which("dpkg"):
+                args = ["dpkg", "-i", value]
+            else:
+                raise RuntimeError("apt-get or dpkg is required to install deb packages")
+        elif action == "uninstall":
+            if shutil.which("apt-get"):
+                args = ["apt-get", "-y", "remove", value]
+            elif shutil.which("dpkg"):
+                args = ["dpkg", "-r", value]
+            else:
+                raise RuntimeError("apt-get or dpkg is required to uninstall deb packages")
+        else:
+            raise RuntimeError("unsupported package helper action")
+        env = os.environ.copy()
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        try:
+            result = subprocess.run(args, check=False, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, env=env,
+                                    timeout=PACKAGE_COMMAND_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            detail = compact_error(exc.stdout or exc.stderr or "")
+            emit("ERROR", "package command timed out" + (f": {detail}" if detail else ""), 124)
+            return 124
+        if result.stdout:
+            sys.stdout.write(result.stdout)
+        if result.returncode != 0:
+            detail = compact_error(result.stdout or "")
+            emit("ERROR", detail or "package command failed", result.returncode)
+            return result.returncode
+        if action == "install" and desktop:
+            try:
+                repaired_exec = repair_desktop_as_root(desktop, exec_values or [])
+                if repaired_exec:
+                    emit("REPAIRED_EXEC", repaired_exec)
+            except Exception as exc:
+                emit("WARNING", f"desktop repair failed: {exc}")
+        mark_package_helper_complete(transaction_id, pending_path_value)
+        return 0
+    except Exception as exc:
+        emit("ERROR", str(exc), 1)
+        return 1
 
 
 def repair_dpkg_state() -> None:
@@ -1398,6 +1545,7 @@ def repair_dpkg_state() -> None:
         check=False,
         capture_output=True,
         text=True,
+        timeout=60,
     )
     if (audit.stdout or audit.stderr).strip():
         emit("PROGRESS", "apt", 0, 0, -1, "Repairing package database")
@@ -1405,8 +1553,10 @@ def repair_dpkg_state() -> None:
 
 
 def package_files(package: str) -> list[str]:
-    if not package or not shutil.which("dpkg-query"):
-        return []
+    if not package:
+        raise RuntimeError("deb package name missing")
+    if not shutil.which("dpkg-query"):
+        raise RuntimeError("dpkg-query is required to inspect installed package files")
     result = subprocess.run(
         ["dpkg-query", "-L", package],
         check=False,
@@ -1414,98 +1564,329 @@ def package_files(package: str) -> list[str]:
         text=True,
     )
     if result.returncode != 0:
-        return []
+        raise RuntimeError(command_error(result))
     return [line for line in result.stdout.splitlines() if line.startswith("/")]
 
 
-def uninstall(app_id: str) -> int:
-    app = find_app(app_id)
-    records = installed_records()
-    key = app_key(app) if app else app_id
-    record = records.pop(key, {})
-    if key != app_id:
-        records.pop(app_id, None)
-    package = deb_package_name(app) if app else ""
-    if not package and isinstance(record, dict):
-        package = str(record.get("package") or "")
-    if not package:
-        emit("ERROR", "deb package name missing", app_id)
-        return 1
+def pending_package_job() -> dict[str, Any]:
+    data = read_json(pending_package_path(), {})
+    return data if isinstance(data, dict) else {}
+
+
+def _write_pending_package_job(action: str, app: dict[str, Any], package: str,
+                               deb_path: str = "", expected_package_version: str = "") -> None:
+    existing = pending_package_job()
+    if existing:
+        raise RuntimeError(
+            f"another package transaction is pending: {existing.get('app_id') or 'unknown'}"
+        )
+    installed, previous_version = package_state(package)
+    write_json(pending_package_path(), {
+        "schema_version": 2,
+        "transaction_id": uuid.uuid4().hex,
+        "action": action,
+        "app_id": app_key(app),
+        "package": package,
+        "expected_version": str(app.get("version") or ""),
+        "expected_package_version": expected_package_version,
+        "previously_installed": installed,
+        "previous_version": previous_version,
+        "deb_path": deb_path,
+        "helper_completed": False,
+        "app_snapshot": {
+            "id": app_key(app),
+            "share_code": str(app.get("share_code") or ""),
+            "title": app.get("title") or app_key(app),
+            "version": str(app.get("version") or ""),
+            "download": dict(app.get("download") or {}),
+            "applaunch": dict(app.get("applaunch") or {}),
+        },
+        "created_at": now_text(),
+    })
+
+
+@package_transaction_locked
+def write_pending_package_job(action: str, app: dict[str, Any], package: str,
+                              deb_path: str = "", expected_package_version: str = "") -> None:
+    _write_pending_package_job(action, app, package, deb_path, expected_package_version)
+
+
+def clear_pending_package_job() -> None:
+    pending_package_path().unlink(missing_ok=True)
+
+
+def package_state(package: str) -> tuple[bool, str]:
+    if not shutil.which("dpkg-query"):
+        raise RuntimeError("dpkg-query is required to verify package state")
+    invalidate_dpkg_status_cache("verify")
+    return package_installed(package), package_version(package)
+
+
+def update_installed_record(app: dict[str, Any], package: str, version: str,
+                            deb_path: str) -> list[str]:
+    files = package_files(package)
+    repaired_exec = ""
     try:
-        repair_dpkg_state()
-        if shutil.which("apt-get"):
-            emit("PROGRESS", "uninstall", 0, 0, -1, "Removing package")
-            run_package_command(["apt-get", "-y", "remove", package])
-        elif shutil.which("dpkg"):
-            emit("PROGRESS", "uninstall", 0, 0, -1, "Removing package")
-            run_package_command(["dpkg", "-r", package])
-        else:
-            raise RuntimeError("apt-get or dpkg is required to uninstall deb packages")
-        invalidate_dpkg_status_cache("uninstall")
-        write_json(installed_path(), records)
-        emit("PROGRESS", "uninstall", 1, 1, 100, "Remove complete")
-        emit("UNINSTALLED", app_id)
-        return 0
+        repaired_exec = repair_applaunch_desktop(app, files)
+        if not repaired_exec:
+            emit("WARNING", "desktop entry was not repaired")
     except Exception as exc:
-        emit("ERROR", str(exc))
-        return 1
+        emit("WARNING", f"desktop repair failed: {exc}")
+    records = installed_records()
+    records[app_key(app)] = {
+        "installed_at": now_text(),
+        "title": localized_text(app, "title", resolve_locale()) or app.get("title"),
+        "version": version,
+        "package": package,
+        "deb_path": deb_path,
+        "exec": repaired_exec or applaunch_exec(app),
+        "files": files,
+    }
+    write_json(installed_path(), records)
+    return files
+
+
+@package_transaction_locked
+def reconcile_pending_package_job(emit_result: bool = False) -> bool:
+    pending = pending_package_job()
+    if not pending:
+        return True
+    action = str(pending.get("action") or "")
+    app_id = str(pending.get("app_id") or "")
+    package = str(pending.get("package") or "")
+    if not action or not app_id or not package:
+        emit("WARNING", "pending package transaction is invalid and was retained")
+        return False
+    app = find_app(app_id)
+    if not app and isinstance(pending.get("app_snapshot"), dict):
+        app = pending["app_snapshot"]
+    if not app:
+        emit("WARNING", f"pending package transaction cannot find app: {app_id}")
+        return False
+    try:
+        installed, version = package_state(package)
+        if int(pending.get("schema_version") or 1) >= 2 and not pending.get("helper_completed"):
+            emit("WARNING", f"{action} outcome is not known; transaction was retained")
+            return False
+        if action == "uninstall":
+            if installed:
+                update_installed_record(app, package, version,
+                                        str(pending.get("deb_path") or ""))
+                emit("WARNING", f"uninstall was not applied; restored installed record for {package}")
+                if int(pending.get("schema_version") or 1) >= 2:
+                    return False
+            else:
+                records = installed_records()
+                records.pop(app_key(app), None)
+                records.pop(app_id, None)
+                write_json(installed_path(), records)
+        else:
+            if not installed or not version:
+                if int(pending.get("schema_version") or 1) >= 2:
+                    emit("WARNING", f"{action} package state verification failed; transaction was retained")
+                    return False
+                records = installed_records()
+                records.pop(app_key(app), None)
+                records.pop(app_id, None)
+                write_json(installed_path(), records)
+                emit("WARNING", f"{action} was not applied; cleared stale record for {package}")
+            elif pending.get("helper_completed") or (
+                int(pending.get("schema_version") or 1) < 2 and
+                action == "install" and not pending.get("previously_installed")
+            ):
+                expected = str(pending.get("expected_package_version") or "")
+                if int(pending.get("schema_version") or 1) >= 2 and (
+                        not expected or version != expected):
+                    emit("WARNING", f"{action} did not install the expected package version; transaction was retained")
+                    return False
+                update_installed_record(app, package, version,
+                                        str(pending.get("deb_path") or ""))
+            else:
+                emit("WARNING", f"{action} outcome is not known; transaction was retained")
+                return False
+        record_completed_package(str(pending.get("transaction_id") or ""), action,
+                                 app_id, package, version)
+        clear_pending_package_job()
+        if emit_result:
+            emit("PACKAGE_RESULT", action, app_id, package, version)
+        return True
+    except Exception as exc:
+        emit("WARNING", f"pending package reconciliation failed: {exc}")
+        return False
+
+
+def uninstall(app_id: str) -> int:
+    return run_legacy_package_job("uninstall", app_id)
 
 
 def install(app_id: str, reinstall: bool = False, upgrade: bool = False) -> int:
+    return run_legacy_package_job("upgrade" if upgrade else ("reinstall" if reinstall else "install"), app_id)
+
+
+@package_transaction_locked
+def prepare_package_job(action: str, app_id: str) -> int:
+    PACKAGE_CANCEL_EVENT.clear()
     app = find_app(app_id)
     if not app:
         emit("ERROR", "app not found", app_id)
         return 1
     try:
+        existing = pending_package_job()
+        if existing:
+            if (str(existing.get("action") or "") != action or
+                    str(existing.get("app_id") or "") not in (app_id, app_key(app)) or
+                    existing.get("helper_completed")):
+                raise RuntimeError(
+                    f"another package transaction is pending: {existing.get('app_id') or 'unknown'}"
+                )
+            package = str(existing.get("package") or "")
+            transaction_id = str(existing.get("transaction_id") or "")
+            if action == "uninstall":
+                emit("PACKAGE_JOB", "uninstall", package, "0", "", transaction_id,
+                     str(pending_package_path()))
+            else:
+                if not existing.get("expected_package_version"):
+                    deb_path = Path(str(existing.get("deb_path") or ""))
+                    if not deb_path.is_file():
+                        snapshot = existing.get("app_snapshot")
+                        if not isinstance(snapshot, dict) or not snapshot.get("download"):
+                            raise RuntimeError("pending package cache is missing; restart the transaction")
+                        deb_path = download_deb(snapshot)
+                        existing["deb_path"] = str(deb_path)
+                    if deb_file_package(deb_path) != package:
+                        raise RuntimeError("cached deb package does not match pending transaction")
+                    existing["expected_package_version"] = deb_file_version(deb_path)
+                    write_json(pending_package_path(), existing)
+                candidates = candidate_execs(app, [])
+                candidates += [f"/usr/lib/{package}/{package}_zero_device",
+                               f"/usr/bin/{package}", f"/usr/lib/{package}/{package}"]
+                emit("PACKAGE_JOB", "install", str(existing.get("deb_path") or ""),
+                     "1" if action == "reinstall" else "0", str(desktop_path_for(app)),
+                     transaction_id, str(pending_package_path()), *dict.fromkeys(candidates))
+            return 0
+        if action == "uninstall":
+            records = installed_records()
+            record = records.get(app_key(app), records.get(app_id, {}))
+            package = str(record.get("package") or "") if isinstance(record, dict) else ""
+            if not package:
+                package = deb_package_name(app)
+            if not package:
+                raise RuntimeError("deb package name missing")
+            _write_pending_package_job(action, app, package)
+            transaction_id = str(pending_package_job().get("transaction_id") or "")
+            emit("PACKAGE_JOB", "uninstall", package, "0", "", transaction_id,
+                 str(pending_package_path()))
+            return 0
+        if action not in ("install", "reinstall", "upgrade"):
+            raise RuntimeError("unsupported package action")
         if not is_installable(app):
             raise RuntimeError("only approved apps can be installed")
         deb_path = download_deb(app)
+        expected_package_version = deb_file_version(deb_path)
         package = deb_package_name(app)
         if not package:
             raise RuntimeError("deb package name missing")
-        repair_dpkg_state()
-        stage = "upgrade" if upgrade else "install"
-        operation = "Upgrading" if upgrade else "Installing"
-        complete = "Upgrade complete" if upgrade else "Install complete"
-        if shutil.which("apt-get"):
-            args = ["apt-get", "-y"]
-            if reinstall:
-                args.append("--reinstall")
-            args += ["install", str(deb_path)]
-            emit("PROGRESS", stage, 0, 0, -1, f"{operation} package")
-            run_package_command(args)
-        elif shutil.which("dpkg"):
-            emit("PROGRESS", stage, 0, 0, -1, f"{operation} package")
-            run_package_command(["dpkg", "-i", str(deb_path)])
-        else:
-            raise RuntimeError("apt-get or dpkg is required to install deb packages")
-        invalidate_dpkg_status_cache(stage)
-        records = installed_records()
-        files = package_files(package)
-        repaired_exec = repair_applaunch_desktop(app, files)
-        installed_now = package_installed(package)
-        installed_now_version = package_version(package)
-        log_debug(
-            "install package result "
-            f"app={app_key(app)} package={package} installed={int(installed_now)} "
-            f"version={installed_now_version or '-'} files={len(files)} exec={repaired_exec or applaunch_exec(app) or '-'}"
-        )
-        records[app_key(app)] = {
-            "installed_at": now_text(),
-            "title": localized_text(app, "title", resolve_locale()) or app.get("title"),
-            "version": app.get("version") or "",
-            "package": package,
-            "deb_path": str(deb_path),
-            "exec": repaired_exec or applaunch_exec(app),
-            "files": files,
-        }
-        write_json(installed_path(), records)
-        emit("PROGRESS", stage, 1, 1, 100, complete)
-        emit("UPGRADED" if upgrade else "INSTALLED", app_key(app), localized_text(app, "title", resolve_locale()) or app_key(app))
+        if deb_file_package(deb_path) != package:
+            raise RuntimeError("downloaded deb package name does not match registry metadata")
+        candidates = candidate_execs(app, [])
+        candidates += [f"/usr/lib/{package}/{package}_zero_device",
+                       f"/usr/bin/{package}", f"/usr/lib/{package}/{package}"]
+        _write_pending_package_job(action, app, package, str(deb_path), expected_package_version)
+        transaction_id = str(pending_package_job().get("transaction_id") or "")
+        emit("PACKAGE_JOB", "install", str(deb_path), "1" if action == "reinstall" else "0",
+             str(desktop_path_for(app)), transaction_id, str(pending_package_path()),
+             *dict.fromkeys(candidates))
         return 0
     except Exception as exc:
-        emit("ERROR", str(exc))
+        emit("ERROR", str(exc), 1)
         return 1
+
+
+@package_transaction_locked
+def finalize_package_job(action: str, app_id: str, transaction_id: str = "") -> int:
+    app = find_app(app_id)
+    try:
+        pending = pending_package_job()
+        if not pending:
+            completed = completed_package_records().get(transaction_id, {})
+            completed_key = app_key(app) if app else app_id
+            if (isinstance(completed, dict) and transaction_id and
+                    str(completed.get("transaction_id") or "") == transaction_id and
+                    str(completed.get("action") or "") == action and
+                    str(completed.get("app_id") or "") in (app_id, completed_key)):
+                emit("PACKAGE_RESULT", action, completed_key, completed.get("package", ""),
+                     completed.get("version", ""))
+                return 0
+            raise RuntimeError("no pending package transaction")
+        if not app and isinstance(pending.get("app_snapshot"), dict):
+            app = pending["app_snapshot"]
+        if not app:
+            raise RuntimeError(f"app not found: {app_id}")
+        key = app_key(app)
+        if not transaction_id or str(pending.get("transaction_id") or "") != transaction_id:
+            raise RuntimeError("pending package transaction id does not match finalize request")
+        if int(pending.get("schema_version") or 1) >= 2 and not pending.get("helper_completed"):
+            raise RuntimeError("package helper completion was not recorded")
+        package = str(pending.get("package") or deb_package_name(app))
+        if pending and (str(pending.get("action") or "") != action or
+                        str(pending.get("app_id") or "") not in (app_id, key)):
+            raise RuntimeError("pending package transaction does not match finalize request")
+        installed, actual_version = package_state(package)
+        if action == "uninstall":
+            if installed:
+                raise RuntimeError(f"package is still installed after uninstall: {package}")
+            records = installed_records()
+            records.pop(key, None)
+            records.pop(app_id, None)
+            write_json(installed_path(), records)
+            record_completed_package(transaction_id, action, app_id, package, "")
+            clear_pending_package_job()
+            emit("PROGRESS", "uninstall", 1, 1, 100, "Remove complete")
+            emit("UNINSTALLED", app_id)
+            emit("PACKAGE_RESULT", action, key, package, "")
+            return 0
+        if action not in ("install", "reinstall", "upgrade"):
+            raise RuntimeError("unsupported package action")
+        if not installed or not actual_version:
+            raise RuntimeError(f"package is not installed after {action}: {package}")
+        expected = str(pending.get("expected_package_version") or "")
+        if int(pending.get("schema_version") or 1) >= 2 and (
+                not expected or actual_version != expected):
+            raise RuntimeError(f"{action} did not install the expected package version")
+        deb_path = str(pending.get("deb_path") or deb_cache_path(download_url(app)))
+        update_installed_record(app, package, actual_version, deb_path)
+        record_completed_package(transaction_id, action, key, package, actual_version)
+        clear_pending_package_job()
+        stage = "upgrade" if action == "upgrade" else "install"
+        emit("PROGRESS", stage, 1, 1, 100,
+             "Upgrade complete" if action == "upgrade" else "Install complete")
+        emit("UPGRADED" if action == "upgrade" else "INSTALLED", key,
+             localized_text(app, "title", resolve_locale()) or key)
+        emit("PACKAGE_RESULT", action, key, package, actual_version)
+        return 0
+    except Exception as exc:
+        emit("ERROR", str(exc), 1)
+        return 1
+
+
+def run_legacy_package_job(action: str, app_id: str) -> int:
+    if os.geteuid() != 0:
+        emit("ERROR", "legacy package operations require root", 1)
+        return 1
+    if prepare_package_job(action, app_id) != 0:
+        return 1
+    pending = pending_package_job()
+    package = str(pending.get("package") or "")
+    value = package if action == "uninstall" else str(pending.get("deb_path") or "")
+    app = find_app(app_id)
+    desktop = str(desktop_path_for(app)) if app and action != "uninstall" else ""
+    candidates = candidate_execs(app, []) if app and action != "uninstall" else []
+    helper_action = "uninstall" if action == "uninstall" else "install"
+    transaction_id = str(pending.get("transaction_id") or "")
+    if package_helper(helper_action, value, action == "reinstall", desktop, candidates,
+                      transaction_id) != 0:
+        return 1
+    return finalize_package_job(action, app_id, transaction_id)
 
 
 def add_registry(url: str, name: str = "") -> int:
@@ -1684,6 +2065,15 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--reinstall")
     parser.add_argument("--upgrade")
     parser.add_argument("--uninstall")
+    parser.add_argument("--prepare-package", nargs=2, metavar=("ACTION", "APP_ID"))
+    parser.add_argument("--finalize-package", nargs=3, metavar=("ACTION", "APP_ID", "TRANSACTION_ID"))
+    parser.add_argument("--package-helper", choices=("install", "uninstall"))
+    parser.add_argument("--package-value")
+    parser.add_argument("--package-reinstall", action="store_true")
+    parser.add_argument("--package-desktop")
+    parser.add_argument("--package-exec", action="append", default=[])
+    parser.add_argument("--package-transaction")
+    parser.add_argument("--package-pending-path")
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--port", type=int, default=8895)
     return parser.parse_args(argv)
@@ -1748,6 +2138,11 @@ def execute_args(args: argparse.Namespace) -> int:
         return install(args.upgrade, upgrade=True)
     if args.uninstall:
         return uninstall(args.uninstall)
+    if args.prepare_package:
+        return prepare_package_job(args.prepare_package[0], args.prepare_package[1])
+    if args.finalize_package:
+        return finalize_package_job(args.finalize_package[0], args.finalize_package[1],
+                                    args.finalize_package[2])
     summary()
     return 0
 
@@ -1785,6 +2180,15 @@ class AppStoreRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:
+        if self.path == "/cancel-package":
+            PACKAGE_CANCEL_EVENT.set()
+            raw = b"OK\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if self.path == "/cancel-sync":
             request_sync_cancel()
             buffer = io.StringIO()
@@ -1804,9 +2208,8 @@ class AppStoreRequestHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or "0")
             body = self.rfile.read(length).decode("utf-8")
             fields = split_tsv_line(body.splitlines()[0] if body else "")
-            password = fields[0] if fields else ""
-            argv = fields[1:] if len(fields) > 1 else []
-            output, rc = run_service_command(argv, password)
+            argv = fields
+            output, rc = run_service_command(argv)
             raw = output.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/tab-separated-values; charset=utf-8")
@@ -1825,19 +2228,14 @@ class AppStoreRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(output)
 
 
-def run_service_command(argv: list[str], password: str) -> tuple[str, int]:
+def run_service_command(argv: list[str]) -> tuple[str, int]:
     with SERVICE_LOCK:
         old_argv = sys.argv[:]
-        old_password = os.environ.get("M5APPSTORE_SUDO_PASSWORD")
-        if password:
-            os.environ["M5APPSTORE_SUDO_PASSWORD"] = password
-        elif "M5APPSTORE_SUDO_PASSWORD" in os.environ:
-            del os.environ["M5APPSTORE_SUDO_PASSWORD"]
         buffer = io.StringIO()
         rc = 1
         try:
             sys.argv = [old_argv[0], *argv]
-            log_debug(f"http run argv={shlex.join(argv)} password_len={len(password)}")
+            log_debug(f"http run argv={shlex.join(argv)}")
             args = parse_args(argv)
             with contextlib.redirect_stdout(buffer):
                 rc = execute_args(args)
@@ -1849,15 +2247,12 @@ def run_service_command(argv: list[str], password: str) -> tuple[str, int]:
             log_debug(f"http command exception argv={shlex.join(argv)} error={compact_error(exc)}")
         finally:
             sys.argv = old_argv
-            if old_password is None:
-                os.environ.pop("M5APPSTORE_SUDO_PASSWORD", None)
-            else:
-                os.environ["M5APPSTORE_SUDO_PASSWORD"] = old_password
         return buffer.getvalue(), rc
 
 
 def serve(port: int) -> int:
     ensure_dirs()
+    reconcile_pending_package_job()
     address = ("127.0.0.1", int(port))
     log_debug(
         f"serve start host={address[0]} port={address[1]} app_root={app_root()} "
@@ -1872,8 +2267,17 @@ def serve(port: int) -> int:
 
 
 def main() -> int:
-    ensure_dirs()
     args = parse_args()
+    if args.package_helper:
+        if not args.package_value:
+            emit("ERROR", "package helper value missing")
+            return 1
+        if args.package_pending_path:
+            os.environ["M5APPSTORE_STATE_DIR"] = str(Path(args.package_pending_path).parent)
+        return package_helper(args.package_helper, args.package_value, args.package_reinstall,
+                              args.package_desktop or "", args.package_exec,
+                              args.package_transaction or "", args.package_pending_path or "")
+    ensure_dirs()
     log_debug(
         "main "
         f"argv={shlex.join(sys.argv[1:])} app_root={app_root()} cache_dir={cache_dir()} "

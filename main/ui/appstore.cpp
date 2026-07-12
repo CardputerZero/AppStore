@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <functional>
 #include <list>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -61,7 +62,6 @@ enum class Screen {
     Home,
     Detail,
     Confirm,
-    SudoPassword,
     Progress,
     ErrorDialog,
     Registry,
@@ -69,6 +69,13 @@ enum class Screen {
     ShareCode,
     Search,
     Screenshots,
+};
+
+enum class JobPhase {
+    Idle,
+    Prepare,
+    Sudo,
+    Finalize,
 };
 
 enum class RegistryOpKind {
@@ -148,13 +155,9 @@ Screen g_screen = Screen::Home;
 bool g_default_category_applied = false;
 SortRule g_sort_rule = SortRule::Default;
 std::string g_confirm_action;
+std::string g_confirm_app_id;
 std::vector<std::string> g_confirm_lines;
 int g_confirm_focus = 0;
-std::string g_sudo_password_input;
-std::string g_sudo_message = "Enter sudo password for package operation.";
-std::string g_sudo_action;
-std::string g_sudo_app_id;
-std::string g_sudo_app_title;
 std::string g_error_title;
 std::string g_error_message;
 std::string g_error_detail;
@@ -187,12 +190,21 @@ std::string g_job_title;
 std::string g_job_stage;
 std::string g_job_detail;
 std::string g_job_output;
-std::string g_job_sudo_password;
+std::string g_job_helper_action;
+std::string g_job_helper_value;
+std::string g_job_helper_desktop;
+std::string g_job_transaction_id;
+std::string g_job_pending_path;
+std::vector<std::string> g_job_helper_execs;
+bool g_job_helper_reinstall = false;
+uint64_t g_job_sudo_request_id = 0;
+JobPhase g_job_phase = JobPhase::Idle;
 int g_job_progress = -1;
 int g_job_rc = -1;
 pthread_t g_job_thread = {};
 uint32_t g_job_start_tick = 0;
 bool g_job_done = false;
+bool g_job_cancel_requested = false;
 uint32_t g_share_code_open_tick = 0;
 uint32_t g_esc_press_tick = 0;
 bool g_esc_pressed = false;
@@ -234,6 +246,7 @@ bool g_plan_running = false;
 bool g_plan_done = false;
 std::string g_plan_action;
 std::string g_plan_app_id;
+Screen g_plan_origin_screen = Screen::Detail;
 std::string g_plan_output;
 int g_plan_rc = -1;
 cp0_wifi_status_t g_top_wifi_status = {};
@@ -252,7 +265,6 @@ const char *screen_name(Screen screen)
         case Screen::Home: return "Home";
         case Screen::Detail: return "Detail";
         case Screen::Confirm: return "Confirm";
-        case Screen::SudoPassword: return "SudoPassword";
         case Screen::Progress: return "Progress";
         case Screen::ErrorDialog: return "ErrorDialog";
         case Screen::Registry: return "Registry";
@@ -1936,34 +1948,6 @@ void render_confirm()
                         &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
 }
 
-void render_sudo_password()
-{
-    clean_root();
-    draw_system_bar();
-    box(0, 20, 320, 150, 0x0D1117, 0x0D1117, 0);
-    box(22, 37, 276, 105, 0x111923, 0xCCCC33, 2, 3, LV_OPA_COVER);
-    box(22, 37, 276, 23, 0x7A5C00, 0x7A5C00, 0);
-    center_strong_label(g_root, "SUDO PASSWORD", 42, 42, 236, 15,
-                        &lv_font_montserrat_12, 0xFFFFFF);
-
-    std::string verb = upper_ascii(job_action_label(g_sudo_action.empty() ? g_confirm_action : g_sudo_action));
-    center_label(g_root, one_line(verb + " " + g_sudo_app_title, 36), 34, 66, 252, 14,
-                 &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_DOT);
-
-    box(50, 86, 220, 30, 0x0D1117, 0xCCCC33, 1, 2);
-    std::string masked(g_sudo_password_input.size(), '*');
-    if (masked.empty()) masked = "password";
-    center_strong_label(g_root, one_line(masked, 24), 58, 94, 204, 15,
-                        &lv_font_montserrat_12,
-                        g_sudo_password_input.empty() ? 0x6E7681 : 0xFFFFFF,
-                        LV_LABEL_LONG_DOT);
-
-    center_label(g_root, one_line(g_sudo_message, 44), 34, 122, 252, 12,
-                 &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
-    label(g_root, "Enter Run   Backspace Delete   Esc Back", 10, 153, 300, 12,
-          &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
-}
-
 void render_progress()
 {
     clean_root();
@@ -2342,7 +2326,6 @@ void render()
         case Screen::Home: render_home(); break;
         case Screen::Detail: render_detail(); break;
         case Screen::Confirm: render_confirm(); break;
-        case Screen::SudoPassword: render_sudo_password(); break;
         case Screen::Progress: render_progress(); break;
         case Screen::ErrorDialog: render_error_dialog(); break;
         case Screen::Registry: render_registry(); break;
@@ -2427,7 +2410,17 @@ void refresh_timer_cb(lv_timer_t *)
 
 void finish_backend_job(const std::string &out, const std::string &rc_text)
 {
-    bool ok = trim(rc_text) == "0" && out.find("ERROR") == std::string::npos;
+    bool has_result = false;
+    std::istringstream result_lines(out);
+    std::string result_line;
+    while (std::getline(result_lines, result_line)) {
+        auto fields = split_tab(result_line);
+        if (!fields.empty() && fields[0] == "PACKAGE_RESULT") {
+            has_result = true;
+            break;
+        }
+    }
+    bool ok = trim(rc_text) == "0" && has_result;
     std::string finished_action = g_job_action;
     std::string finished_title = g_job_title.empty() ? "Selected app" : g_job_title;
     app_tracef("job finish action=%s app=%s rc=%s ok=%d output=%s",
@@ -2456,11 +2449,121 @@ void finish_backend_job(const std::string &out, const std::string &rc_text)
     g_job_stage.clear();
     g_job_detail.clear();
     g_job_output.clear();
-    g_job_sudo_password.clear();
+    g_job_helper_action.clear();
+    g_job_helper_value.clear();
+    g_job_helper_desktop.clear();
+    g_job_transaction_id.clear();
+    g_job_pending_path.clear();
+    g_job_helper_execs.clear();
+    g_job_helper_reinstall = false;
+    g_job_phase = JobPhase::Idle;
     g_job_rc = -1;
     g_job_done = false;
     request_summary_refresh();
     g_screen = ok ? Screen::Detail : Screen::ErrorDialog;
+}
+
+bool parse_package_job(const std::string &output)
+{
+    std::istringstream lines(output);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (line.rfind("PACKAGE_JOB\t", 0) != 0)
+            continue;
+        auto values = split_tab(line);
+        if (values.size() < 7)
+            return false;
+        g_job_helper_action = values[1];
+        g_job_helper_value = values[2];
+        g_job_helper_reinstall = values[3] == "1";
+        g_job_helper_desktop = values[4];
+        g_job_transaction_id = values[5];
+        g_job_pending_path = values[6];
+        g_job_helper_execs.clear();
+        for (size_t i = 7; i < values.size(); ++i)
+            if (!values[i].empty()) g_job_helper_execs.push_back(values[i]);
+        return !g_job_helper_action.empty() && !g_job_helper_value.empty() &&
+               !g_job_transaction_id.empty();
+    }
+    return false;
+}
+
+void sudo_job_output(const char *data, size_t size, void *)
+{
+    if (!data || size == 0)
+        return;
+    pthread_mutex_lock(&g_job_mutex);
+    g_job_output.append(data, size);
+    pthread_mutex_unlock(&g_job_mutex);
+}
+
+void sudo_job_complete(cp0_sudo_result_t result, int exit_code, void *)
+{
+    g_job_sudo_request_id = 0;
+    if (result == CP0_SUDO_RESULT_SUCCESS) {
+        g_job_phase = JobPhase::Finalize;
+        g_job_pending_start = true;
+        g_job_done = false;
+        g_job_rc = -1;
+        g_job_detail = "Finalizing package state";
+        g_job_start_tick = lv_tick_get();
+        return;
+    }
+    pthread_mutex_lock(&g_job_mutex);
+    if (result == CP0_SUDO_RESULT_AUTH_FAILED)
+        g_job_output += "ERROR\tSudo authentication failed after 3 attempts\n";
+    else if (result == CP0_SUDO_RESULT_CANCELLED)
+        g_job_output += "ERROR\tPackage operation cancelled\n";
+    else if (result == CP0_SUDO_RESULT_TIMED_OUT)
+        g_job_output += "ERROR\tPackage operation timed out\n";
+    else if (g_job_output.find("ERROR\t") == std::string::npos)
+        g_job_output += "ERROR\tPrivileged package command failed\t" +
+                        std::to_string(exit_code) + "\n";
+    g_job_rc = exit_code == 0 ? 1 : exit_code;
+    g_job_done = true;
+    pthread_mutex_unlock(&g_job_mutex);
+}
+
+bool start_sudo_job()
+{
+    std::vector<std::string> storage = {
+        "python3", backend_script_path(), "--package-helper", g_job_helper_action,
+        "--package-value", g_job_helper_value
+    };
+    if (g_job_helper_reinstall)
+        storage.push_back("--package-reinstall");
+    if (!g_job_helper_desktop.empty()) {
+        storage.push_back("--package-desktop");
+        storage.push_back(g_job_helper_desktop);
+    }
+    storage.push_back("--package-transaction");
+    storage.push_back(g_job_transaction_id);
+    storage.push_back("--package-pending-path");
+    storage.push_back(g_job_pending_path);
+    for (const std::string &value : g_job_helper_execs) {
+        storage.push_back("--package-exec");
+        storage.push_back(value);
+    }
+    std::vector<const char *> argv;
+    argv.reserve(storage.size() + 1);
+    for (const std::string &arg : storage)
+        argv.push_back(arg.c_str());
+    argv.push_back(nullptr);
+    int rc = cp0_sudo_run_argv_async_ex(argv.data(), CP0_SUDO_CALLBACK_LVGL,
+                                        sudo_job_output, sudo_job_complete, nullptr,
+                                        60 * 1000, 15 * 60 * 1000,
+                                        &g_job_sudo_request_id);
+    if (rc != 0) {
+        pthread_mutex_lock(&g_job_mutex);
+        g_job_output += "ERROR\tUnable to start sudo request\n";
+        g_job_rc = rc;
+        g_job_done = true;
+        pthread_mutex_unlock(&g_job_mutex);
+        return false;
+    }
+    g_job_phase = JobPhase::Sudo;
+    g_job_detail = "Waiting for sudo authentication";
+    return true;
 }
 
 void poll_backend_job()
@@ -2477,29 +2580,59 @@ void poll_backend_job()
     pthread_mutex_unlock(&g_job_mutex);
     parse_job_progress(out);
     std::string detail = g_job_detail.empty() ? job_action_label(g_job_action) : g_job_detail;
-    if (g_job_progress >= 0) {
+    if (g_job_progress >= 0)
         detail += " " + std::to_string(g_job_progress) + "%";
-    }
     g_status_message = detail + " " + one_line(g_job_title, 16) + " " + std::to_string(elapsed) + "s";
     if (!done) return;
-    finish_backend_job(out, std::to_string(rc));
+    if (g_job_phase == JobPhase::Prepare && rc == 0) {
+        if (g_job_cancel_requested) {
+            pthread_mutex_lock(&g_job_mutex);
+            g_job_output += "ERROR\tPackage operation cancelled\n";
+            g_job_rc = 1;
+            pthread_mutex_unlock(&g_job_mutex);
+            finish_backend_job(g_job_output, "1");
+            return;
+        }
+        if (parse_package_job(out)) {
+            pthread_mutex_lock(&g_job_mutex);
+            g_job_done = false;
+            g_job_rc = -1;
+            pthread_mutex_unlock(&g_job_mutex);
+            start_sudo_job();
+            return;
+        }
+        pthread_mutex_lock(&g_job_mutex);
+        g_job_output += "ERROR\tPackage preparation returned no helper command\n";
+        g_job_rc = 1;
+        pthread_mutex_unlock(&g_job_mutex);
+        rc = 1;
+    }
+    finish_backend_job(g_job_output, std::to_string(rc));
 }
 
-void *backend_job_thread_main(void *)
-{
-    std::string flag = "--install";
-    if (g_job_action == "reinstall") flag = "--reinstall";
-    else if (g_job_action == "upgrade") flag = "--upgrade";
-    else if (g_job_action == "uninstall") flag = "--uninstall";
+struct BackendJobContext {
+    JobPhase phase;
+    std::string action;
+    std::string app_id;
+    std::string transaction_id;
+};
 
+void *backend_job_thread_main(void *user)
+{
+    std::unique_ptr<BackendJobContext> context(static_cast<BackendJobContext *>(user));
     int rc = -1;
-    app_tracef("job backend start action=%s app=%s flag=%s",
-               g_job_action.c_str(), g_job_app_id.c_str(), flag.c_str());
-    std::string out = backend_capture_with_sudo({flag, g_job_app_id}, g_job_sudo_password, &rc);
-    app_tracef("job backend done action=%s app=%s rc=%d bytes=%zu",
-               g_job_action.c_str(), g_job_app_id.c_str(), rc, out.size());
+    std::vector<std::string> args = context->phase == JobPhase::Prepare
+        ? std::vector<std::string>{"--prepare-package", context->action, context->app_id}
+        : std::vector<std::string>{"--finalize-package", context->action, context->app_id,
+                                   context->transaction_id};
+    app_tracef("job backend start phase=%d action=%s app=%s",
+               static_cast<int>(context->phase), context->action.c_str(), context->app_id.c_str());
+    std::string out = backend_capture(args, &rc);
     pthread_mutex_lock(&g_job_mutex);
-    g_job_output = out;
+    if (context->phase == JobPhase::Prepare)
+        g_job_output = out;
+    else
+        g_job_output += out;
     g_job_rc = rc;
     g_job_done = true;
     pthread_mutex_unlock(&g_job_mutex);
@@ -2512,21 +2645,30 @@ void job_timer_cb(lv_timer_t *)
     if (g_job_pending_start && lv_tick_elaps(g_job_start_tick) >= kJobStartDelayMs) {
         g_job_pending_start = false;
         pthread_mutex_lock(&g_job_mutex);
-        g_job_output.clear();
+        if (g_job_phase == JobPhase::Prepare)
+            g_job_output.clear();
         g_job_rc = -1;
         g_job_done = false;
         pthread_mutex_unlock(&g_job_mutex);
 
-        if (pthread_create(&g_job_thread, nullptr, backend_job_thread_main, nullptr) != 0) {
-            g_job_running = false;
-            g_status_message = "Unable to start operation";
-            g_screen = Screen::Detail;
+        auto *context = new (std::nothrow) BackendJobContext{
+            g_job_phase, g_job_action, g_job_app_id, g_job_transaction_id};
+        if (!context || pthread_create(&g_job_thread, nullptr, backend_job_thread_main, context) != 0) {
+            delete context;
+            pthread_mutex_lock(&g_job_mutex);
+            g_job_output += "ERROR\tUnable to start package worker\n";
+            g_job_rc = 1;
+            g_job_done = true;
+            pthread_mutex_unlock(&g_job_mutex);
+            finish_backend_job(g_job_output, "1");
             render();
             return;
         }
         pthread_detach(g_job_thread);
         g_job_start_tick = lv_tick_get();
-        g_job_detail = "Waiting for package output";
+        g_job_detail = g_job_phase == JobPhase::Prepare
+                         ? "Preparing package files"
+                         : "Updating package records";
         g_status_message = job_action_label(g_job_action) + " " + one_line(g_job_title, 18) + "... 0s";
     }
     poll_backend_job();
@@ -2538,14 +2680,22 @@ void update_local_job_app_state(bool ok, const std::string &out)
     if (!ok || g_job_app_id.empty()) return;
     for (StoreApp &app : g_apps) {
         if (app.id != g_job_app_id) continue;
-        if (g_job_action == "uninstall" || out.find("UNINSTALLED") != std::string::npos) {
+        std::string actual_version;
+        std::istringstream lines(out);
+        std::string line;
+        while (std::getline(lines, line)) {
+            auto fields = split_tab(line);
+            if (fields.size() >= 5 && fields[0] == "PACKAGE_RESULT") {
+                actual_version = fields[4];
+                break;
+            }
+        }
+        if (g_job_action == "uninstall") {
             app.installed = false;
             app.installed_version.clear();
-        } else if (out.find("INSTALLED") != std::string::npos ||
-                   out.find("UPGRADED") != std::string::npos ||
-                   g_job_action == "install" || g_job_action == "reinstall" || g_job_action == "upgrade") {
+        } else {
             app.installed = true;
-            if (app.installed_version.empty()) app.installed_version = app.version;
+            app.installed_version = actual_version.empty() ? app.version : actual_version;
         }
         app_tracef("job local_state app=%s action=%s installed=%d version=%s out=%s",
                    app.id.c_str(), g_job_action.c_str(), app.installed ? 1 : 0,
@@ -2569,17 +2719,22 @@ void navigate_back()
         case Screen::Confirm:
             g_screen = Screen::Detail;
             g_confirm_action.clear();
+            g_confirm_app_id.clear();
             g_confirm_lines.clear();
             g_confirm_focus = 0;
             break;
-        case Screen::SudoPassword:
-            g_screen = Screen::Confirm;
-            g_sudo_password_input.clear();
-            g_sudo_message = "Enter sudo password for package operation.";
-            break;
         case Screen::Progress:
             if (g_job_running || g_job_pending_start) {
-                g_status_message = "Operation is still running";
+                if (g_job_phase == JobPhase::Sudo && g_job_sudo_request_id != 0) {
+                    cp0_sudo_cancel(g_job_sudo_request_id);
+                    g_status_message = "Cancelling package operation...";
+                } else if (g_job_phase == JobPhase::Prepare) {
+                    g_job_cancel_requested = true;
+                    cancel_package_prepare();
+                    g_status_message = "Cancelling package preparation...";
+                } else {
+                    g_status_message = "Operation is still running";
+                }
             } else {
                 g_screen = Screen::Detail;
             }
@@ -3181,6 +3336,7 @@ void start_plan_check(const std::string &action, const std::string &app_id)
     g_plan_done = false;
     g_plan_action = action;
     g_plan_app_id = app_id;
+    g_plan_origin_screen = g_screen;
     g_plan_output.clear();
     g_plan_rc = -1;
     pthread_mutex_unlock(&g_plan_mutex);
@@ -3208,6 +3364,7 @@ bool poll_plan_check()
     if (g_plan_done) {
         done = true;
         action = g_plan_action;
+        g_confirm_app_id = g_plan_app_id;
         out = std::move(g_plan_output);
         rc = g_plan_rc;
         g_plan_done = false;
@@ -3221,6 +3378,13 @@ bool poll_plan_check()
     if (!done) return false;
 
     g_confirm_action = action;
+    StoreApp *current = selected_app();
+    if (g_screen != g_plan_origin_screen || !current || current->id != g_confirm_app_id) {
+        g_confirm_action.clear();
+        g_confirm_app_id.clear();
+        g_status_message = "Install plan expired";
+        return true;
+    }
     if (rc == 0 && parse_plan(out)) {
         g_status_message.clear();
         g_screen = Screen::Confirm;
@@ -3234,6 +3398,7 @@ void cancel_confirm()
 {
     g_screen = Screen::Detail;
     g_confirm_action.clear();
+    g_confirm_app_id.clear();
     g_confirm_lines.clear();
     g_confirm_focus = 0;
 }
@@ -3251,6 +3416,7 @@ void start_confirm(const std::string &action)
         return;
     }
     g_confirm_action = action;
+    g_confirm_app_id = app->id;
     g_confirm_focus = 0;
     if (action == "uninstall") {
         g_confirm_lines = {"Delete " + app->name, "Remove installed Debian package.", "Disk free: " + g_free_space};
@@ -3362,7 +3528,7 @@ void scroll_detail_description(int delta)
     g_status_message.clear();
 }
 
-void start_backend_job(const std::string &action, StoreApp *app, const std::string &sudo_password)
+void start_backend_job(const std::string &action, StoreApp *app)
 {
     if (!app) return;
     if (g_job_running) {
@@ -3378,10 +3544,19 @@ void start_backend_job(const std::string &action, StoreApp *app, const std::stri
     g_job_stage.clear();
     g_job_detail = "Preparing package worker";
     g_job_output.clear();
-    g_job_sudo_password = sudo_password;
+    g_job_helper_action.clear();
+    g_job_helper_value.clear();
+    g_job_helper_desktop.clear();
+    g_job_transaction_id.clear();
+    g_job_pending_path.clear();
+    g_job_helper_execs.clear();
+    g_job_helper_reinstall = false;
+    g_job_sudo_request_id = 0;
+    g_job_phase = JobPhase::Prepare;
     g_job_progress = -1;
     g_job_rc = -1;
     g_job_done = false;
+    g_job_cancel_requested = false;
     g_job_start_tick = lv_tick_get();
     g_status_message = "Preparing " + one_line(app->name, 18) + "...";
     g_screen = Screen::Progress;
@@ -3395,47 +3570,19 @@ void start_backend_job(const std::string &action, StoreApp *app, const std::stri
 
 void execute_confirm()
 {
-    StoreApp *app = selected_app();
-    if (!app || g_confirm_action.empty()) return;
-    g_sudo_action = g_confirm_action;
-    g_sudo_app_id = app->id;
-    g_sudo_app_title = app->name;
-    g_sudo_password_input.clear();
-    g_sudo_message = "Enter sudo password for package operation.";
-    g_screen = Screen::SudoPassword;
-}
-
-void execute_sudo_password()
-{
-    StoreApp *app = selected_app();
-    if (!app || app->id != g_sudo_app_id) {
-        app = nullptr;
-        for (StoreApp &candidate : g_apps) {
-            if (candidate.id == g_sudo_app_id) {
-                app = &candidate;
-                break;
-            }
+    StoreApp *app = nullptr;
+    for (auto &candidate : g_apps) {
+        if (candidate.id == g_confirm_app_id) {
+            app = &candidate;
+            break;
         }
     }
-    if (!app || g_sudo_action.empty()) {
-        g_sudo_message = "Selected app is no longer available.";
-        return;
-    }
-    if (g_sudo_password_input.empty()) {
-        g_sudo_message = "Password is required for sudo.";
-        return;
-    }
-
-    std::string action = g_sudo_action;
-    std::string password = g_sudo_password_input;
+    if (!app || g_confirm_action.empty()) return;
+    std::string action = g_confirm_action;
     g_confirm_action.clear();
+    g_confirm_app_id.clear();
     g_confirm_lines.clear();
-    g_sudo_action.clear();
-    g_sudo_app_id.clear();
-    g_sudo_app_title.clear();
-    g_sudo_password_input.clear();
-    g_sudo_message = "Enter sudo password for package operation.";
-    start_backend_job(action, app, password);
+    start_backend_job(action, app);
 }
 
 void handle_key(const KeyEvent &key)
@@ -3576,17 +3723,6 @@ void handle_key(const KeyEvent &key)
             } else if (key.code == KEY_ENTER) {
                 if (g_confirm_focus == 0) execute_confirm();
                 else cancel_confirm();
-            }
-            break;
-        case Screen::SudoPassword:
-            if (key.code == KEY_BACKSPACE && !g_sudo_password_input.empty()) {
-                g_sudo_password_input.pop_back();
-                g_sudo_message = "Enter sudo password for package operation.";
-            } else if (key.code == KEY_ENTER) {
-                execute_sudo_password();
-            } else if (key.ch >= 32 && key.ch <= 126 && g_sudo_password_input.size() < 64) {
-                g_sudo_password_input.push_back(key.ch);
-                g_sudo_message = "Enter runs package operation with sudo.";
             }
             break;
         case Screen::Progress:

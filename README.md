@@ -54,9 +54,36 @@ python3 appstore.py --plan <app-id>
 python3 appstore.py --install <app-id>
 python3 appstore.py --upgrade <app-id>
 python3 appstore.py --uninstall <app-id>
+python3 appstore.py --prepare-package install <app-id>
+python3 appstore.py --finalize-package install <app-id>
 ```
 
 `<app-id>` accepts either the app UUID or its `share_code` from registry metadata.
+
+The LVGL application uses a three-stage package transaction. The unprivileged
+`--prepare-package` stage downloads and verifies the package and records a
+pending transaction. The UI then runs the emitted package helper command with
+privileges. Finally, `--finalize-package` checks the real package state through
+`dpkg-query` before updating AppStore's installed-app records. The original
+`--install`, `--reinstall`, `--upgrade`, and `--uninstall` commands remain
+available and use the same verification and record-update behavior.
+
+Pending transactions are stored in the AppStore state directory using atomic
+file replacement. AppStore reconciles them against the dpkg database on backend
+startup and during summary refresh, so an interrupted finalize stage can be
+completed after a restart. A transaction remains pending when its outcome cannot
+be determined; its diagnostic is reported again on the next reconciliation.
+
+Package commands produce tab-separated, machine-readable status records.
+`PACKAGE_JOB` describes the privileged step, `PACKAGE_RESULT` is the verified
+terminal result, `WARNING` reports a non-fatal issue such as desktop-entry
+repair, and `ERROR` reports a failed operation. Consumers must determine success
+from the process exit code and `PACKAGE_RESULT`, not by searching free-form
+package-manager output for words such as `ERROR`.
+
+Desktop-entry repair is best effort. Failure to find or rewrite an APPLaunch
+desktop entry is reported as `WARNING` after a successful package operation and
+does not change the verified package result.
 
 Multiple registries are supported. On the Registries settings screen, use the
 region radio buttons to choose the built-in Default or CN registry. Add another

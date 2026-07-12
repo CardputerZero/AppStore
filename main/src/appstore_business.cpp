@@ -107,11 +107,12 @@ std::string tsv_escape_cpp(const std::string &value)
     return out;
 }
 
-std::string make_backend_body(const std::vector<std::string> &args, const std::string &password)
+std::string make_backend_body(const std::vector<std::string> &args)
 {
-    std::string body = tsv_escape_cpp(password);
-    for (const auto &arg : args) {
-        body += '\t';
+    std::string body;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i) body += '\t';
+        const auto &arg = args[i];
         body += tsv_escape_cpp(arg);
     }
     body += '\n';
@@ -204,7 +205,7 @@ bool start_backend_service_locked()
         " --serve --port " + std::to_string(kBackendPort);
     std::fprintf(stderr, "[AppStore UI] backend service start command=%s\n", command.c_str());
     business_tracef("backend service start command=%s", command.c_str());
-    g_backend_service_pid = cp0_process_spawn(command.c_str(), 1);
+    g_backend_service_pid = cp0_process_spawn(command.c_str(), 0);
     if (g_backend_service_pid < 0) {
         std::fprintf(stderr, "[AppStore UI] backend service spawn failed\n");
         business_tracef("backend service spawn failed");
@@ -226,12 +227,12 @@ bool start_backend_service_locked()
                  static_cast<int>(g_backend_service_pid));
     business_tracef("backend service health timeout pid=%d",
                     static_cast<int>(g_backend_service_pid));
+    cp0_process_stop(g_backend_service_pid);
+    g_backend_service_pid = -1;
     return false;
 }
 
-std::string backend_http_capture_locked(const std::vector<std::string> &args,
-                                        const std::string &password,
-                                        int *rc)
+std::string backend_http_capture_locked(const std::vector<std::string> &args, int *rc)
 {
     auto total_start = std::chrono::steady_clock::now();
     {
@@ -248,11 +249,11 @@ std::string backend_http_capture_locked(const std::vector<std::string> &args,
     }
 
     httplib::Client client(kBackendHost, kBackendPort);
-    configure_backend_client(client, 3600);
-    const std::string body = make_backend_body(args, password);
+    configure_backend_client(client, 16 * 60);
+    const std::string body = make_backend_body(args);
     auto post_start = std::chrono::steady_clock::now();
-    business_tracef("backend post begin args=%s body_bytes=%zu sudo=%d",
-                    join_args(args).c_str(), body.size(), password.empty() ? 0 : 1);
+    business_tracef("backend post begin args=%s body_bytes=%zu",
+                    join_args(args).c_str(), body.size());
     auto res = client.Post("/run", body, "text/tab-separated-values; charset=utf-8");
     auto post_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - post_start).count();
@@ -509,17 +510,21 @@ std::string job_action_label(const std::string &action)
 std::string backend_error_message(const std::string &out)
 {
     std::string fallback;
+    std::string error;
     std::istringstream stream(out);
     std::string line;
     while (std::getline(stream, line)) {
         auto fields = split_tab(line);
         if (fields.empty() || fields[0] == "PROGRESS") continue;
         if (fields[0] == "ERROR") {
-            if (fields.size() >= 2 && !fields[1].empty()) return fields[1];
-            return "Operation failed";
+            error = fields.size() >= 2 && !fields[1].empty() ? fields[1] : "Operation failed";
+            if (fields.size() >= 3 && !fields[2].empty())
+                error += " (code " + fields[2] + ")";
+            continue;
         }
         if (!trim(line).empty()) fallback = line;
     }
+    if (!error.empty()) return error;
     if (!fallback.empty()) return fallback;
     return out.empty() ? "Operation failed" : out;
 }
@@ -660,25 +665,10 @@ std::string backend_capture(const std::vector<std::string> &args, int *rc)
                  g_backend_script_path.c_str(), file_probe(g_backend_script_path).c_str(),
                  join_args(args).c_str());
     int ret = -1;
-    std::string text = backend_http_capture_locked(args, "", &ret);
+    std::string text = backend_http_capture_locked(args, &ret);
     std::fprintf(stderr, "[AppStore UI] backend http done rc=%d bytes=%zu script=%s args=%s preview=%s\n",
                  ret, text.size(), g_backend_script_path.c_str(), join_args(args).c_str(),
                  preview_output(text).c_str());
-    if (rc) *rc = ret;
-    return text;
-}
-
-std::string backend_capture_with_sudo(const std::vector<std::string> &args,
-                                      const std::string &password,
-                                      int *rc)
-{
-    std::fprintf(stderr, "[AppStore UI] backend http sudo start script=%s (%s) args=%s password_len=%zu\n",
-                 g_backend_script_path.c_str(), file_probe(g_backend_script_path).c_str(),
-                 join_args(args).c_str(), password.size());
-    int ret = -1;
-    std::string text = backend_http_capture_locked(args, password, &ret);
-    std::fprintf(stderr, "[AppStore UI] backend http sudo done rc=%d bytes=%zu args=%s preview=%s\n",
-                 ret, text.size(), join_args(args).c_str(), preview_output(text).c_str());
     if (rc) *rc = ret;
     return text;
 }
@@ -735,6 +725,14 @@ bool cancel_sync()
     bool ok = res && res->status >= 200 && res->status < 300;
     business_tracef("backend cancel_sync ok=%d status=%d", ok ? 1 : 0, res ? res->status : -1);
     return ok;
+}
+
+bool cancel_package_prepare()
+{
+    httplib::Client client(kBackendHost, kBackendPort);
+    configure_backend_client(client, 2);
+    auto res = client.Post("/cancel-package", "", "text/plain");
+    return res && res->status == 200;
 }
 
 RegistryConfig load_registry_config()

@@ -115,11 +115,9 @@ const std::string &backend_script_path();
 bool start_backend_service();
 void stop_backend_service();
 std::string backend_capture(const std::vector<std::string> &args, int *rc = nullptr);
-std::string backend_capture_with_sudo(const std::vector<std::string> &args,
-                                      const std::string &password,
-                                      int *rc = nullptr);
 SyncStatus load_sync_status();
 bool cancel_sync();
+bool cancel_package_prepare();
 RegistryConfig load_registry_config();
 bool replace_registry_config(const RegistryConfig &config);
 SummaryData load_summary(SortRule rule);
