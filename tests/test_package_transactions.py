@@ -1,7 +1,9 @@
 import contextlib
 import importlib.util
 import io
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -54,9 +56,9 @@ class PackageTransactionTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(["apt-get"], 0, "installed\n", "")
         with (
             mock.patch.object(appstore.os, "geteuid", return_value=0),
-            mock.patch.object(appstore, "repair_dpkg_state"),
+            mock.patch.object(appstore, "deb_dependencies_satisfied", return_value=True),
             mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/apt-get"),
-            mock.patch.object(appstore.subprocess, "run", return_value=completed),
+            mock.patch.object(appstore, "run_package_helper_command", return_value=completed),
             mock.patch.object(
                 appstore,
                 "repair_desktop_as_root",
@@ -74,6 +76,175 @@ class PackageTransactionTests(unittest.TestCase):
         self.assertIn("installed", output)
         self.assertIn("WARNING\tdesktop repair failed: desktop unavailable", output)
         self.assertNotIn("ERROR\t", output)
+
+    def test_uninstall_removes_target_without_global_dpkg_repair(self):
+        completed = subprocess.CompletedProcess(
+            ["dpkg", "--remove", "demo-package"], 0, "removed\n", ""
+        )
+        with (
+            mock.patch.object(appstore.os, "geteuid", return_value=0),
+            mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/dpkg"),
+            mock.patch.object(appstore, "run_package_helper_command", return_value=completed) as run,
+        ):
+            result, output = self.capture(
+                appstore.package_helper, "uninstall", "demo-package"
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(run.call_args.args[0], ["dpkg", "--remove", "demo-package"])
+        self.assertIn("removed", output)
+
+    def test_install_targets_deb_without_global_dpkg_repair(self):
+        completed = subprocess.CompletedProcess(
+            ["dpkg", "--install", "/tmp/demo.deb"], 0, "installed\n", ""
+        )
+        with (
+            mock.patch.object(appstore.os, "geteuid", return_value=0),
+            mock.patch.object(appstore, "deb_dependencies_satisfied", return_value=True),
+            mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/dpkg"),
+            mock.patch.object(appstore, "run_package_helper_command", return_value=completed) as run,
+        ):
+            result, output = self.capture(
+                appstore.package_helper, "install", "/tmp/demo.deb"
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(run.call_args.args[0], ["dpkg", "--install", "/tmp/demo.deb"])
+        self.assertIn("installed", output)
+
+    def test_install_uses_apt_for_missing_dependencies_when_dpkg_is_clean(self):
+        completed = subprocess.CompletedProcess(["apt-get"], 0, "installed\n", "")
+        with (
+            mock.patch.object(appstore.os, "geteuid", return_value=0),
+            mock.patch.object(appstore, "deb_dependencies_satisfied", return_value=False),
+            mock.patch.object(appstore, "dpkg_audit_detail", return_value=""),
+            mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/tool"),
+            mock.patch.object(appstore, "run_package_helper_command", return_value=completed) as run,
+        ):
+            result, _ = self.capture(appstore.package_helper, "install", "/tmp/demo.deb")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(run.call_args.args[0], ["apt-get", "-y", "install", "/tmp/demo.deb"])
+
+    def test_install_rejects_missing_dependencies_before_unpack_when_dpkg_is_dirty(self):
+        appstore.write_json(appstore.pending_package_path(), {
+            "transaction_id": "tx-preflight", "action": "install",
+            "app_id": "app-id", "helper_completed": False,
+        })
+        with (
+            mock.patch.object(appstore.os, "geteuid", return_value=0),
+            mock.patch.object(appstore, "deb_dependencies_satisfied", return_value=False),
+            mock.patch.object(appstore, "dpkg_audit_detail", return_value="flint is half configured"),
+            mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/tool"),
+            mock.patch.object(appstore, "run_package_helper_command") as run,
+        ):
+            result, output = self.capture(
+                appstore.package_helper, "install", "/tmp/demo.deb",
+                transaction_id="tx-preflight",
+                pending_path_value=str(appstore.pending_package_path()),
+            )
+
+        self.assertEqual(result, 1)
+        run.assert_not_called()
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("unfinished packages", output)
+
+    def test_empty_deb_dependencies_do_not_require_dpkg_checkbuilddeps(self):
+        def which(name):
+            return "/usr/bin/dpkg-deb" if name == "dpkg-deb" else None
+
+        empty = subprocess.CompletedProcess(["dpkg-deb"], 0, "", "")
+        with (
+            mock.patch.object(appstore.shutil, "which", side_effect=which),
+            mock.patch.object(appstore.subprocess, "run", return_value=empty) as run,
+        ):
+            self.assertTrue(appstore.deb_dependencies_satisfied("/tmp/demo.deb"))
+
+        self.assertEqual(run.call_count, 2)
+
+    def test_dependency_checker_uses_all_deb_dependency_fields(self):
+        results = [
+            subprocess.CompletedProcess(["dpkg-deb"], 0, "base-files\n", ""),
+            subprocess.CompletedProcess(["dpkg-deb"], 0, "libc6 (>= 2.36) | libc6.1\n", ""),
+            subprocess.CompletedProcess(["dpkg-checkbuilddeps"], 0, "", ""),
+        ]
+        with (
+            mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/tool"),
+            mock.patch.object(appstore.subprocess, "run", side_effect=results) as run,
+        ):
+            self.assertTrue(appstore.deb_dependencies_satisfied("/tmp/demo.deb"))
+
+        self.assertEqual(
+            run.call_args.args[0][0:3],
+            ["dpkg-checkbuilddeps", "-d", "base-files, libc6 (>= 2.36) | libc6.1"],
+        )
+
+    def test_dependency_checker_rejects_unreadable_control_fields(self):
+        failed = subprocess.CompletedProcess(["dpkg-deb"], 2, "", "bad archive")
+        with (
+            mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/tool"),
+            mock.patch.object(appstore.subprocess, "run", return_value=failed),
+        ):
+            self.assertFalse(appstore.deb_dependencies_satisfied("/tmp/bad.deb"))
+
+    def test_failed_uninstall_with_unchanged_state_discards_pending(self):
+        appstore.write_json(appstore.pending_package_path(), {
+            "transaction_id": "tx-remove-fail", "action": "uninstall",
+            "app_id": "app-id", "package": "demo-package",
+            "previously_installed": True, "previous_version": "1.2.0",
+            "helper_completed": False,
+        })
+        failed = subprocess.CompletedProcess(["dpkg"], 1, "dependency blocks removal\n", "")
+        with (
+            mock.patch.object(appstore.os, "geteuid", return_value=0),
+            mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/dpkg"),
+            mock.patch.object(appstore, "run_package_helper_command", return_value=failed),
+            mock.patch.object(appstore, "package_dpkg_status", return_value=("ii", "1.2.0")),
+        ):
+            result, output = self.capture(
+                appstore.package_helper, "uninstall", "demo-package",
+                transaction_id="tx-remove-fail",
+                pending_path_value=str(appstore.pending_package_path()),
+            )
+
+        self.assertEqual(result, 1)
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("made no package state changes", output)
+
+    def test_write_json_preserves_existing_mode(self):
+        path = self.state_dir / "owned.json"
+        path.write_text("{}")
+        path.chmod(0o640)
+        appstore.write_json(path, {"updated": True})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+
+    def test_dpkg_query_error_is_not_treated_as_package_absent(self):
+        failed = subprocess.CompletedProcess(
+            ["dpkg-query"], 2, "", "dpkg database read error"
+        )
+        with (
+            mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/dpkg-query"),
+            mock.patch.object(appstore.subprocess, "run", return_value=failed),
+        ):
+            self.assertEqual(appstore.package_dpkg_status("demo-package"), ("unknown", ""))
+
+    def test_package_timeout_terminates_maintenance_script_process_group(self):
+        child_code = (
+            "import subprocess,time; "
+            "p=subprocess.Popen(['sleep','30']); print(p.pid, flush=True); time.sleep(30)"
+        )
+        with mock.patch.object(appstore, "PACKAGE_COMMAND_TIMEOUT_SECONDS", 0.1):
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                appstore.run_package_helper_command(
+                    [sys.executable, "-c", child_code], os.environ.copy()
+                )
+        child_pid = int(str(raised.exception.stdout).strip().splitlines()[0])
+        stat_path = Path(f"/proc/{child_pid}/stat")
+        try:
+            state = stat_path.read_text().split()[2]
+        except (FileNotFoundError, ProcessLookupError):
+            state = "gone"
+        self.assertIn(state, ("gone", "Z"))
 
     def test_reconcile_install_uses_actual_version_and_clears_pending(self):
         appstore.write_json(
@@ -197,12 +368,70 @@ class PackageTransactionTests(unittest.TestCase):
         self.assertTrue(appstore.pending_package_path().exists())
         self.assertIn("outcome is not known", output)
 
+    def test_reconcile_recovers_uninstall_when_receipt_was_lost(self):
+        appstore.write_json(appstore.pending_package_path(), {
+            "schema_version": 2, "transaction_id": "tx-uninstall-recover",
+            "action": "uninstall", "app_id": "app-id", "package": "demo-package",
+            "previously_installed": True, "previous_version": "1.2.0",
+            "helper_completed": False, "app_snapshot": APP,
+        })
+        with (
+            mock.patch.object(appstore, "find_app", return_value=APP),
+            mock.patch.object(appstore, "package_state", return_value=(False, "")),
+        ):
+            result, output = self.capture(appstore.reconcile_pending_package_job, True)
+
+        self.assertTrue(result)
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("recovered uninstall from verified package state", output)
+        self.assertIn("PACKAGE_RESULT\tuninstall", output)
+
+    def test_reconcile_recovers_new_install_when_receipt_was_lost(self):
+        appstore.write_json(appstore.pending_package_path(), {
+            "schema_version": 2, "transaction_id": "tx-install-recover",
+            "action": "install", "app_id": "app-id", "package": "demo-package",
+            "previously_installed": False, "previous_version": "",
+            "expected_package_version": "1.2.0", "helper_completed": False,
+            "app_snapshot": APP,
+        })
+        with (
+            mock.patch.object(appstore, "find_app", return_value=APP),
+            mock.patch.object(appstore, "package_state", return_value=(True, "1.2.0")),
+            mock.patch.object(appstore, "update_installed_record"),
+        ):
+            result, output = self.capture(appstore.reconcile_pending_package_job, True)
+
+        self.assertTrue(result)
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("recovered install from verified package state", output)
+        self.assertIn("PACKAGE_RESULT\tinstall", output)
+
     def test_prepare_rejects_existing_transaction(self):
         appstore.write_json(appstore.pending_package_path(), {"app_id": "other"})
         with mock.patch.object(appstore, "find_app", return_value=APP):
             result, output = self.capture(appstore.prepare_package_job, "install", "demo")
         self.assertEqual(result, 1)
         self.assertIn("another package transaction is pending", output)
+
+    def test_prepare_allows_uninstall_recovery_after_failed_install(self):
+        appstore.write_json(appstore.pending_package_path(), {
+            "schema_version": 2, "transaction_id": "tx-partial",
+            "action": "install", "app_id": "app-id", "package": "demo-package",
+            "helper_failed": True, "helper_completed": False,
+        })
+        with (
+            mock.patch.object(appstore, "find_app", return_value=APP),
+            mock.patch.object(appstore, "package_state", return_value=(False, "")),
+        ):
+            result, output = self.capture(
+                appstore.prepare_package_job, "uninstall", "app-id"
+            )
+
+        self.assertEqual(result, 0)
+        pending = appstore.pending_package_job()
+        self.assertEqual(pending.get("action"), "uninstall")
+        self.assertNotEqual(pending.get("transaction_id"), "tx-partial")
+        self.assertIn("PACKAGE_JOB\tuninstall\tdemo-package", output)
 
     def test_uninstall_prefers_recorded_package_name(self):
         appstore.write_json(

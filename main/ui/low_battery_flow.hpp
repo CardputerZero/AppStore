@@ -1,0 +1,91 @@
+#pragma once
+
+#include <cstdint>
+
+namespace appstore_ui {
+
+enum class LowBatteryWarning {
+    None,
+    Low,
+    ShutdownCountdown,
+};
+
+class LowBatteryFlow {
+public:
+    static constexpr uint32_t kShutdownDelayMs = 15000;
+    static constexpr uint32_t kInvalidReadingGraceMs = 3000;
+
+    void reset() { *this = LowBatteryFlow{}; }
+
+    void update(bool valid, int soc, bool charging, uint32_t now)
+    {
+        if (!valid)
+            return;
+        if (charging || soc >= 5) {
+            warning_ = LowBatteryWarning::None;
+            shutdown_requested_ = false;
+            confirmation_pending_ = false;
+            return;
+        }
+        if (soc <= 0) {
+            if (warning_ != LowBatteryWarning::ShutdownCountdown) {
+                countdown_started_ = now;
+                shutdown_requested_ = false;
+                confirmation_pending_ = false;
+            }
+            warning_ = LowBatteryWarning::ShutdownCountdown;
+            return;
+        }
+        warning_ = LowBatteryWarning::Low;
+        shutdown_requested_ = false;
+        confirmation_pending_ = false;
+    }
+
+    bool confirm_shutdown(bool reading_valid, bool charging, uint32_t now)
+    {
+        if (!shutdown_due(now))
+            return false;
+        if (reading_valid) {
+            confirmation_pending_ = false;
+            if (charging) {
+                warning_ = LowBatteryWarning::None;
+                return false;
+            }
+        } else if (!confirmation_pending_) {
+            confirmation_pending_ = true;
+            confirmation_started_ = now;
+            return false;
+        } else if (static_cast<uint32_t>(now - confirmation_started_) < kInvalidReadingGraceMs) {
+            return false;
+        }
+        shutdown_requested_ = true;
+        return true;
+    }
+
+    bool shutdown_due(uint32_t now) const
+    {
+        return warning_ == LowBatteryWarning::ShutdownCountdown && !shutdown_requested_ &&
+            static_cast<uint32_t>(now - countdown_started_) >= kShutdownDelayMs;
+    }
+
+    LowBatteryWarning warning() const { return warning_; }
+
+    uint32_t seconds_until_shutdown(uint32_t now) const
+    {
+        if (warning_ != LowBatteryWarning::ShutdownCountdown)
+            return 0;
+        const uint32_t elapsed = static_cast<uint32_t>(now - countdown_started_);
+        if (elapsed >= kShutdownDelayMs)
+            return 0;
+        return (kShutdownDelayMs - elapsed + 999) / 1000;
+    }
+
+private:
+    LowBatteryWarning warning_ = LowBatteryWarning::None;
+    uint32_t countdown_started_ = 0;
+    uint32_t confirmation_started_ = 0;
+    bool shutdown_requested_ = false;
+    bool confirmation_pending_ = false;
+};
+
+} // namespace appstore_ui

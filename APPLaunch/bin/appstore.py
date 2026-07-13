@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import os
+import signal
 import shlex
 import shutil
 import subprocess
@@ -249,6 +250,13 @@ def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    try:
+        current = path.stat()
+        os.chmod(tmp, current.st_mode & 0o777)
+        if os.geteuid() == 0:
+            os.chown(tmp, current.st_uid, current.st_gid)
+    except FileNotFoundError:
+        pass
     tmp.replace(path)
 
 
@@ -1447,6 +1455,158 @@ def run_package_command(args: list[str]) -> None:
         raise RuntimeError(command_error(result))
 
 
+def dpkg_audit_detail() -> str:
+    if not shutil.which("dpkg"):
+        return ""
+    result = subprocess.run(
+        ["dpkg", "--audit"], check=False, capture_output=True, text=True, timeout=60
+    )
+    detail = compact_error((result.stdout or "") + (result.stderr or ""))
+    if result.returncode != 0:
+        return detail or f"dpkg --audit failed with exit code {result.returncode}"
+    return detail
+
+
+def deb_dependencies_satisfied(path: str) -> bool:
+    if not shutil.which("dpkg-deb"):
+        return False
+    dependencies = []
+    for field in ("Pre-Depends", "Depends"):
+        result = subprocess.run(
+            ["dpkg-deb", "-f", path, field], check=False,
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            return False
+        value = result.stdout.strip()
+        if value:
+            dependencies.append(value)
+    if not dependencies:
+        return True
+    if not shutil.which("dpkg-checkbuilddeps"):
+        return False
+    result = subprocess.run(
+        ["dpkg-checkbuilddeps", "-d", ", ".join(dependencies), "/dev/null"],
+        check=False, capture_output=True, text=True, timeout=60,
+    )
+    return result.returncode == 0
+
+
+def discard_unstarted_package_job(transaction_id: str, pending_path_value: str) -> None:
+    if not transaction_id or not pending_path_value:
+        return
+    path = Path(pending_path_value)
+    pending = read_json(path, {})
+    if (isinstance(pending, dict) and
+            str(pending.get("transaction_id") or "") == transaction_id and
+            not pending.get("helper_completed")):
+        path.unlink(missing_ok=True)
+
+
+def package_dpkg_status(package: str) -> tuple[str, str]:
+    if not package or not shutil.which("dpkg-query"):
+        return "unknown", ""
+    env = os.environ.copy()
+    env["LC_ALL"] = "C"
+    result = subprocess.run(
+        ["dpkg-query", "-W", "-f=${db:Status-Abbrev}\t${Version}", package],
+        check=False, capture_output=True, text=True, timeout=30, env=env,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if result.returncode == 1 and "no packages found matching" in detail:
+            return "absent", ""
+        return "unknown", ""
+    status, _, version = result.stdout.partition("\t")
+    return status.strip() or "unknown", version.strip()
+
+
+def mark_package_helper_failed(transaction_id: str, pending_path_value: str,
+                               exit_code: int) -> None:
+    if not transaction_id or not pending_path_value:
+        return
+    path = Path(pending_path_value)
+    pending = read_json(path, {})
+    if (not isinstance(pending, dict) or
+            str(pending.get("transaction_id") or "") != transaction_id):
+        return
+    pending["helper_failed"] = True
+    pending["helper_exit_code"] = exit_code
+    pending["helper_failed_at"] = now_text()
+    write_json(path, pending)
+
+
+def discard_failed_job_if_state_unchanged(transaction_id: str,
+                                          pending_path_value: str) -> bool:
+    if not transaction_id or not pending_path_value:
+        return False
+    path = Path(pending_path_value)
+    pending = read_json(path, {})
+    if (not isinstance(pending, dict) or
+            str(pending.get("transaction_id") or "") != transaction_id):
+        return False
+    status, version = package_dpkg_status(str(pending.get("package") or ""))
+    if pending.get("previously_installed"):
+        unchanged = status.startswith("ii") and version == str(pending.get("previous_version") or "")
+    else:
+        unchanged = status in ("absent", "rc")
+    if unchanged:
+        path.unlink(missing_ok=True)
+    return unchanged
+
+
+def run_package_helper_command(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env=env, start_new_session=True,
+    )
+    def terminate_group(sig: int) -> None:
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+
+    def forward_signal(signum, _frame) -> None:
+        terminate_group(signal.SIGTERM)
+        raise InterruptedError(f"package command interrupted by signal {signum}")
+
+    previous_handlers = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[sig] = signal.signal(sig, forward_signal)
+    try:
+        output, _ = process.communicate(timeout=PACKAGE_COMMAND_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        terminate_group(signal.SIGTERM)
+        try:
+            output, _ = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            terminate_group(signal.SIGKILL)
+            output, _ = process.communicate()
+        exc.stdout = output
+        raise
+    except InterruptedError:
+        terminate_group(signal.SIGTERM)
+        try:
+            process.communicate(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            terminate_group(signal.SIGKILL)
+            process.communicate()
+        raise
+    except BaseException:
+        terminate_group(signal.SIGTERM)
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            terminate_group(signal.SIGKILL)
+            process.communicate()
+        raise
+    finally:
+        for sig, previous in previous_handlers.items():
+            signal.signal(sig, previous)
+    return subprocess.CompletedProcess(args, process.returncode, output, "")
+
+
 def repair_desktop_as_root(desktop_value: str, exec_values: list[str]) -> str:
     if not desktop_value:
         return ""
@@ -1486,23 +1646,35 @@ def package_helper(action: str, value: str, reinstall: bool = False,
     if os.geteuid() != 0:
         emit("ERROR", "package helper requires root")
         return 1
+    command_started = False
     try:
-        repair_dpkg_state()
         if action == "install":
-            if shutil.which("apt-get"):
+            # The downloaded artifact is already verified. Install that one
+            # package directly so an unrelated half-configured package cannot
+            # pull this transaction into its postinst through apt repair.
+            if shutil.which("dpkg") and deb_dependencies_satisfied(value):
+                args = ["dpkg", "--install", value]
+            elif shutil.which("apt-get"):
+                audit = dpkg_audit_detail()
+                if audit:
+                    raise RuntimeError(
+                        "cannot resolve package dependencies while dpkg has unrelated "
+                        f"unfinished packages: {audit}"
+                    )
                 args = ["apt-get", "-y"]
                 if reinstall:
                     args.append("--reinstall")
                 args += ["install", value]
-            elif shutil.which("dpkg"):
-                args = ["dpkg", "-i", value]
             else:
                 raise RuntimeError("apt-get or dpkg is required to install deb packages")
         elif action == "uninstall":
-            if shutil.which("apt-get"):
+            # Removing one package must not configure every unrelated package.
+            # A half-configured package with a slow postinst otherwise blocks
+            # an independent uninstall in repair_dpkg_state()/apt-get.
+            if shutil.which("dpkg"):
+                args = ["dpkg", "--remove", value]
+            elif shutil.which("apt-get"):
                 args = ["apt-get", "-y", "remove", value]
-            elif shutil.which("dpkg"):
-                args = ["dpkg", "-r", value]
             else:
                 raise RuntimeError("apt-get or dpkg is required to uninstall deb packages")
         else:
@@ -1510,17 +1682,22 @@ def package_helper(action: str, value: str, reinstall: bool = False,
         env = os.environ.copy()
         env["DEBIAN_FRONTEND"] = "noninteractive"
         try:
-            result = subprocess.run(args, check=False, stdout=subprocess.PIPE,
-                                    stderr=subprocess.STDOUT, text=True, env=env,
-                                    timeout=PACKAGE_COMMAND_TIMEOUT_SECONDS)
+            command_started = True
+            result = run_package_helper_command(args, env)
         except subprocess.TimeoutExpired as exc:
             detail = compact_error(exc.stdout or exc.stderr or "")
+            mark_package_helper_failed(transaction_id, pending_path_value, 124)
+            if discard_failed_job_if_state_unchanged(transaction_id, pending_path_value):
+                emit("WARNING", "failed package command made no package state changes")
             emit("ERROR", "package command timed out" + (f": {detail}" if detail else ""), 124)
             return 124
         if result.stdout:
             sys.stdout.write(result.stdout)
         if result.returncode != 0:
             detail = compact_error(result.stdout or "")
+            mark_package_helper_failed(transaction_id, pending_path_value, result.returncode)
+            if discard_failed_job_if_state_unchanged(transaction_id, pending_path_value):
+                emit("WARNING", "failed package command made no package state changes")
             emit("ERROR", detail or "package command failed", result.returncode)
             return result.returncode
         if action == "install" and desktop:
@@ -1533,6 +1710,12 @@ def package_helper(action: str, value: str, reinstall: bool = False,
         mark_package_helper_complete(transaction_id, pending_path_value)
         return 0
     except Exception as exc:
+        if not command_started:
+            discard_unstarted_package_job(transaction_id, pending_path_value)
+        else:
+            mark_package_helper_failed(transaction_id, pending_path_value, 1)
+            if discard_failed_job_if_state_unchanged(transaction_id, pending_path_value):
+                emit("WARNING", "failed package command made no package state changes")
         emit("ERROR", str(exc), 1)
         return 1
 
@@ -1665,9 +1848,25 @@ def reconcile_pending_package_job(emit_result: bool = False) -> bool:
         return False
     try:
         installed, version = package_state(package)
+        helper_effect_verified = bool(pending.get("helper_completed"))
         if int(pending.get("schema_version") or 1) >= 2 and not pending.get("helper_completed"):
-            emit("WARNING", f"{action} outcome is not known; transaction was retained")
-            return False
+            expected = str(pending.get("expected_package_version") or "")
+            previously_installed = bool(pending.get("previously_installed"))
+            previous_version = str(pending.get("previous_version") or "")
+            dpkg_status, _ = package_dpkg_status(package)
+            state_proves_applied = (
+                action == "uninstall" and previously_installed and
+                dpkg_status in ("absent", "rc")
+            ) or (
+                action in ("install", "reinstall", "upgrade") and installed and expected and
+                version == expected and
+                (not previously_installed or previous_version != version)
+            )
+            if not state_proves_applied:
+                emit("WARNING", f"{action} outcome is not known; transaction was retained")
+                return False
+            helper_effect_verified = True
+            emit("WARNING", f"recovered {action} from verified package state")
         if action == "uninstall":
             if installed:
                 update_installed_record(app, package, version,
@@ -1690,7 +1889,7 @@ def reconcile_pending_package_job(emit_result: bool = False) -> bool:
                 records.pop(app_id, None)
                 write_json(installed_path(), records)
                 emit("WARNING", f"{action} was not applied; cleared stale record for {package}")
-            elif pending.get("helper_completed") or (
+            elif helper_effect_verified or (
                 int(pending.get("schema_version") or 1) < 2 and
                 action == "install" and not pending.get("previously_installed")
             ):
@@ -1733,12 +1932,20 @@ def prepare_package_job(action: str, app_id: str) -> int:
     try:
         existing = pending_package_job()
         if existing:
-            if (str(existing.get("action") or "") != action or
-                    str(existing.get("app_id") or "") not in (app_id, app_key(app)) or
-                    existing.get("helper_completed")):
+            same_app = str(existing.get("app_id") or "") in (app_id, app_key(app))
+            recovery_uninstall = (
+                action == "uninstall" and same_app and existing.get("helper_failed") and
+                str(existing.get("action") or "") in ("install", "reinstall", "upgrade")
+            )
+            if recovery_uninstall:
+                clear_pending_package_job()
+                existing = {}
+            elif (str(existing.get("action") or "") != action or not same_app or
+                  existing.get("helper_completed")):
                 raise RuntimeError(
                     f"another package transaction is pending: {existing.get('app_id') or 'unknown'}"
                 )
+        if existing:
             package = str(existing.get("package") or "")
             transaction_id = str(existing.get("transaction_id") or "")
             if action == "uninstall":

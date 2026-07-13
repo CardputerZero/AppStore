@@ -11,7 +11,12 @@
 #include "hal_lvgl_bsp.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include "job_output_buffer.hpp"
+#include "job_shutdown_flow.hpp"
+#include "low_battery_flow.hpp"
+#include "startup_network_flow.hpp"
 #include <cstdarg>
 #include <cctype>
 #include <csignal>
@@ -51,6 +56,7 @@ constexpr uint32_t kJobStartDelayMs = 80;
 constexpr uint32_t kJobPollIntervalMs = 250;
 constexpr uint32_t kTopStatusRefreshMs = 5000;
 constexpr uint32_t kBatteryChargeAnimRefreshMs = 120;
+constexpr uint32_t kLowBatteryFlashMs = 500;
 constexpr uint32_t kSyncAnimRefreshMs = 200;
 constexpr uint32_t kRegionDebounceMs = 2000;
 constexpr uint32_t kStatusScrollVisibleMs = 6000;
@@ -132,7 +138,15 @@ lv_timer_t *g_refresh_timer = nullptr;
 lv_timer_t *g_esc_hold_timer = nullptr;
 lv_timer_t *g_job_timer = nullptr;
 lv_timer_t *g_sync_timer = nullptr;
+lv_obj_t *g_low_battery_overlay = nullptr;
+lv_obj_t *g_low_battery_tint = nullptr;
+lv_obj_t *g_low_battery_countdown = nullptr;
 volatile sig_atomic_t g_quit_requested = 0;
+bool g_quit_cancel_sent = false;
+bool g_quit_background_cancel_sent = false;
+uint32_t g_quit_cancel_retry_tick = 0;
+uint32_t g_quit_background_retry_tick = 0;
+std::atomic<int> g_background_worker_count{0};
 
 std::string g_app_dir = ".";
 std::string g_status_message;
@@ -220,7 +234,6 @@ SyncStatus g_sync_status;
 uint32_t g_sync_visible_until_tick = 0;
 uint64_t g_sync_generation = 0;
 bool g_startup_sync_active = false;
-bool g_startup_sync_cancelled = false;
 bool g_startup_sync_failed = false;
 pthread_mutex_t g_summary_mutex = PTHREAD_MUTEX_INITIALIZER;
 bool g_summary_running = false;
@@ -252,6 +265,10 @@ std::string g_plan_output;
 int g_plan_rc = -1;
 cp0_wifi_status_t g_top_wifi_status = {};
 cp0_battery_info_t g_top_battery_status = {};
+appstore_ui::LowBatteryFlow g_low_battery_flow;
+appstore_ui::LowBatteryWarning g_rendered_battery_warning = appstore_ui::LowBatteryWarning::None;
+uint32_t g_low_battery_flash_tick = 0;
+uint32_t g_rendered_shutdown_seconds = 0;
 uint32_t g_top_status_tick = 0;
 uint32_t g_top_status_last_render_tick = 0;
 int g_sync_anim_phase = -1;
@@ -489,6 +506,18 @@ struct TraceScope {
     }
 };
 
+struct BackgroundWorkerScope {
+    ~BackgroundWorkerScope() { g_background_worker_count.fetch_sub(1); }
+};
+
+int start_background_worker(pthread_t *thread, void *(*entry)(void *), void *arg)
+{
+    g_background_worker_count.fetch_add(1);
+    int rc = pthread_create(thread, nullptr, entry, arg);
+    if (rc != 0) g_background_worker_count.fetch_sub(1);
+    return rc;
+}
+
 void request_quit()
 {
     g_quit_requested = 1;
@@ -617,6 +646,8 @@ cp0_wifi_status_t get_wifi_status()
     return st;
 }
 
+void apply_battery_status(const cp0_battery_info_t &info, uint32_t now);
+
 void update_top_status_cache(bool force = false)
 {
     if (!force && g_top_status_tick != 0 && lv_tick_elaps(g_top_status_tick) < kTopStatusRefreshMs) {
@@ -627,7 +658,8 @@ void update_top_status_cache(bool force = false)
     g_top_wifi_status = get_wifi_status();
     uint32_t wifi_ms = lv_tick_elaps(wifi_start);
     uint32_t battery_start = lv_tick_get();
-    g_top_battery_status = cp0_battery_read();
+    cp0_battery_info_t battery_status = cp0_battery_read();
+    apply_battery_status(battery_status, lv_tick_get());
     uint32_t battery_ms = lv_tick_elaps(battery_start);
     g_top_status_tick = lv_tick_get();
     uint32_t total_ms = lv_tick_elaps(start);
@@ -641,7 +673,6 @@ void update_top_status_cache(bool force = false)
 
 void request_summary_refresh();
 void sync_catalog(bool refresh_registries_after = false);
-void cancel_startup_sync_and_open_registry();
 void open_registry_screen();
 bool poll_plan_check();
 void start_plan_check(const std::string &action, const std::string &app_id);
@@ -754,6 +785,7 @@ void apply_registry_data(const RegistryData &registries)
 
 void *registry_refresh_thread_main(void *arg)
 {
+    BackgroundWorkerScope worker_scope;
     RegistryRefreshRequest request = *static_cast<RegistryRefreshRequest *>(arg);
     delete static_cast<RegistryRefreshRequest *>(arg);
     uint32_t start = lv_tick_get();
@@ -780,6 +812,7 @@ void *registry_refresh_thread_main(void *arg)
 
 void request_registry_refresh()
 {
+    if (g_quit_requested) return;
     std::fprintf(stderr, "[AppStore UI] request_registry_refresh\n");
     app_tracef("registry_refresh request screen=%s loading=%d entries=%zu",
                screen_name(g_screen), g_registry_loading ? 1 : 0, g_registry_entries.size());
@@ -800,7 +833,7 @@ void request_registry_refresh()
 
     pthread_t thread_id;
     auto *thread_arg = new RegistryRefreshRequest{fallback, generation};
-    if (pthread_create(&thread_id, nullptr, registry_refresh_thread_main, thread_arg) != 0) {
+    if (start_background_worker(&thread_id, registry_refresh_thread_main, thread_arg) != 0) {
         delete thread_arg;
         pthread_mutex_lock(&g_registry_mutex);
         g_registry_refresh_running = false;
@@ -970,6 +1003,7 @@ bool registry_op_available()
 
 void *registry_op_thread_main(void *arg)
 {
+    BackgroundWorkerScope worker_scope;
     RegistryOpRequest request = *static_cast<RegistryOpRequest *>(arg);
     delete static_cast<RegistryOpRequest *>(arg);
     uint32_t start = lv_tick_get();
@@ -1020,6 +1054,7 @@ void *registry_op_thread_main(void *arg)
 
 void start_registry_op(const RegistryOpRequest &request, const std::string &status)
 {
+    if (g_quit_requested) return;
     app_tracef("registry_op start request kind=%d status=%s screen=%s",
                static_cast<int>(request.kind), status.c_str(), screen_name(g_screen));
     pthread_mutex_lock(&g_registry_op_mutex);
@@ -1038,7 +1073,7 @@ void start_registry_op(const RegistryOpRequest &request, const std::string &stat
     pthread_t thread_id;
     auto *thread_arg = new RegistryOpRequest(request);
     thread_arg->generation = generation;
-    if (pthread_create(&thread_id, nullptr, registry_op_thread_main, thread_arg) != 0) {
+    if (start_background_worker(&thread_id, registry_op_thread_main, thread_arg) != 0) {
         delete thread_arg;
         pthread_mutex_lock(&g_registry_op_mutex);
         g_registry_op_running = false;
@@ -1258,6 +1293,83 @@ void box(int x, int y, int w, int h, uint32_t color, uint32_t border = 0x2A3A46,
     lv_obj_set_style_bg_opa(obj, bg_opa, 0);
     lv_obj_set_style_border_width(obj, border_width, 0);
     lv_obj_set_style_border_color(obj, lv_color_hex(border), 0);
+}
+
+void create_low_battery_overlay()
+{
+    if (g_low_battery_overlay) return;
+    g_low_battery_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(g_low_battery_overlay);
+    lv_obj_set_pos(g_low_battery_overlay, 0, 0);
+    lv_obj_set_size(g_low_battery_overlay, kScreenWidth, kScreenHeight);
+    lv_obj_clear_flag(g_low_battery_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(g_low_battery_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_low_battery_overlay, LV_OBJ_FLAG_IGNORE_LAYOUT);
+
+    g_low_battery_tint = lv_obj_create(g_low_battery_overlay);
+    lv_obj_remove_style_all(g_low_battery_tint);
+    lv_obj_set_size(g_low_battery_tint, kScreenWidth, kScreenHeight);
+    lv_obj_set_style_bg_color(g_low_battery_tint, lv_color_hex(0xFF0000), 0);
+    lv_obj_set_style_bg_opa(g_low_battery_tint, LV_OPA_20, 0);
+    lv_obj_clear_flag(g_low_battery_tint, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *panel = lv_obj_create(g_low_battery_overlay);
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_pos(panel, 18, 39);
+    lv_obj_set_size(panel, 284, 94);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(0x160000), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_80, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(0xFF3030), 0);
+    lv_obj_set_style_border_width(panel, 2, 0);
+
+    center_strong_label(panel, "LOW BATTERY", 12, 10, 260, 18,
+                        &lv_font_montserrat_14, 0xFFFFFF);
+    g_low_battery_countdown = center_label(
+        panel, "", 12, 34, 260, 18, &lv_font_montserrat_14, 0xFF4444);
+    center_label(panel, "Shut down now or connect a charger.", 12, 62, 260, 15,
+                 &lv_font_montserrat_10, 0xFFFFFF, LV_LABEL_LONG_DOT);
+    lv_obj_add_flag(g_low_battery_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+void update_low_battery_overlay(uint32_t now, bool force = false)
+{
+    const appstore_ui::LowBatteryWarning warning = g_low_battery_flow.warning();
+    if (warning == appstore_ui::LowBatteryWarning::None) {
+        if (g_low_battery_overlay)
+            lv_obj_add_flag(g_low_battery_overlay, LV_OBJ_FLAG_HIDDEN);
+        g_rendered_battery_warning = warning;
+        g_rendered_shutdown_seconds = 0;
+        return;
+    }
+
+    create_low_battery_overlay();
+    if (!g_low_battery_overlay) return;
+    lv_obj_move_foreground(g_low_battery_overlay);
+    lv_obj_clear_flag(g_low_battery_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    const uint32_t seconds = g_low_battery_flow.seconds_until_shutdown(now);
+    if (force || warning != g_rendered_battery_warning ||
+        seconds != g_rendered_shutdown_seconds) {
+        std::string text = warning == appstore_ui::LowBatteryWarning::ShutdownCountdown
+            ? "Power off in " + std::to_string(seconds) + "s"
+            : "Battery below 5%";
+        lv_label_set_text(g_low_battery_countdown, text.c_str());
+        g_rendered_battery_warning = warning;
+        g_rendered_shutdown_seconds = seconds;
+    }
+}
+
+void apply_battery_status(const cp0_battery_info_t &info, uint32_t now)
+{
+    g_top_battery_status = info;
+    g_low_battery_flow.update(info.valid != 0, info.soc, (info.flags & 1) != 0, now);
+    update_low_battery_overlay(now, true);
+}
+
+void handle_battery_event(lv_event_t *event)
+{
+    auto *info = static_cast<cp0_battery_info_t *>(lv_event_get_param(event));
+    if (info) apply_battery_status(*info, lv_tick_get());
 }
 
 void draw_system_bar()
@@ -1601,6 +1713,7 @@ void draw_home_icon_panel(const StoreApp *app)
 
 void *summary_thread_main(void *arg)
 {
+    BackgroundWorkerScope worker_scope;
     SummaryRequest request = *static_cast<SummaryRequest *>(arg);
     delete static_cast<SummaryRequest *>(arg);
     SummaryData summary = load_summary(request.rule);
@@ -1620,6 +1733,7 @@ void *summary_thread_main(void *arg)
 
 void request_summary_refresh()
 {
+    if (g_quit_requested) return;
     std::fprintf(stderr, "[AppStore UI] request_summary_refresh\n");
     pthread_mutex_lock(&g_summary_mutex);
     if (g_summary_running) {
@@ -1637,7 +1751,7 @@ void request_summary_refresh()
 
     pthread_t thread_id;
     auto *thread_arg = new SummaryRequest{rule_value, generation};
-    if (pthread_create(&thread_id, nullptr, summary_thread_main, thread_arg) != 0) {
+    if (start_background_worker(&thread_id, summary_thread_main, thread_arg) != 0) {
         delete thread_arg;
         pthread_mutex_lock(&g_summary_mutex);
         g_summary_running = false;
@@ -2024,8 +2138,8 @@ void render_startup_sync()
     draw_system_bar();
     box(0, 20, 320, 150, 0x080B10, 0x080B10, 0);
     box(0, 20, 320, 22, 0x101B2D, 0x101B2D, 0);
-    label(g_root, "Syncing Catalog", 8, 24, 190, 15, &lv_font_montserrat_12, 0xFFFFFF);
-    label(g_root, "Esc Exit", 262, 24, 52, 14, &lv_font_montserrat_10, 0xAECBFA);
+    label(g_root, "Checking Network", 8, 24, 190, 15, &lv_font_montserrat_12, 0xFFFFFF);
+    label(g_root, "Hold ESC", 254, 24, 60, 14, &lv_font_montserrat_10, 0xAECBFA);
 
     std::string phase = g_sync_status.phase.empty() ? "registry" : g_sync_status.phase;
     center_strong_label(g_root, upper_ascii(phase), 28, 47, 264, 16,
@@ -2057,7 +2171,7 @@ void render_startup_sync()
     center_label(g_root, one_line(detail, 52), 18, 119, 284, 14,
                  &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
 
-    std::string cancel = g_sync_status.cancel_requested ? "Cancelling..." : "S Settings   4 Settings   Esc Exit";
+    std::string cancel = g_sync_status.cancel_requested ? "Cancelling..." : "Checking connection...   Hold ESC: Exit";
     center_strong_label(g_root, cancel, 18, 151, 284, 12,
                         &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
 
@@ -2068,11 +2182,11 @@ void render_startup_sync()
     center_strong_label(g_root, g_error_title.empty() ? "NETWORK FAILED" : g_error_title,
                         32, 44, 256, 15, &lv_font_montserrat_12, 0xFFFFFF, LV_LABEL_LONG_DOT);
 
-    std::string message = g_error_message.empty() ? "Unable to sync catalog." : g_error_message;
+    std::string message = g_error_message.empty() ? "Network check failed." : g_error_message;
     center_strong_label(g_root, one_line(message, 38), 30, 73, 260, 15,
                         &lv_font_montserrat_12, 0xFFD2D2, LV_LABEL_LONG_DOT);
 
-    std::string alert_detail = g_error_detail.empty() ? "Check Wi-Fi, then open AppStore again." : g_error_detail;
+    std::string alert_detail = g_error_detail.empty() ? "Check Wi-Fi before opening AppStore again." : g_error_detail;
     std::vector<std::string> lines = wrap_display_text(alert_detail, 44);
     int y = 94;
     for (size_t i = 0; i < lines.size() && i < 2; ++i) {
@@ -2083,7 +2197,7 @@ void render_startup_sync()
 
     box(118, 124, 84, 17, 0x2EA043, 0xCCCC33, 2, 2);
     center_strong_label(g_root, "OK", 122, 127, 76, 12, &lv_font_montserrat_10, 0xFFFFFF);
-    center_label(g_root, "Enter OK", 102, 153, 116, 12, &lv_font_montserrat_10, 0xCCCC33);
+    center_label(g_root, "OK / Hold ESC: Exit", 82, 153, 156, 12, &lv_font_montserrat_10, 0xCCCC33);
 }
 
 void draw_radio_option(int x, int y, const std::string &text, bool selected, bool focused)
@@ -2350,6 +2464,26 @@ bool allow_sync_anim_render()
 void refresh_timer_cb(lv_timer_t *)
 {
     uint32_t start = lv_tick_get();
+    update_low_battery_overlay(start);
+    if (g_low_battery_overlay &&
+        g_low_battery_flow.warning() != appstore_ui::LowBatteryWarning::None &&
+        lv_tick_elaps(g_low_battery_flash_tick) >= kLowBatteryFlashMs) {
+        g_low_battery_flash_tick = start;
+        lv_opa_t opacity = lv_obj_get_style_bg_opa(g_low_battery_tint, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(g_low_battery_tint,
+                                opacity == LV_OPA_20 ? LV_OPA_50 : LV_OPA_20, 0);
+    }
+    if (g_low_battery_flow.shutdown_due(start)) {
+        // Battery events arrive every few seconds. Re-read at and after the
+        // deadline so a final-interval charger connection cancels shutdown.
+        cp0_battery_info_t confirmation = cp0_battery_read();
+        apply_battery_status(confirmation, start);
+        if (g_low_battery_flow.confirm_shutdown(
+                confirmation.valid != 0, (confirmation.flags & 1) != 0, start)) {
+            app_tracef("battery reached 0%%; 15 second warning elapsed, requesting shutdown");
+            cp0_system_shutdown();
+        }
+    }
     bool region_debounce = poll_region_debounce();
     if (region_debounce) {
         render();
@@ -2460,8 +2594,10 @@ void finish_backend_job(const std::string &out, const std::string &rc_text)
     g_job_phase = JobPhase::Idle;
     g_job_rc = -1;
     g_job_done = false;
-    request_summary_refresh();
-    g_screen = ok ? Screen::Detail : Screen::ErrorDialog;
+    if (!g_quit_requested) {
+        request_summary_refresh();
+        g_screen = ok ? Screen::Detail : Screen::ErrorDialog;
+    }
 }
 
 bool parse_package_job(const std::string &output)
@@ -2593,9 +2729,26 @@ void poll_backend_job()
     std::string detail = g_job_detail.empty() ? job_action_label(g_job_action) : g_job_detail;
     if (g_job_progress >= 0)
         detail += " " + std::to_string(g_job_progress) + "%";
-    g_status_message = detail + " " + one_line(g_job_title, 16) + " " + std::to_string(elapsed) + "s";
+    if (g_job_cancel_requested)
+        g_status_message = "Cancelling package operation...";
+    else
+        g_status_message = detail + " " + one_line(g_job_title, 16) + " " + std::to_string(elapsed) + "s";
     if (!done) return;
     if (g_job_phase == JobPhase::Prepare && rc == 0) {
+        if (parse_package_job(out)) {
+            pthread_mutex_lock(&g_job_mutex);
+            g_job_done = false;
+            g_job_rc = -1;
+            pthread_mutex_unlock(&g_job_mutex);
+            if (start_sudo_job() && g_job_cancel_requested && g_job_sudo_request_id != 0) {
+                g_quit_cancel_sent = false;
+                int cancel_rc = cp0_sudo_cancel(g_job_sudo_request_id);
+                if (cancel_rc == 0 || cancel_rc == -ENOENT)
+                    g_quit_cancel_sent = true;
+                g_status_message = "Cancelling package operation...";
+            }
+            return;
+        }
         if (g_job_cancel_requested) {
             pthread_mutex_lock(&g_job_mutex);
             g_job_output_buffer.append("ERROR\tPackage operation cancelled\n", sizeof("ERROR\tPackage operation cancelled\n") - 1);
@@ -2603,14 +2756,6 @@ void poll_backend_job()
             out = job_output_snapshot_locked();
             pthread_mutex_unlock(&g_job_mutex);
             finish_backend_job(out, "1");
-            return;
-        }
-        if (parse_package_job(out)) {
-            pthread_mutex_lock(&g_job_mutex);
-            g_job_done = false;
-            g_job_rc = -1;
-            pthread_mutex_unlock(&g_job_mutex);
-            start_sudo_job();
             return;
         }
         pthread_mutex_lock(&g_job_mutex);
@@ -2688,7 +2833,7 @@ void job_timer_cb(lv_timer_t *)
         g_status_message = job_action_label(g_job_action) + " " + one_line(g_job_title, 18) + "... 0s";
     }
     poll_backend_job();
-    render();
+    if (!g_quit_requested) render();
 }
 
 void update_local_job_app_state(bool ok, const std::string &out)
@@ -2725,7 +2870,7 @@ void navigate_back()
 {
     switch (g_screen) {
         case Screen::StartupSync:
-            request_quit();
+            // Exit from startup checking only via failure OK or long ESC.
             break;
         case Screen::Home:
             break;
@@ -2743,9 +2888,10 @@ void navigate_back()
             if (g_job_running || g_job_pending_start) {
                 if (g_job_phase == JobPhase::Sudo && g_job_sudo_request_id != 0) {
                     int rc = cp0_sudo_cancel(g_job_sudo_request_id);
-                    if (rc == 0)
+                    if (rc == 0) {
+                        g_job_cancel_requested = true;
                         g_status_message = "Cancelling package operation...";
-                    else
+                    } else
                         g_status_message = "Unable to cancel package operation";
                 } else if (g_job_phase == JobPhase::Prepare) {
                     if (cancel_package_prepare()) {
@@ -2812,6 +2958,7 @@ void apply_sync_output(const std::string &out, bool refresh_registries_after)
 
 void *sync_thread_main(void *arg)
 {
+    BackgroundWorkerScope worker_scope;
     SyncRequest request = *static_cast<SyncRequest *>(arg);
     delete static_cast<SyncRequest *>(arg);
     std::fprintf(stderr, "[AppStore UI] sync thread start\n");
@@ -2837,6 +2984,7 @@ void *sync_thread_main(void *arg)
 
 void sync_catalog(bool refresh_registries_after)
 {
+    if (g_quit_requested) return;
     std::fprintf(stderr, "[AppStore UI] sync_catalog request refresh_registries=%d\n",
                  refresh_registries_after ? 1 : 0);
     pthread_mutex_lock(&g_sync_mutex);
@@ -2855,10 +3003,10 @@ void sync_catalog(bool refresh_registries_after)
     uint64_t generation = ++g_sync_generation;
     pthread_mutex_unlock(&g_sync_mutex);
 
-    g_status_message = "Syncing catalog...";
+    g_status_message = g_startup_sync_active ? "Checking network..." : "Syncing catalog...";
     pthread_t thread_id;
     auto *thread_arg = new SyncRequest{generation};
-    if (pthread_create(&thread_id, nullptr, sync_thread_main, thread_arg) != 0) {
+    if (start_background_worker(&thread_id, sync_thread_main, thread_arg) != 0) {
         delete thread_arg;
         pthread_mutex_lock(&g_sync_mutex);
         g_sync_running = false;
@@ -2867,6 +3015,19 @@ void sync_catalog(bool refresh_registries_after)
         pthread_mutex_unlock(&g_sync_mutex);
         g_status_message = "Unable to start sync";
         std::fprintf(stderr, "[AppStore UI] sync_catalog failed: pthread_create\n");
+        if (g_startup_sync_active) {
+            g_startup_sync_active = false;
+            g_startup_sync_failed = true;
+            g_sync_status.running = false;
+            g_sync_status.percent = -1;
+            g_sync_status.phase = "network";
+            g_sync_status.detail = "Unable to start network check";
+            g_error_title = "NETWORK FAILED";
+            g_error_message = "Network check failed";
+            g_error_detail = "Unable to start the network check. Hold ESC or press OK to exit.";
+            g_status_message.clear();
+            render();
+        }
         return;
     }
     pthread_detach(thread_id);
@@ -2922,15 +3083,17 @@ void sync_timer_cb(lv_timer_t *)
     if (g_startup_sync_active) {
         g_startup_sync_active = false;
         std::string startup_error;
-        if (sync_output_failed_for_startup(out, &startup_error)) {
+        bool startup_failed = sync_output_failed_for_startup(out, &startup_error);
+        if (startup_network_completion(startup_failed) ==
+            StartupNetworkCompletion::STAY_FAILED) {
             g_startup_sync_failed = true;
             g_sync_status.running = false;
             g_sync_status.percent = -1;
             g_sync_status.phase = "network";
             g_sync_status.detail = "Network sync failed";
             g_error_title = "NETWORK FAILED";
-            g_error_message = "Catalog sync failed";
-            g_error_detail = startup_error.empty() ? "Check Wi-Fi, then open AppStore again." : startup_error;
+            g_error_message = "Network check failed";
+            g_error_detail = startup_error.empty() ? "Check Wi-Fi before opening AppStore again." : startup_error;
             g_status_message.clear();
             render();
             return;
@@ -2943,30 +3106,6 @@ void sync_timer_cb(lv_timer_t *)
         apply_sync_output(out, refresh_registries_after);
     }
     render();
-}
-
-void cancel_startup_sync_and_open_registry()
-{
-    if (g_startup_sync_active) {
-        if (!cancel_sync()) {
-            g_status_message = "Unable to cancel startup sync";
-            render();
-            return;
-        }
-        g_startup_sync_cancelled = true;
-        pthread_mutex_lock(&g_sync_mutex);
-        ++g_sync_generation;
-        g_sync_running = false;
-        g_sync_done = false;
-        g_sync_output.clear();
-        g_sync_refresh_registries = false;
-        pthread_mutex_unlock(&g_sync_mutex);
-        g_startup_sync_active = false;
-        g_sync_status.cancel_requested = true;
-        g_sync_status.detail = "Cancelling sync...";
-        g_status_message = "Startup sync cancelled";
-    }
-    open_registry_screen();
 }
 
 void open_registry_screen()
@@ -3335,6 +3474,7 @@ bool parse_plan(const std::string &out)
 
 void *plan_thread_main(void *)
 {
+    BackgroundWorkerScope worker_scope;
     std::string app_id;
     pthread_mutex_lock(&g_plan_mutex);
     app_id = g_plan_app_id;
@@ -3352,6 +3492,7 @@ void *plan_thread_main(void *)
 
 void start_plan_check(const std::string &action, const std::string &app_id)
 {
+    if (g_quit_requested) return;
     pthread_mutex_lock(&g_plan_mutex);
     if (g_plan_running) {
         pthread_mutex_unlock(&g_plan_mutex);
@@ -3369,7 +3510,7 @@ void start_plan_check(const std::string &action, const std::string &app_id)
 
     g_status_message = "Checking install plan...";
     pthread_t thread_id;
-    if (pthread_create(&thread_id, nullptr, plan_thread_main, nullptr) != 0) {
+    if (start_background_worker(&thread_id, plan_thread_main, nullptr) != 0) {
         pthread_mutex_lock(&g_plan_mutex);
         g_plan_running = false;
         pthread_mutex_unlock(&g_plan_mutex);
@@ -3613,6 +3754,7 @@ void execute_confirm()
 
 void handle_key(const KeyEvent &key)
 {
+    if (g_quit_requested) return;
     uint32_t key_start = lv_tick_get();
     Screen before_screen = g_screen;
     app_tracef("handle_key begin screen=%s code=%u ch=%d release=%d repeat=%d",
@@ -3625,8 +3767,10 @@ void handle_key(const KeyEvent &key)
             g_esc_pressed = false;
             g_esc_long_consumed = false;
             if (do_back) {
-                navigate_back();
-                render();
+                if (g_screen != Screen::StartupSync) {
+                    navigate_back();
+                    render();
+                }
             }
         } else if (!key.repeated) {
             g_esc_pressed = true;
@@ -3650,11 +3794,8 @@ void handle_key(const KeyEvent &key)
     }
     switch (g_screen) {
         case Screen::StartupSync:
-            if (g_startup_sync_failed && key.code == KEY_ENTER) {
-                request_quit();
-            } else if (!g_startup_sync_failed && (key_matches(key, 's', KEY_S) || key_matches(key, '4', KEY_4))) {
-                cancel_startup_sync_and_open_registry();
-            } else if (key_matches(key, 'q', KEY_Q)) {
+            if (startup_network_key_action(g_startup_sync_failed, key.code == KEY_ENTER) ==
+                StartupNetworkKeyAction::EXIT) {
                 request_quit();
             }
             break;
@@ -3883,6 +4024,8 @@ void build_ui()
     lv_obj_set_size(g_root, kScreenWidth, kScreenHeight);
     lv_obj_clear_flag(g_root, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(g_root, handle_keyboard_event, static_cast<lv_event_code_t>(LV_EVENT_KEYBOARD), nullptr);
+    lv_obj_add_event_cb(g_root, handle_battery_event,
+                        static_cast<lv_event_code_t>(lv_c_event[CP0_C_EVENT_BATTERY]), nullptr);
 
     g_group = lv_group_create();
     lv_group_add_obj(g_group, g_root);
@@ -3898,6 +4041,9 @@ void ui_init(int, char **argv)
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
     cp0_zmq_log_init();
+    g_low_battery_flow.reset();
+    g_rendered_battery_warning = appstore_ui::LowBatteryWarning::None;
+    g_rendered_shutdown_seconds = 0;
 
     g_app_dir = dirname_of(argv && argv[0] ? argv[0] : nullptr);
     set_backend_script_path(resolve_script_path(g_app_dir));
@@ -3909,10 +4055,11 @@ void ui_init(int, char **argv)
     init_runtime_fonts(g_app_dir);
     build_ui();
     update_top_status_cache(true);
+    apply_battery_status(g_top_battery_status, lv_tick_get());
     g_screen = Screen::StartupSync;
     g_startup_sync_active = true;
-    g_sync_status.detail = "Preparing catalog sync...";
-    g_sync_status.phase = "startup";
+    g_sync_status.detail = "Checking network connection...";
+    g_sync_status.phase = "network";
     g_sync_status.url = g_region_registry_url;
     render();
     sync_shared_registry_config_on_startup();
@@ -3937,10 +4084,46 @@ void ui_deinit()
     if (g_refresh_timer) lv_timer_delete(g_refresh_timer);
     if (g_job_timer) lv_timer_delete(g_job_timer);
     if (g_sync_timer) lv_timer_delete(g_sync_timer);
+    if (g_low_battery_overlay) lv_obj_del(g_low_battery_overlay);
+    g_low_battery_overlay = nullptr;
+    g_low_battery_tint = nullptr;
+    g_low_battery_countdown = nullptr;
+    g_low_battery_flow.reset();
     stop_backend_service();
 }
 
 bool ui_should_quit()
 {
-    return g_quit_requested != 0;
+    if (g_quit_requested && !g_quit_background_cancel_sent) {
+        uint32_t now = lv_tick_get();
+        if (!sync_is_running() ||
+            (lv_tick_elaps(g_quit_background_retry_tick) >= 250 && cancel_sync()))
+            g_quit_background_cancel_sent = true;
+        else if (lv_tick_elaps(g_quit_background_retry_tick) >= 250)
+            g_quit_background_retry_tick = now;
+    }
+    appstore_ui::ShutdownJobPhase phase = appstore_ui::ShutdownJobPhase::Idle;
+    if (g_job_phase == JobPhase::Prepare) phase = appstore_ui::ShutdownJobPhase::Prepare;
+    else if (g_job_phase == JobPhase::Sudo) phase = appstore_ui::ShutdownJobPhase::Sudo;
+    else if (g_job_phase == JobPhase::Finalize) phase = appstore_ui::ShutdownJobPhase::Finalize;
+    appstore_ui::ShutdownAction action = appstore_ui::shutdown_action(
+        g_quit_requested != 0, g_job_running, g_job_pending_start,
+        g_quit_cancel_sent, phase, g_job_sudo_request_id != 0);
+    if (action == appstore_ui::ShutdownAction::Ready)
+        return g_background_worker_count.load() == 0;
+    if (action == appstore_ui::ShutdownAction::KeepRunning) return false;
+    if (lv_tick_elaps(g_quit_cancel_retry_tick) < 250) return false;
+    g_quit_cancel_retry_tick = lv_tick_get();
+
+    g_job_cancel_requested = true;
+    if (action == appstore_ui::ShutdownAction::CancelPendingPrepare) {
+        g_quit_cancel_sent = true;
+        finish_backend_job("ERROR\tPackage operation cancelled\n", "1");
+    } else if (action == appstore_ui::ShutdownAction::CancelPrepare) {
+        if (cancel_package_prepare()) g_quit_cancel_sent = true;
+    } else if (action == appstore_ui::ShutdownAction::CancelSudo) {
+        int rc = cp0_sudo_cancel(g_job_sudo_request_id);
+        if (rc == 0 || rc == -ENOENT) g_quit_cancel_sent = true;
+    }
+    return false;
 }
