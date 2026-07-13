@@ -11,6 +11,7 @@
 #include "hal_lvgl_bsp.h"
 
 #include <algorithm>
+#include "job_output_buffer.hpp"
 #include <cstdarg>
 #include <cctype>
 #include <csignal>
@@ -189,7 +190,7 @@ std::string g_job_app_id;
 std::string g_job_title;
 std::string g_job_stage;
 std::string g_job_detail;
-std::string g_job_output;
+appstore::JobOutputBuffer g_job_output_buffer;
 std::string g_job_helper_action;
 std::string g_job_helper_value;
 std::string g_job_helper_desktop;
@@ -2448,7 +2449,7 @@ void finish_backend_job(const std::string &out, const std::string &rc_text)
     g_job_progress = -1;
     g_job_stage.clear();
     g_job_detail.clear();
-    g_job_output.clear();
+    g_job_output_buffer.clear();
     g_job_helper_action.clear();
     g_job_helper_value.clear();
     g_job_helper_desktop.clear();
@@ -2488,12 +2489,19 @@ bool parse_package_job(const std::string &output)
     return false;
 }
 
+// Protocol records are retained separately so tail truncation cannot discard them.
+// Build one canonical view without presenting the same record twice to parsers.
+std::string job_output_snapshot_locked()
+{
+    return g_job_output_buffer.snapshot();
+}
+
 void sudo_job_output(const char *data, size_t size, void *)
 {
     if (!data || size == 0)
         return;
     pthread_mutex_lock(&g_job_mutex);
-    g_job_output.append(data, size);
+    g_job_output_buffer.append(data, size);
     pthread_mutex_unlock(&g_job_mutex);
 }
 
@@ -2511,14 +2519,17 @@ void sudo_job_complete(cp0_sudo_result_t result, int exit_code, void *)
     }
     pthread_mutex_lock(&g_job_mutex);
     if (result == CP0_SUDO_RESULT_AUTH_FAILED)
-        g_job_output += "ERROR\tSudo authentication failed after 3 attempts\n";
+        g_job_output_buffer.append("ERROR\tSudo authentication failed after 3 attempts\n", sizeof("ERROR\tSudo authentication failed after 3 attempts\n") - 1);
     else if (result == CP0_SUDO_RESULT_CANCELLED)
-        g_job_output += "ERROR\tPackage operation cancelled\n";
+        g_job_output_buffer.append("ERROR\tPackage operation cancelled\n", sizeof("ERROR\tPackage operation cancelled\n") - 1);
     else if (result == CP0_SUDO_RESULT_TIMED_OUT)
-        g_job_output += "ERROR\tPackage operation timed out\n";
-    else if (g_job_output.find("ERROR\t") == std::string::npos)
-        g_job_output += "ERROR\tPrivileged package command failed\t" +
-                        std::to_string(exit_code) + "\n";
+        g_job_output_buffer.append("ERROR\tPackage operation timed out\n", sizeof("ERROR\tPackage operation timed out\n") - 1);
+    else if (g_job_output_buffer.snapshot().find("ERROR\t") == std::string::npos)
+        {
+            std::string error = "ERROR\tPrivileged package command failed\t" +
+                                std::to_string(exit_code) + "\n";
+            g_job_output_buffer.append(error.data(), error.size());
+        }
     g_job_rc = exit_code == 0 ? 1 : exit_code;
     g_job_done = true;
     pthread_mutex_unlock(&g_job_mutex);
@@ -2555,7 +2566,7 @@ bool start_sudo_job()
                                         &g_job_sudo_request_id);
     if (rc != 0) {
         pthread_mutex_lock(&g_job_mutex);
-        g_job_output += "ERROR\tUnable to start sudo request\n";
+        g_job_output_buffer.append("ERROR\tUnable to start sudo request\n", sizeof("ERROR\tUnable to start sudo request\n") - 1);
         g_job_rc = rc;
         g_job_done = true;
         pthread_mutex_unlock(&g_job_mutex);
@@ -2574,7 +2585,7 @@ void poll_backend_job()
     int rc = -1;
     bool done = false;
     pthread_mutex_lock(&g_job_mutex);
-    out = g_job_output;
+    out = job_output_snapshot_locked();
     rc = g_job_rc;
     done = g_job_done;
     pthread_mutex_unlock(&g_job_mutex);
@@ -2587,10 +2598,11 @@ void poll_backend_job()
     if (g_job_phase == JobPhase::Prepare && rc == 0) {
         if (g_job_cancel_requested) {
             pthread_mutex_lock(&g_job_mutex);
-            g_job_output += "ERROR\tPackage operation cancelled\n";
+            g_job_output_buffer.append("ERROR\tPackage operation cancelled\n", sizeof("ERROR\tPackage operation cancelled\n") - 1);
             g_job_rc = 1;
+            out = job_output_snapshot_locked();
             pthread_mutex_unlock(&g_job_mutex);
-            finish_backend_job(g_job_output, "1");
+            finish_backend_job(out, "1");
             return;
         }
         if (parse_package_job(out)) {
@@ -2602,12 +2614,13 @@ void poll_backend_job()
             return;
         }
         pthread_mutex_lock(&g_job_mutex);
-        g_job_output += "ERROR\tPackage preparation returned no helper command\n";
+        g_job_output_buffer.append("ERROR\tPackage preparation returned no helper command\n", sizeof("ERROR\tPackage preparation returned no helper command\n") - 1);
         g_job_rc = 1;
+        out = job_output_snapshot_locked();
         pthread_mutex_unlock(&g_job_mutex);
         rc = 1;
     }
-    finish_backend_job(g_job_output, std::to_string(rc));
+    finish_backend_job(out, std::to_string(rc));
 }
 
 struct BackendJobContext {
@@ -2629,10 +2642,12 @@ void *backend_job_thread_main(void *user)
                static_cast<int>(context->phase), context->action.c_str(), context->app_id.c_str());
     std::string out = backend_capture(args, &rc);
     pthread_mutex_lock(&g_job_mutex);
-    if (context->phase == JobPhase::Prepare)
-        g_job_output = out;
-    else
-        g_job_output += out;
+    if (context->phase == JobPhase::Prepare) {
+        g_job_output_buffer.clear();
+        g_job_output_buffer.append(out.data(), out.size());
+    } else {
+        g_job_output_buffer.append(out.data(), out.size());
+    }
     g_job_rc = rc;
     g_job_done = true;
     pthread_mutex_unlock(&g_job_mutex);
@@ -2646,7 +2661,7 @@ void job_timer_cb(lv_timer_t *)
         g_job_pending_start = false;
         pthread_mutex_lock(&g_job_mutex);
         if (g_job_phase == JobPhase::Prepare)
-            g_job_output.clear();
+            g_job_output_buffer.clear();
         g_job_rc = -1;
         g_job_done = false;
         pthread_mutex_unlock(&g_job_mutex);
@@ -2656,11 +2671,12 @@ void job_timer_cb(lv_timer_t *)
         if (!context || pthread_create(&g_job_thread, nullptr, backend_job_thread_main, context) != 0) {
             delete context;
             pthread_mutex_lock(&g_job_mutex);
-            g_job_output += "ERROR\tUnable to start package worker\n";
+            g_job_output_buffer.append("ERROR\tUnable to start package worker\n", sizeof("ERROR\tUnable to start package worker\n") - 1);
             g_job_rc = 1;
             g_job_done = true;
+            std::string out = job_output_snapshot_locked();
             pthread_mutex_unlock(&g_job_mutex);
-            finish_backend_job(g_job_output, "1");
+            finish_backend_job(out, "1");
             render();
             return;
         }
@@ -2726,12 +2742,18 @@ void navigate_back()
         case Screen::Progress:
             if (g_job_running || g_job_pending_start) {
                 if (g_job_phase == JobPhase::Sudo && g_job_sudo_request_id != 0) {
-                    cp0_sudo_cancel(g_job_sudo_request_id);
-                    g_status_message = "Cancelling package operation...";
+                    int rc = cp0_sudo_cancel(g_job_sudo_request_id);
+                    if (rc == 0)
+                        g_status_message = "Cancelling package operation...";
+                    else
+                        g_status_message = "Unable to cancel package operation";
                 } else if (g_job_phase == JobPhase::Prepare) {
-                    g_job_cancel_requested = true;
-                    cancel_package_prepare();
-                    g_status_message = "Cancelling package preparation...";
+                    if (cancel_package_prepare()) {
+                        g_job_cancel_requested = true;
+                        g_status_message = "Cancelling package preparation...";
+                    } else {
+                        g_status_message = "Unable to cancel package preparation";
+                    }
                 } else {
                     g_status_message = "Operation is still running";
                 }
@@ -2926,8 +2948,12 @@ void sync_timer_cb(lv_timer_t *)
 void cancel_startup_sync_and_open_registry()
 {
     if (g_startup_sync_active) {
+        if (!cancel_sync()) {
+            g_status_message = "Unable to cancel startup sync";
+            render();
+            return;
+        }
         g_startup_sync_cancelled = true;
-        cancel_sync();
         pthread_mutex_lock(&g_sync_mutex);
         ++g_sync_generation;
         g_sync_running = false;
@@ -3543,7 +3569,7 @@ void start_backend_job(const std::string &action, StoreApp *app)
     g_job_title = app->name;
     g_job_stage.clear();
     g_job_detail = "Preparing package worker";
-    g_job_output.clear();
+    g_job_output_buffer.clear();
     g_job_helper_action.clear();
     g_job_helper_value.clear();
     g_job_helper_desktop.clear();
