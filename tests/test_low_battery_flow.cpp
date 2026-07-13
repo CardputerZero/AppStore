@@ -44,21 +44,16 @@ int main()
     assert(!flow.confirm_shutdown(true, false, 4999));
     assert(flow.confirm_shutdown(true, false, 9999));
 
-    LowBatteryFlow invalid_reading;
-    invalid_reading.update(true, 0, false, 1000);
-    assert(!invalid_reading.confirm_shutdown(false, false, 16000));
-    assert(!invalid_reading.confirm_shutdown(false, false, 18999));
-    assert(invalid_reading.confirm_shutdown(false, false, 19000));
-
-    LowBatteryFlow recovered_charging;
-    recovered_charging.update(true, 0, false, 1000);
-    assert(!recovered_charging.confirm_shutdown(false, false, 16000));
-    assert(!recovered_charging.confirm_shutdown(true, true, 17000));
-    assert(recovered_charging.warning() == LowBatteryWarning::None);
+    LowBatteryFlow unavailable_battery;
+    unavailable_battery.update(true, 0, false, 1000);
+    unavailable_battery.update(false, 0, false, 5000);
+    assert(unavailable_battery.warning() == LowBatteryWarning::None);
+    assert(!unavailable_battery.shutdown_due(16000));
+    assert(!unavailable_battery.confirm_shutdown(false, false, 16000));
 
     flow.update(true, 4, false, 12000);
     flow.update(false, 80, true, 13000);
-    assert(flow.warning() == LowBatteryWarning::Low);
+    assert(flow.warning() == LowBatteryWarning::None);
     flow.update(true, 80, false, 14000);
     assert(flow.warning() == LowBatteryWarning::None);
 

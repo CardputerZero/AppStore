@@ -1347,9 +1347,13 @@ void update_low_battery_overlay(uint32_t now, bool force = false)
     lv_obj_move_foreground(g_low_battery_overlay);
     lv_obj_clear_flag(g_low_battery_overlay, LV_OBJ_FLAG_HIDDEN);
 
+    const bool warning_changed = warning != g_rendered_battery_warning;
+    if (warning_changed) {
+        g_low_battery_flash_tick = now;
+        lv_obj_set_style_bg_opa(g_low_battery_tint, LV_OPA_20, 0);
+    }
     const uint32_t seconds = g_low_battery_flow.seconds_until_shutdown(now);
-    if (force || warning != g_rendered_battery_warning ||
-        seconds != g_rendered_shutdown_seconds) {
+    if (force || warning_changed || seconds != g_rendered_shutdown_seconds) {
         std::string text = warning == appstore_ui::LowBatteryWarning::ShutdownCountdown
             ? "Power off in " + std::to_string(seconds) + "s"
             : "Battery below 5%";

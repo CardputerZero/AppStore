@@ -244,7 +244,7 @@ class PackageTransactionTests(unittest.TestCase):
             state = stat_path.read_text().split()[2]
         except (FileNotFoundError, ProcessLookupError):
             state = "gone"
-        self.assertIn(state, ("gone", "Z"))
+        self.assertIn(state, ("gone", "Z", "X"))
 
     def test_reconcile_install_uses_actual_version_and_clears_pending(self):
         appstore.write_json(

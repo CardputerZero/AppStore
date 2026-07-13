@@ -13,49 +13,39 @@ enum class LowBatteryWarning {
 class LowBatteryFlow {
 public:
     static constexpr uint32_t kShutdownDelayMs = 15000;
-    static constexpr uint32_t kInvalidReadingGraceMs = 3000;
 
     void reset() { *this = LowBatteryFlow{}; }
 
     void update(bool valid, int soc, bool charging, uint32_t now)
     {
-        if (!valid)
+        if (!valid) {
+            warning_ = LowBatteryWarning::None;
+            shutdown_requested_ = false;
             return;
+        }
         if (charging || soc >= 5) {
             warning_ = LowBatteryWarning::None;
             shutdown_requested_ = false;
-            confirmation_pending_ = false;
             return;
         }
         if (soc <= 0) {
             if (warning_ != LowBatteryWarning::ShutdownCountdown) {
                 countdown_started_ = now;
                 shutdown_requested_ = false;
-                confirmation_pending_ = false;
             }
             warning_ = LowBatteryWarning::ShutdownCountdown;
             return;
         }
         warning_ = LowBatteryWarning::Low;
         shutdown_requested_ = false;
-        confirmation_pending_ = false;
     }
 
     bool confirm_shutdown(bool reading_valid, bool charging, uint32_t now)
     {
         if (!shutdown_due(now))
             return false;
-        if (reading_valid) {
-            confirmation_pending_ = false;
-            if (charging) {
-                warning_ = LowBatteryWarning::None;
-                return false;
-            }
-        } else if (!confirmation_pending_) {
-            confirmation_pending_ = true;
-            confirmation_started_ = now;
-            return false;
-        } else if (static_cast<uint32_t>(now - confirmation_started_) < kInvalidReadingGraceMs) {
+        if (!reading_valid || charging) {
+            warning_ = LowBatteryWarning::None;
             return false;
         }
         shutdown_requested_ = true;
@@ -83,9 +73,7 @@ public:
 private:
     LowBatteryWarning warning_ = LowBatteryWarning::None;
     uint32_t countdown_started_ = 0;
-    uint32_t confirmation_started_ = 0;
     bool shutdown_requested_ = false;
-    bool confirmation_pending_ = false;
 };
 
 } // namespace appstore_ui
