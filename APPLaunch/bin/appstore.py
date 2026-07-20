@@ -1536,6 +1536,37 @@ def mark_package_helper_failed(transaction_id: str, pending_path_value: str,
     write_json(path, pending)
 
 
+def pending_package_state_unchanged(pending: dict[str, Any], status: str,
+                                    version: str) -> bool:
+    previously_installed = pending.get("previously_installed")
+    if not isinstance(previously_installed, bool):
+        return False
+    if previously_installed:
+        previous_version = pending.get("previous_version")
+        if not isinstance(previous_version, str) or not previous_version:
+            return False
+        return status.startswith("ii") and version == previous_version
+    return status in ("absent", "rc")
+
+
+def pending_action_requires_state_change(pending: dict[str, Any]) -> bool:
+    action = pending.get("action")
+    if action == "uninstall":
+        return True
+    if action not in ("install", "upgrade"):
+        return False
+    previously_installed = pending.get("previously_installed")
+    if previously_installed is False:
+        return True
+    if previously_installed is not True:
+        return False
+    previous_version = pending.get("previous_version")
+    expected_version = pending.get("expected_package_version")
+    return (isinstance(previous_version, str) and bool(previous_version) and
+            isinstance(expected_version, str) and bool(expected_version) and
+            previous_version != expected_version)
+
+
 def discard_failed_job_if_state_unchanged(transaction_id: str,
                                           pending_path_value: str) -> bool:
     if not transaction_id or not pending_path_value:
@@ -1546,10 +1577,7 @@ def discard_failed_job_if_state_unchanged(transaction_id: str,
             str(pending.get("transaction_id") or "") != transaction_id):
         return False
     status, version = package_dpkg_status(str(pending.get("package") or ""))
-    if pending.get("previously_installed"):
-        unchanged = status.startswith("ii") and version == str(pending.get("previous_version") or "")
-    else:
-        unchanged = status in ("absent", "rc")
+    unchanged = pending_package_state_unchanged(pending, status, version)
     if unchanged:
         path.unlink(missing_ok=True)
     return unchanged
@@ -1688,7 +1716,7 @@ def package_helper(action: str, value: str, reinstall: bool = False,
             detail = compact_error(exc.stdout or exc.stderr or "")
             mark_package_helper_failed(transaction_id, pending_path_value, 124)
             if discard_failed_job_if_state_unchanged(transaction_id, pending_path_value):
-                emit("WARNING", "failed package command made no package state changes")
+                emit("WARNING", "failed package command left installed package state unchanged")
             emit("ERROR", "package command timed out" + (f": {detail}" if detail else ""), 124)
             return 124
         if result.stdout:
@@ -1697,7 +1725,7 @@ def package_helper(action: str, value: str, reinstall: bool = False,
             detail = compact_error(result.stdout or "")
             mark_package_helper_failed(transaction_id, pending_path_value, result.returncode)
             if discard_failed_job_if_state_unchanged(transaction_id, pending_path_value):
-                emit("WARNING", "failed package command made no package state changes")
+                emit("WARNING", "failed package command left installed package state unchanged")
             emit("ERROR", detail or "package command failed", result.returncode)
             return result.returncode
         if action == "install" and desktop:
@@ -1715,7 +1743,7 @@ def package_helper(action: str, value: str, reinstall: bool = False,
         else:
             mark_package_helper_failed(transaction_id, pending_path_value, 1)
             if discard_failed_job_if_state_unchanged(transaction_id, pending_path_value):
-                emit("WARNING", "failed package command made no package state changes")
+                emit("WARNING", "failed package command left installed package state unchanged")
         emit("ERROR", str(exc), 1)
         return 1
 
@@ -1837,7 +1865,7 @@ def reconcile_pending_package_job(emit_result: bool = False) -> bool:
     action = str(pending.get("action") or "")
     app_id = str(pending.get("app_id") or "")
     package = str(pending.get("package") or "")
-    if not action or not app_id or not package:
+    if action not in ("install", "reinstall", "upgrade", "uninstall") or not app_id or not package:
         emit("WARNING", "pending package transaction is invalid and was retained")
         return False
     app = find_app(app_id)
@@ -1853,7 +1881,13 @@ def reconcile_pending_package_job(emit_result: bool = False) -> bool:
             expected = str(pending.get("expected_package_version") or "")
             previously_installed = bool(pending.get("previously_installed"))
             previous_version = str(pending.get("previous_version") or "")
-            dpkg_status, _ = package_dpkg_status(package)
+            dpkg_status, dpkg_version = package_dpkg_status(package)
+            if (pending_action_requires_state_change(pending) and
+                    pending_package_state_unchanged(pending, dpkg_status, dpkg_version)):
+                clear_pending_package_job()
+                emit("WARNING", f"interrupted {action} left installed package state unchanged; "
+                     "cleared stale transaction")
+                return True
             state_proves_applied = (
                 action == "uninstall" and previously_installed and
                 dpkg_status in ("absent", "rc")

@@ -71,8 +71,10 @@ available and use the same verification and record-update behavior.
 Pending transactions are stored in the AppStore state directory using atomic
 file replacement. AppStore reconciles them against the dpkg database on backend
 startup and during summary refresh, so an interrupted finalize stage can be
-completed after a restart. A transaction remains pending when its outcome cannot
-be determined; its diagnostic is reported again on the next reconciliation.
+completed after a restart. An interrupted transaction that provably left the
+installed package state unchanged is cleared so it cannot block later
+operations. A transaction remains pending when its outcome cannot be determined;
+its diagnostic is reported again on the next reconciliation.
 
 Package commands produce tab-separated, machine-readable status records.
 `PACKAGE_JOB` describes the privileged step, `PACKAGE_RESULT` is the verified
