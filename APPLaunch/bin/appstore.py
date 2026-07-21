@@ -990,6 +990,13 @@ def executable_exists(exec_value: str) -> bool:
     return bool(binary) and is_executable_file(binary)
 
 
+def package_dpkg_status_is_installed(status: str) -> bool:
+    # The second abbreviation character is the current state. The first is
+    # only the requested action, so `ri` is still installed after a failed
+    # removal. A third character indicates a dpkg error and is not healthy.
+    return len(status) == 2 and status[0] in "uihpr" and status[1] == "i"
+
+
 def dpkg_status_cache() -> dict[str, tuple[bool, str]]:
     global _DPKG_STATUS_CACHE
     if _DPKG_STATUS_CACHE is not None:
@@ -999,7 +1006,7 @@ def dpkg_status_cache() -> dict[str, tuple[bool, str]]:
         return _DPKG_STATUS_CACHE
     try:
         result = subprocess.run(
-            ["dpkg-query", "-W", "-f=${Package}\t${Status}\t${Version}\n"],
+            ["dpkg-query", "-W", "-f=${Package}\t${db:Status-Abbrev}\t${Version}\n"],
             check=False,
             capture_output=True,
             text=True,
@@ -1014,7 +1021,9 @@ def dpkg_status_cache() -> dict[str, tuple[bool, str]]:
             continue
         package, status, version = parts
         if package:
-            _DPKG_STATUS_CACHE[package] = ("install ok installed" in status, version.strip())
+            _DPKG_STATUS_CACHE[package] = (
+                package_dpkg_status_is_installed(status.strip()), version.strip()
+            )
     return _DPKG_STATUS_CACHE
 
 
@@ -1554,7 +1563,7 @@ def pending_package_state_unchanged(pending: dict[str, Any], status: str,
         previous_version = pending.get("previous_version")
         if not isinstance(previous_version, str) or not previous_version:
             return False
-        return status.startswith("ii") and version == previous_version
+        return package_dpkg_status_is_installed(status) and version == previous_version
     return package_dpkg_status_is_absent(status)
 
 
@@ -1863,9 +1872,9 @@ def reconcile_pending_package_job(emit_result: bool = False) -> bool:
     if action not in ("install", "reinstall", "upgrade", "uninstall") or not app_id or not package:
         emit("WARNING", "pending package transaction is invalid and was retained")
         return False
-    app = find_app(app_id)
-    if not app and isinstance(pending.get("app_snapshot"), dict):
-        app = pending["app_snapshot"]
+    app = pending.get("app_snapshot") if isinstance(pending.get("app_snapshot"), dict) else None
+    if not app:
+        app = find_app(app_id)
     if not app:
         emit("WARNING", f"pending package transaction cannot find app: {app_id}")
         return False
@@ -2493,7 +2502,6 @@ def run_service_command(argv: list[str]) -> tuple[str, int]:
 
 def serve(port: int) -> int:
     ensure_dirs()
-    reconcile_pending_package_job()
     address = ("127.0.0.1", int(port))
     log_debug(
         f"serve start host={address[0]} port={address[1]} app_root={app_root()} "

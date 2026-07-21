@@ -297,6 +297,25 @@ class PackageTransactionTests(unittest.TestCase):
             with self.subTest(status=status):
                 self.assertFalse(appstore.package_dpkg_status_is_absent(status))
 
+    def test_current_installed_state_ignores_requested_dpkg_action(self):
+        for status in ("ii", "ui", "hi", "ri", "pi"):
+            with self.subTest(status=status):
+                self.assertTrue(appstore.package_dpkg_status_is_installed(status))
+        for status in ("unknown", "un", "rc", "iU", "iiR", ""):
+            with self.subTest(status=status):
+                self.assertFalse(appstore.package_dpkg_status_is_installed(status))
+
+    def test_dpkg_status_cache_treats_deinstall_requested_package_as_installed(self):
+        completed = subprocess.CompletedProcess(
+            ["dpkg-query"], 0, "demo-package\tri \t1.2.0\n", ""
+        )
+        with (
+            mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/dpkg-query"),
+            mock.patch.object(appstore.subprocess, "run", return_value=completed),
+        ):
+            self.assertTrue(appstore.package_installed("demo-package"))
+            self.assertEqual(appstore.package_version("demo-package"), "1.2.0")
+
     def test_package_timeout_terminates_maintenance_script_process_group(self):
         child_code = (
             "import subprocess,time; "
@@ -542,6 +561,39 @@ class PackageTransactionTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertFalse(appstore.pending_package_path().exists())
         self.assertIn("cleared stale transaction", output)
+
+    def test_reconcile_interrupted_uninstall_with_ri_status_clears_pending(self):
+        appstore.write_json(appstore.pending_package_path(), {
+            "schema_version": 2, "transaction_id": "tx-uninstall-ri",
+            "action": "uninstall", "app_id": "app-id", "package": "demo-package",
+            "previously_installed": True, "previous_version": "1.2.0",
+            "helper_completed": False, "app_snapshot": APP,
+        })
+        with (
+            mock.patch.object(appstore, "find_app", return_value=APP) as find_app,
+            mock.patch.object(appstore, "package_state", return_value=(True, "1.2.0")),
+            mock.patch.object(appstore, "package_dpkg_status", return_value=("ri", "1.2.0")),
+        ):
+            result, output = self.capture(appstore.reconcile_pending_package_job, True)
+
+        self.assertTrue(result)
+        find_app.assert_not_called()
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("cleared stale transaction", output)
+
+    def test_serve_opens_health_endpoint_without_startup_reconciliation(self):
+        server = mock.Mock()
+        server.serve_forever.side_effect = KeyboardInterrupt
+        with (
+            mock.patch.object(appstore, "AppStoreHTTPServer", return_value=server) as server_type,
+            mock.patch.object(appstore, "reconcile_pending_package_job") as reconcile,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            appstore.serve(18895)
+
+        server_type.assert_called_once_with(("127.0.0.1", 18895), appstore.AppStoreRequestHandler)
+        reconcile.assert_not_called()
+        server.server_close.assert_called_once()
 
     def test_reconcile_interrupted_install_with_unknown_status_retains_pending(self):
         appstore.write_json(appstore.pending_package_path(), {
