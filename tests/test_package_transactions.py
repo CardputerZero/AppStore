@@ -211,6 +211,31 @@ class PackageTransactionTests(unittest.TestCase):
         self.assertFalse(appstore.pending_package_path().exists())
         self.assertIn("installed package state unchanged", output)
 
+    def test_failed_same_version_reinstall_discards_pending(self):
+        appstore.write_json(appstore.pending_package_path(), {
+            "transaction_id": "tx-reinstall-fail", "action": "reinstall",
+            "app_id": "app-id", "package": "demo-package",
+            "previously_installed": True, "previous_version": "1.2.0",
+            "expected_package_version": "1.2.0", "helper_completed": False,
+        })
+        failed = subprocess.CompletedProcess(["dpkg"], 1, "postinst failed\n", "")
+        with (
+            mock.patch.object(appstore.os, "geteuid", return_value=0),
+            mock.patch.object(appstore, "deb_dependencies_satisfied", return_value=True),
+            mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/dpkg"),
+            mock.patch.object(appstore, "run_package_helper_command", return_value=failed),
+            mock.patch.object(appstore, "package_dpkg_status", return_value=("ii", "1.2.0")),
+        ):
+            result, output = self.capture(
+                appstore.package_helper, "install", "/tmp/demo.deb", True,
+                transaction_id="tx-reinstall-fail",
+                pending_path_value=str(appstore.pending_package_path()),
+            )
+
+        self.assertEqual(result, 1)
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("installed package state unchanged", output)
+
     def test_failed_helper_with_incomplete_baseline_retains_pending(self):
         appstore.write_json(appstore.pending_package_path(), {
             "transaction_id": "tx-incomplete", "action": "install",
@@ -250,6 +275,27 @@ class PackageTransactionTests(unittest.TestCase):
             mock.patch.object(appstore.subprocess, "run", return_value=failed),
         ):
             self.assertEqual(appstore.package_dpkg_status("demo-package"), ("unknown", ""))
+
+    def test_dpkg_not_installed_status_is_recognized_as_absent(self):
+        completed = subprocess.CompletedProcess(
+            ["dpkg-query"], 0, "un \t0.1.0\n", ""
+        )
+        with (
+            mock.patch.object(appstore.shutil, "which", return_value="/usr/bin/dpkg-query"),
+            mock.patch.object(appstore.subprocess, "run", return_value=completed),
+        ):
+            status, version = appstore.package_dpkg_status("demo-package")
+
+        self.assertEqual((status, version), ("un", "0.1.0"))
+        self.assertTrue(appstore.package_dpkg_status_is_absent(status))
+
+    def test_only_not_installed_and_config_files_states_are_absent(self):
+        for status in ("absent", "un", "pn", "hn", "rc", "uc"):
+            with self.subTest(status=status):
+                self.assertTrue(appstore.package_dpkg_status_is_absent(status))
+        for status in ("unknown", "ii", "iU", "iF", ""):
+            with self.subTest(status=status):
+                self.assertFalse(appstore.package_dpkg_status_is_absent(status))
 
     def test_package_timeout_terminates_maintenance_script_process_group(self):
         child_code = (
@@ -412,6 +458,73 @@ class PackageTransactionTests(unittest.TestCase):
         self.assertIn("cleared stale transaction", output)
         self.assertNotIn("PACKAGE_RESULT", output)
 
+    def test_reconcile_interrupted_new_install_with_un_status_clears_pending(self):
+        appstore.write_json(appstore.pending_package_path(), {
+            "schema_version": 2, "transaction_id": "tx-install-un",
+            "action": "install", "app_id": "app-id", "package": "demo-package",
+            "previously_installed": False, "previous_version": "",
+            "expected_package_version": "1.2.0", "helper_completed": False,
+            "app_snapshot": APP,
+        })
+        with (
+            mock.patch.object(appstore, "find_app", return_value=APP),
+            mock.patch.object(appstore, "package_state", return_value=(False, "")),
+            mock.patch.object(appstore, "package_dpkg_status", return_value=("un", "0.1.0")),
+        ):
+            result, output = self.capture(appstore.reconcile_pending_package_job, True)
+
+        self.assertTrue(result)
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("cleared stale transaction", output)
+
+    def test_reconcile_interrupted_uninstall_with_un_status_finishes_recovery(self):
+        appstore.write_json(appstore.pending_package_path(), {
+            "schema_version": 2, "transaction_id": "tx-uninstall-un",
+            "action": "uninstall", "app_id": "app-id", "package": "demo-package",
+            "previously_installed": True, "previous_version": "0.1.0",
+            "helper_completed": False, "app_snapshot": APP,
+        })
+        with (
+            mock.patch.object(appstore, "find_app", return_value=APP),
+            mock.patch.object(appstore, "package_state", return_value=(False, "")),
+            mock.patch.object(appstore, "package_dpkg_status", return_value=("un", "0.1.0")),
+        ):
+            result, output = self.capture(appstore.reconcile_pending_package_job, True)
+
+        self.assertTrue(result)
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("recovered uninstall", output)
+        self.assertIn("PACKAGE_RESULT\tuninstall", output)
+
+    def test_running_service_reconciles_before_handling_next_request(self):
+        appstore.write_json(appstore.pending_package_path(), {
+            "schema_version": 2, "transaction_id": "tx-service-uninstall",
+            "action": "uninstall", "app_id": "app-id", "package": "demo-package",
+            "previously_installed": True, "previous_version": "1.2.0",
+            "helper_completed": False, "app_snapshot": APP,
+        })
+        events = []
+
+        def package_state(_package):
+            events.append("reconcile")
+            return False, ""
+
+        def summary(sync_if_empty=False):
+            events.append("summary")
+
+        with (
+            mock.patch.object(appstore, "find_app", return_value=APP),
+            mock.patch.object(appstore, "package_state", side_effect=package_state),
+            mock.patch.object(appstore, "package_dpkg_status", return_value=("un", "1.2.0")),
+            mock.patch.object(appstore, "summary", side_effect=summary),
+        ):
+            output, rc = appstore.run_service_command(["--summary"])
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(events, ["reconcile", "summary"])
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("recovered uninstall", output)
+
     def test_reconcile_interrupted_uninstall_with_old_version_clears_pending(self):
         appstore.write_json(appstore.pending_package_path(), {
             "schema_version": 2, "transaction_id": "tx-uninstall-not-started",
@@ -520,7 +633,7 @@ class PackageTransactionTests(unittest.TestCase):
         self.assertIn("recovered install from verified package state", output)
         self.assertIn("PACKAGE_RESULT\tinstall", output)
 
-    def test_reconcile_retains_same_version_reinstall_when_receipt_was_lost(self):
+    def test_reconcile_clears_same_version_reinstall_when_receipt_was_lost(self):
         appstore.write_json(appstore.pending_package_path(), {
             "schema_version": 2, "transaction_id": "tx-reinstall-recover",
             "action": "reinstall", "app_id": "app-id", "package": "demo-package",
@@ -536,13 +649,13 @@ class PackageTransactionTests(unittest.TestCase):
         ):
             result, output = self.capture(appstore.reconcile_pending_package_job, True)
 
-        self.assertFalse(result)
+        self.assertTrue(result)
         update_record.assert_not_called()
-        self.assertTrue(appstore.pending_package_path().exists())
-        self.assertIn("outcome is not known", output)
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("cleared stale transaction", output)
         self.assertNotIn("PACKAGE_RESULT", output)
 
-    def test_reconcile_retains_same_version_install_when_receipt_was_lost(self):
+    def test_reconcile_clears_same_version_install_when_receipt_was_lost(self):
         appstore.write_json(appstore.pending_package_path(), {
             "schema_version": 2, "transaction_id": "tx-install-same-version",
             "action": "install", "app_id": "app-id", "package": "demo-package",
@@ -557,11 +670,11 @@ class PackageTransactionTests(unittest.TestCase):
         ):
             result, output = self.capture(appstore.reconcile_pending_package_job, True)
 
-        self.assertFalse(result)
-        self.assertTrue(appstore.pending_package_path().exists())
-        self.assertIn("outcome is not known", output)
+        self.assertTrue(result)
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("cleared stale transaction", output)
 
-    def test_reconcile_retains_same_version_upgrade_when_receipt_was_lost(self):
+    def test_reconcile_clears_same_version_upgrade_when_receipt_was_lost(self):
         appstore.write_json(appstore.pending_package_path(), {
             "schema_version": 2, "transaction_id": "tx-upgrade-same-version",
             "action": "upgrade", "app_id": "app-id", "package": "demo-package",
@@ -576,9 +689,9 @@ class PackageTransactionTests(unittest.TestCase):
         ):
             result, output = self.capture(appstore.reconcile_pending_package_job, True)
 
-        self.assertFalse(result)
-        self.assertTrue(appstore.pending_package_path().exists())
-        self.assertIn("outcome is not known", output)
+        self.assertTrue(result)
+        self.assertFalse(appstore.pending_package_path().exists())
+        self.assertIn("cleared stale transaction", output)
 
     def test_prepare_rejects_existing_transaction(self):
         appstore.write_json(appstore.pending_package_path(), {"app_id": "other"})

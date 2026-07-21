@@ -1521,6 +1521,15 @@ def package_dpkg_status(package: str) -> tuple[str, str]:
     return status.strip() or "unknown", version.strip()
 
 
+def package_dpkg_status_is_absent(status: str) -> bool:
+    if status == "absent":
+        return True
+    # dpkg's second status-abbrev character is the current package state:
+    # `n` is not-installed and `c` is config-files-only.
+    return (len(status) in (2, 3) and status[0] in "uihpr" and
+            status[1] in ("n", "c"))
+
+
 def mark_package_helper_failed(transaction_id: str, pending_path_value: str,
                                exit_code: int) -> None:
     if not transaction_id or not pending_path_value:
@@ -1546,25 +1555,11 @@ def pending_package_state_unchanged(pending: dict[str, Any], status: str,
         if not isinstance(previous_version, str) or not previous_version:
             return False
         return status.startswith("ii") and version == previous_version
-    return status in ("absent", "rc")
+    return package_dpkg_status_is_absent(status)
 
 
 def pending_action_requires_state_change(pending: dict[str, Any]) -> bool:
-    action = pending.get("action")
-    if action == "uninstall":
-        return True
-    if action not in ("install", "upgrade"):
-        return False
-    previously_installed = pending.get("previously_installed")
-    if previously_installed is False:
-        return True
-    if previously_installed is not True:
-        return False
-    previous_version = pending.get("previous_version")
-    expected_version = pending.get("expected_package_version")
-    return (isinstance(previous_version, str) and bool(previous_version) and
-            isinstance(expected_version, str) and bool(expected_version) and
-            previous_version != expected_version)
+    return pending.get("action") in ("install", "reinstall", "upgrade", "uninstall")
 
 
 def discard_failed_job_if_state_unchanged(transaction_id: str,
@@ -1890,7 +1885,7 @@ def reconcile_pending_package_job(emit_result: bool = False) -> bool:
                 return True
             state_proves_applied = (
                 action == "uninstall" and previously_installed and
-                dpkg_status in ("absent", "rc")
+                package_dpkg_status_is_absent(dpkg_status)
             ) or (
                 action in ("install", "reinstall", "upgrade") and installed and expected and
                 version == expected and
@@ -2388,6 +2383,11 @@ def execute_args(args: argparse.Namespace) -> int:
     return 0
 
 
+def execute_reconciled_args(args: argparse.Namespace) -> int:
+    reconcile_pending_package_job()
+    return execute_args(args)
+
+
 class AppStoreHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
@@ -2479,7 +2479,7 @@ def run_service_command(argv: list[str]) -> tuple[str, int]:
             log_debug(f"http run argv={shlex.join(argv)}")
             args = parse_args(argv)
             with contextlib.redirect_stdout(buffer):
-                rc = execute_args(args)
+                rc = execute_reconciled_args(args)
         except SystemExit as exc:
             rc = int(exc.code or 0) if isinstance(exc.code, int) else 1
         except Exception as exc:
@@ -2526,7 +2526,7 @@ def main() -> int:
     )
     if args.serve:
         return serve(args.port)
-    return execute_args(args)
+    return execute_reconciled_args(args)
 
 
 if __name__ == "__main__":
