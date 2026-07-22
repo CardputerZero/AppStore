@@ -10,11 +10,9 @@ OS/Debian package tools. Installed apps can be launched through their APPLaunch
 
 ## Runtime
 
-The LVGL UI calls `appstore.py` for registry, install, upgrade, and uninstall operations. By default the script lives next to the installed binary, but the UI also honors:
-
-```bash
-M5APPSTORE_SCRIPT=/path/to/appstore.py
-```
+The LVGL UI calls the native backend compiled into the AppStore executable for
+registry, install, upgrade, and uninstall operations. No Python runtime or
+backend service is required.
 
 Useful backend environment variables:
 
@@ -41,21 +39,28 @@ or intermediate CDN cache does not hide newly published entries. If a registry
 cannot be loaded, the UI shows the load failure; if a previous catalog exists,
 AppStore keeps showing the cached app list and marks the registry as cached.
 
+Registry metadata and artwork use libhv asynchronous networking. Artwork is
+downloaded in bounded batches of six requests so synchronization remains
+responsive without exhausting device sockets. When an HTTP proxy is configured,
+AppStore uses libhv's asynchronous thread pool with curl because libhv's native
+async client does not implement HTTPS CONNECT proxy tunneling. Debian package
+downloads continue to use curl so interrupted downloads can be resumed safely.
+
 ## Backend Commands
 
 ```bash
-python3 appstore.py --summary
-python3 appstore.py --registries
-python3 appstore.py --regions
-python3 appstore.py --set-region CN
-python3 appstore.py --add-registry https://example.com/generated/registry.json
-python3 appstore.py --sync
-python3 appstore.py --plan <app-id>
-python3 appstore.py --install <app-id>
-python3 appstore.py --upgrade <app-id>
-python3 appstore.py --uninstall <app-id>
-python3 appstore.py --prepare-package install <app-id>
-python3 appstore.py --finalize-package install <app-id>
+./M5CardputerZero-AppStore --summary
+./M5CardputerZero-AppStore --registries
+./M5CardputerZero-AppStore --regions
+./M5CardputerZero-AppStore --set-region CN
+./M5CardputerZero-AppStore --add-registry https://example.com/generated/registry.json
+./M5CardputerZero-AppStore --sync
+./M5CardputerZero-AppStore --plan <app-id>
+./M5CardputerZero-AppStore --install <app-id>
+./M5CardputerZero-AppStore --upgrade <app-id>
+./M5CardputerZero-AppStore --uninstall <app-id>
+./M5CardputerZero-AppStore --prepare-package install <app-id>
+./M5CardputerZero-AppStore --finalize-package install <app-id> <transaction-id>
 ```
 
 `<app-id>` accepts either the app UUID or its `share_code` from registry metadata.

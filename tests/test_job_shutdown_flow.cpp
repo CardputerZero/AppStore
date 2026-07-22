@@ -1,4 +1,4 @@
-#include "../main/ui/job_shutdown_flow.hpp"
+#include "../main/interface/job_shutdown_flow.hpp"
 #include <cassert>
 
 using appstore_ui::ShutdownAction;

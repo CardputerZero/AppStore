@@ -1,4 +1,4 @@
-#include "../main/ui/job_output_buffer.hpp"
+#include "../main/interface/job_output_buffer.hpp"
 #include <cassert>
 #include <cstring>
 int main()

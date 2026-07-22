@@ -1,12 +1,11 @@
 #include "appstore_paths.hpp"
 
-#include "appstore_business.hpp"
+#include "appstore_client.hpp"
 #if __has_include("global_config.h")
 #include "global_config.h"
 #endif
 
 #include <algorithm>
-#include <cstdlib>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -58,24 +57,6 @@ bool supported_media_file(const std::string &path)
     file.read(reinterpret_cast<char *>(signature), sizeof(signature));
     return file.gcount() == static_cast<std::streamsize>(sizeof(signature)) &&
            std::equal(std::begin(signature), std::end(signature), std::begin(kPngSignature));
-}
-
-std::string resolve_script_path(const std::string &binary_dir)
-{
-    const char *script_env = std::getenv("M5APPSTORE_SCRIPT");
-    if (script_env && script_env[0]) return script_env;
-
-    std::vector<std::string> candidates = {
-        binary_dir + "/appstore.py",
-        parent_dir(binary_dir) + "/appstore.py",
-        parent_dir(binary_dir) + "/share/appstore/appstore.py",
-        "/usr/share/APPLaunch/bin/appstore.py",
-        "/usr/share/APPLaunch/share/appstore/appstore.py",
-    };
-    for (const auto &candidate : candidates) {
-        if (file_exists(candidate)) return candidate;
-    }
-    return binary_dir + "/appstore.py";
 }
 
 std::string resolve_media_path(const std::string &app_dir, std::string image)
