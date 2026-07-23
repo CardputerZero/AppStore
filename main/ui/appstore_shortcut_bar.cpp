@@ -1,7 +1,5 @@
 #include "appstore_shortcut_bar.hpp"
 
-#include "appstore_paths.hpp"
-
 namespace appstore_ui {
 namespace {
 
@@ -46,9 +44,9 @@ void AppStoreShortcutBar::render_catalog(lv_obj_t *root, AppStoreImageRenderer &
 void AppStoreShortcutBar::render_detail(lv_obj_t *root, AppStoreImageRenderer &images,
                                         const std::string &app_dir, const appstore::StoreApp &app)
 {
+    (void)app_dir;
     button(root, images, 180, "appstore-shortcut-back.png", "back", 0xF0B429);
-    if (!detail_screenshot_paths(app_dir, app).empty())
-        button(root, images, 236, "appstore-shortcut-screenshots.png", "shots", 0x58A6FF);
+    button(root, images, 236, "appstore-shortcut-screenshots.png", "shots", 0x58A6FF);
     if (!app.installed && appstore::can_install_app(app))
         button(root, images, 292, "appstore-shortcut-install.png", "install", 0xB069FF);
     if (appstore::can_reinstall_app(app))
