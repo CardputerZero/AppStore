@@ -1,7 +1,6 @@
 #include "appstore_input_controller.hpp"
 
 #include "appstore_client.hpp"
-#include "appstore_paths.hpp"
 #include "input_keys.h"
 #include "startup_network_flow.hpp"
 
@@ -104,10 +103,8 @@ void AppStoreInputController::handle(const AppStoreKeyEvent &key, uint32_t now)
                 detail_.scroll_description(1);
             else if (matches(key, '4', KEY_4) || matches(key, 'b', KEY_B))
                 session_.screen = Screen::Home;
-            else if (matches(key, '5', KEY_5)) {
-                if (app && !detail_screenshot_paths(session_.app_dir, *app).empty())
-                    detail_.open_screenshots(now);
-            }
+            else if (matches(key, '5', KEY_5))
+                detail_.open_screenshots(now);
             else if (matches(key, '6', KEY_6)) {
                 if (app && appstore::can_reinstall_app(*app))
                     detail_.reinstall(app);

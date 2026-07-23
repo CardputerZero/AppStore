@@ -171,6 +171,9 @@ int main()
     assert(session.screen == Screen::Registry && session.status.value().empty());
 
     session.screen = Screen::Detail;
+    input.handle({KEY_5}, 190);
+    assert(session.screen == Screen::Screenshots);
+    session.screen = Screen::Detail;
     input.handle({KEY_ESC}, 200);
     input.handle({KEY_ESC, 0, 0, true}, 300);
     assert(backs == 1 && session.screen == Screen::Home);
