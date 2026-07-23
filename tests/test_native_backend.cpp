@@ -57,13 +57,17 @@ static std::string tx(const Result &r) {
     } return "";
 }
 static json app(const std::string &id, const std::string &review) {
-    return {{"uuid",id},{"share_code",id=="app-id"?"demo":"blocked"},{"title",id=="app-id"?"Demo":"Blocked"},
+    json result={{"uuid",id},{"share_code",id=="app-id"?"demo":"blocked"},{"title",id=="app-id"?"Demo":"Blocked"},
       {"version","1.2.0"},{"review_status",review},{"featured",id=="app-id"},{"categories",{"Utilities","Tools"}},
-      {"i18n",{{"en",{{"title","Demo Local"},{"summary","Localized summary"}}},{"zh-CN",{{"title","演示"},{"summary","本地化摘要"}}}}},{"author",{{"display_name","Tester"}}},
+      {"i18n",{{"en",{{"title","Demo Local"},{"summary","Localized summary"}}},{"zh-CN",{{"title","演示"},{"summary","本地化摘要"}}}}},
       {"source",{{"repository","https://example.invalid/source"}}},
       {"icon","https://assets.invalid/"+id+".png"},
       {"app",{{"dependencies",{"lib-one","lib-two"}},{"applaunch",{{"desktop_entry","applications/demo.desktop"},{"exec","/usr/bin/demo-package"}}}}},
       {"download",{{"type","deb"},{"package","demo-package"},{"url","https://example.invalid/demo.deb"},{"md5",getenv("FAKE_MD5")},{"size","42K"}}}};
+    result["author"] = id == "app-id"
+        ? json{{"display_name", "Tester"}, {"github", "ignored-user"}}
+        : json{{"github", "fallback-user"}, {"name", "ignored-name"}};
+    return result;
 }
 static void fixture() {
     fs::create_directories(root/"bin"); fs::create_directories(root/"state"); fs::create_directories(root/"cache"); fs::create_directories(root/"root/applications");
@@ -118,6 +122,24 @@ static void registry_cases() {
     unsetenv("FAKE_ASSET_FAIL");
     CHECK(has(call({"--sync"}),"SYNC\t1\t0\t0\t2"));
     setenv("M5APPSTORE_LOCALE","zh_CN.UTF-8",1); CHECK(has(call({"--summary"}),"APP\tapp-id\t演示")); setenv("M5APPSTORE_LOCALE","en",1);
+    Result author_summary=call({"--summary"});
+    CHECK(has(author_summary,"\tTester\t"));
+    CHECK(has(author_summary,"\tfallback-user\t"));
+    CHECK(!has(author_summary,"\tignored-user\t"));
+    CHECK(!has(author_summary,"\tignored-name\t"));
+    json registry_with_repo_author = load(root/"registry.json");
+    json repo_author_app = app("repo-author-id", "approved");
+    repo_author_app["author"] = json::object();
+    repo_author_app.erase("source");
+    repo_author_app["source_repo"] = "https://github.com/repo-owner/example";
+    registry_with_repo_author["apps"].push_back(repo_author_app);
+    save(root/"registry.json", registry_with_repo_author);
+    CHECK(call({"--sync"}).rc==0);
+    CHECK(has(call({"--summary"}),"\trepo-owner\t"));
+    registry_with_repo_author["apps"].erase(
+        registry_with_repo_author["apps"].end() - 1);
+    save(root/"registry.json", registry_with_repo_author);
+    CHECK(call({"--sync"}).rc==0);
     CHECK(has(call({"--registries"}),"\tok\t2\t")); setenv("FAKE_CURL_FAIL","1",1);
     CHECK(has(call({"--sync"}),"SYNC\t0\t1\t0\t2")); CHECK(has(call({"--summary"}),"WARN\tRegistry offline")); unsetenv("FAKE_CURL_FAIL");
     CHECK(call({"--add-registry","example.invalid/registry.json","--registry-name","Extra"}).rc==0);

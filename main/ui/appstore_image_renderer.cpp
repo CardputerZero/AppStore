@@ -40,7 +40,7 @@ bool AppStoreImageRenderer::draw_app_icon(lv_obj_t *root, const std::string &app
 #if LV_USE_LODEPNG && LV_USE_FS_POSIX
     const std::string path = icon_file_path(app_dir, app);
     if (path.empty()) return false;
-    constexpr int x = 10, y = 45, width = 68, height = 68;
+    constexpr int x = 10, y = 49, width = 68, height = 68;
     lv_obj_t *clip = lv_obj_create(root);
     lv_obj_remove_style_all(clip);
     lv_obj_set_pos(clip, x, y);
@@ -52,13 +52,15 @@ bool AppStoreImageRenderer::draw_app_icon(lv_obj_t *root, const std::string &app
     lv_obj_set_style_clip_corner(clip, true, 0);
     lv_obj_set_style_pad_all(clip, 0, 0);
     lv_obj_t *icon = lv_image_create(clip);
-    lv_image_set_scale(icon, 174);
     lv_image_set_src(icon, retain_source(lvgl_posix_src(path)));
     lv_obj_update_layout(icon);
     int image_width = lv_obj_get_width(icon);
     int image_height = lv_obj_get_height(icon);
-    if (image_width <= 0) image_width = 100;
-    if (image_height <= 0) image_height = 100;
+    if (image_width <= 0) image_width = 256;
+    if (image_height <= 0) image_height = 256;
+    int scale = std::min(width * 256 / image_width, height * 256 / image_height);
+    if (scale <= 0) scale = 1;
+    lv_image_set_scale(icon, static_cast<uint16_t>(scale));
     lv_obj_set_pos(icon, (width - image_width) / 2, (height - image_height) / 2);
     return true;
 #else

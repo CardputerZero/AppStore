@@ -14,7 +14,7 @@ namespace {
 
 void runtime_log(const std::string &message)
 {
-    std::fprintf(stderr, "[AppStore TRACE] %s\n", message.c_str());
+    std::fprintf(stderr, "[Store TRACE] %s\n", message.c_str());
     cp0_zmq_log("appstore", message.c_str());
 }
 

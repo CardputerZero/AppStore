@@ -1,6 +1,7 @@
 #include "appstore_input_controller.hpp"
 
 #include "appstore_client.hpp"
+#include "appstore_paths.hpp"
 #include "input_keys.h"
 #include "startup_network_flow.hpp"
 
@@ -87,8 +88,9 @@ void AppStoreInputController::handle(const AppStoreKeyEvent &key, uint32_t now)
                     detail_.start_confirmation(app->installed ? "reinstall" : "install");
                 else
                     session_.status.value() = app ? "Only approved apps can install" : "No selected app";
-            } else if (matches(key, '8', KEY_8) || key.code == KEY_ENTER)
-                catalog_.open_detail();
+            } else if (matches(key, '8', KEY_8) || key.code == KEY_ENTER) {
+                if (session_.catalog.selected_app()) catalog_.open_detail();
+            }
             else if (key.code == KEY_TAB)
                 catalog_.cycle_sort_rule();
             else if (matches(key, 'q', KEY_Q) && actions_.request_quit)
@@ -102,14 +104,20 @@ void AppStoreInputController::handle(const AppStoreKeyEvent &key, uint32_t now)
                 detail_.scroll_description(1);
             else if (matches(key, '4', KEY_4) || matches(key, 'b', KEY_B))
                 session_.screen = Screen::Home;
-            else if (matches(key, '5', KEY_5))
-                detail_.open_screenshots(now);
+            else if (matches(key, '5', KEY_5)) {
+                if (app && !detail_screenshot_paths(session_.app_dir, *app).empty())
+                    detail_.open_screenshots(now);
+            }
             else if (matches(key, '6', KEY_6)) {
-                if (app && app->installed) detail_.reinstall(app); else detail_.install(app);
-            } else if (matches(key, '7', KEY_7))
-                detail_.upgrade(app);
-            else if (matches(key, '8', KEY_8))
-                detail_.remove(app);
+                if (app && appstore::can_reinstall_app(*app))
+                    detail_.reinstall(app);
+                else if (app && !app->installed && appstore::can_install_app(*app))
+                    detail_.install(app);
+            } else if (matches(key, '7', KEY_7)) {
+                if (app && appstore::can_upgrade_app(*app)) detail_.upgrade(app);
+            } else if (matches(key, '8', KEY_8)) {
+                if (app && app->installed) detail_.remove(app);
+            }
             else if (app && matches(key, 'i', KEY_I)) {
                 if (appstore::can_install_app(*app))
                     detail_.start_confirmation(app->installed ? "reinstall" : "install");
@@ -166,8 +174,15 @@ void AppStoreInputController::handle(const AppStoreKeyEvent &key, uint32_t now)
             }
             else if (key.code == KEY_UP || key.code == KEY_DOWN)
                 session_.registry.page_focus() = 1 - session_.registry.page_focus();
-            else if (matches(key, 'a', KEY_A)) {
-                if (actions_.open_registry_add) actions_.open_registry_add();
+            else if (matches(key, '5', KEY_5) || matches(key, 'e', KEY_E) ||
+                       (key.code == KEY_ENTER && session_.registry.page_focus() == 1)) {
+                const auto *entry = session_.registry.selected_entry();
+                if (entry && !entry->builtin) registry_.edit_selected();
+            } else if (matches(key, '7', KEY_7) || matches(key, 'd', KEY_D)) {
+                const auto *entry = session_.registry.selected_entry();
+                if (entry && !entry->builtin) registry_.delete_selected();
+            } else if (matches(key, '8', KEY_8) || matches(key, 'r', KEY_R)) {
+                sync_.start(true, now);
             } else if (key.code == KEY_LEFT || key.code == KEY_Z || key.ch == 'z' || key.ch == '<') {
                 if (session_.registry.page_focus() == 0)
                     registry_.select_region(registry_.adjacent_region(-1), now);
@@ -178,15 +193,7 @@ void AppStoreInputController::handle(const AppStoreKeyEvent &key, uint32_t now)
                     registry_.select_region(registry_.adjacent_region(1), now);
                 else
                     session_.registry.select_adjacent_entry(1);
-            } else if (matches(key, 'r', KEY_R))
-                sync_.start(true, now);
-            else if (matches(key, 't', KEY_T))
-                registry_.toggle_selected();
-            else if (matches(key, 'd', KEY_D))
-                registry_.delete_selected();
-            else if (matches(key, 'e', KEY_E) ||
-                     (key.code == KEY_ENTER && session_.registry.page_focus() == 1))
-                registry_.edit_selected();
+            }
             break;
         case Screen::RegistryEdit: {
             std::string &field = session_.registry.edit_focus() == 0 ?
@@ -195,13 +202,13 @@ void AppStoreInputController::handle(const AppStoreKeyEvent &key, uint32_t now)
                 field.pop_back();
             else if (key.code == KEY_ENTER)
                 registry_.submit_editor();
+            else if (key.code == KEY_TAB || key.code == KEY_UP || key.code == KEY_DOWN)
+                session_.registry.edit_focus() = 1 - session_.registry.edit_focus();
             else if (key.ch >= 32 && key.ch <= 126 &&
                      (session_.registry.edit_focus() == 0 ?
                       session_.registry.name_input().size() < 48 :
                       session_.registry.input_url().size() < 180))
                 field.push_back(key.ch);
-            else if (key.code == KEY_UP || key.code == KEY_DOWN)
-                session_.registry.edit_focus() = 1 - session_.registry.edit_focus();
             else if (key.code == KEY_LEFT && !session_.registry.edit_url().empty() &&
                      !session_.registry.entries().empty()) {
                 session_.registry.select_adjacent_entry(-1);

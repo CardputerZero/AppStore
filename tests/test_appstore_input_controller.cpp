@@ -75,6 +75,8 @@ int main()
     int backs = 0;
     int repairs = 0;
     int registry_opens = 0;
+    int registry_adds = 0;
+    int confirmations = 0;
     AppStoreInputController input(
         session, package_job, exit, share_code, catalog, detail, registry, sync,
         {[&]() { ++quits; },
@@ -83,8 +85,8 @@ int main()
              session.screen = session.sync.startup_active ? Screen::StartupSync : Screen::Home;
          },
          [&]() { ++registry_opens; session.screen = Screen::Registry; },
-         [&]() { session.screen = Screen::RegistryEdit; },
-         []() {}, [&]() { ++repairs; }, [&]() { ++renders; }});
+         [&]() { ++registry_adds; session.screen = Screen::RegistryEdit; },
+         [&]() { ++confirmations; }, [&]() { ++repairs; }, [&]() { ++renders; }});
 
     session.catalog.categories() = {"All"};
     appstore::StoreApp first;
@@ -114,12 +116,59 @@ int main()
     session.confirmation.focus() = 0;
     input.handle({KEY_TAB}, 150);
     assert(session.confirmation.focus() == 1);
+    input.handle({KEY_7}, 151);
+    assert(session.screen == Screen::Confirm);
+    input.handle({KEY_ENTER}, 152);
+    assert(session.screen == Screen::Detail);
+    session.screen = Screen::Confirm;
+    session.confirmation.focus() = 0;
+    input.handle({KEY_5}, 153);
+    assert(confirmations == 0);
+    input.handle({KEY_ENTER}, 154);
+    assert(confirmations == 1);
 
     session.screen = Screen::RegistryEdit;
     session.registry.edit_focus() = 0;
     session.registry.name_input().clear();
     input.handle({0, 0, 'X'}, 160);
     assert(session.registry.name_input() == "X");
+    input.handle({KEY_TAB}, 161);
+    assert(session.registry.edit_focus() == 1);
+    const std::string url_before_x = session.registry.input_url();
+    input.handle({KEY_X, 0, 'x'}, 162);
+    assert(session.registry.edit_focus() == 1);
+    assert(session.registry.input_url() == url_before_x + "x");
+
+    appstore::RegistryData registry_data;
+    registry_data.entries.push_back(
+        {"https://example.invalid/registry.json", "Example", "ok", "1",
+         "now", "", "global", true, false});
+    session.registry.apply(registry_data);
+    session.screen = Screen::Registry;
+    input.handle({KEY_5}, 170);
+    assert(session.screen == Screen::RegistryEdit);
+    assert(session.registry.name_input() == "Example");
+    session.screen = Screen::Registry;
+    input.handle({KEY_4}, 180);
+    assert(session.screen == Screen::Registry && registry_adds == 0);
+    input.handle({KEY_A, 0, 'a'}, 181);
+    assert(session.screen == Screen::Registry && registry_adds == 0);
+    session.status.value().clear();
+    input.handle({KEY_6}, 182);
+    input.handle({KEY_T, 0, 't'}, 183);
+    assert(session.screen == Screen::Registry && session.status.value().empty());
+
+    appstore::RegistryData builtin_registry_data;
+    builtin_registry_data.entries.push_back(
+        {"https://example.invalid/builtin.json", "Built in", "ok", "1",
+         "now", "", "global", true, true});
+    session.registry.apply(builtin_registry_data);
+    session.status.value().clear();
+    session.screen = Screen::Registry;
+    input.handle({KEY_5}, 184);
+    assert(session.screen == Screen::Registry && session.status.value().empty());
+    input.handle({KEY_7}, 185);
+    assert(session.screen == Screen::Registry && session.status.value().empty());
 
     session.screen = Screen::Detail;
     input.handle({KEY_ESC}, 200);

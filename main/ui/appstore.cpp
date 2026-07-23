@@ -76,7 +76,7 @@ void app_tracef(const char *fmt, ...)
     va_start(args, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    std::fprintf(stderr, "[AppStore TRACE] %s\n", buf);
+    std::fprintf(stderr, "[Store TRACE] %s\n", buf);
     cp0_zmq_log("appstore", buf);
 }
 
@@ -404,7 +404,7 @@ AppStoreApp::AppStoreApp()
           {[](SortRule rule) { return load_summary(rule); },
            []() { return g_runtime.exit.requested(); },
            [](const std::string &message) {
-               std::fprintf(stderr, "[AppStore UI] %s\n", message.c_str());
+               std::fprintf(stderr, "[Store UI] %s\n", message.c_str());
            }}),
       sync_actions_(
           runtime_.session, runtime_.task_service,
@@ -480,7 +480,7 @@ AppStoreApp::AppStoreApp()
                runtime_.session.app_dir = dirname_of(argv && argv[0] ? argv[0] : nullptr);
                set_backend_executable_path(argv && argv[0] ? argv[0] :
                                            "M5CardputerZero-AppStore");
-               std::fprintf(stderr, "[AppStore UI] ui_init argv0=%s app_dir=%s backend=%s\n",
+               std::fprintf(stderr, "[Store UI] ui_init argv0=%s app_dir=%s backend=%s\n",
                             argv && argv[0] ? argv[0] : "-", runtime_.session.app_dir.c_str(),
                             backend_executable_path().c_str());
                app_tracef("ui_init argv0=%s app_dir=%s backend=%s",

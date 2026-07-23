@@ -37,10 +37,9 @@ bool ConfirmationState::apply_plan(const std::string &output)
         else if (action_ == "upgrade") verb = "Upgrade ";
         else if (action_ == "reinstall") verb = "Reinstall ";
         lines_.push_back(verb + fields[2]);
-        lines_.push_back("Download/app size: " + fields[4]);
-        lines_.push_back("Disk free: " + fields[5]);
-        lines_.push_back("Dependencies: " + (fields[6].empty() ? "-" : fields[6]));
-        lines_.push_back("Install checks: " + (fields[7].empty() ? "OK" : fields[7]));
+        lines_.push_back("Store cannot verify this app is safe.");
+        lines_.push_back("Review its source and publisher yourself.");
+        lines_.push_back("Continuing means you accept all risks.");
         return true;
     }
     return false;

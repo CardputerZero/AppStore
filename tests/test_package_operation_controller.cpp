@@ -116,7 +116,7 @@ int main()
 
     service.state().begin("install", "demo", "Demo", 500);
     controller.finish(
-        "ERROR\tpackage pending path is not the AppStore transaction file\n", 1);
+        "ERROR\tpackage pending path is not the Store transaction file\n", 1);
     assert(session.error.repairable);
     assert(session.error.repair_action == "install");
     assert(session.error.repair_app_id == "demo");

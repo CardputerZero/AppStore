@@ -392,7 +392,7 @@ std::string backend_capture(const std::vector<std::string> &args, int *rc)
 {
     init_appstore_backend_bridge();
     int result = 1;
-    std::string output = "ERROR\tAppStore backend bridge unavailable\n";
+    std::string output = "ERROR\tStore backend bridge unavailable\n";
     appstore_signal_backend_api(
         std::list<std::string>(args.begin(), args.end()),
         [&](int code, std::string data) {
@@ -446,7 +446,7 @@ RegistryConfig load_registry_config()
     int rc = -1;
     std::string output = backend_capture({"--registry-config"}, &rc);
     if (rc != 0) {
-        std::fprintf(stderr, "[AppStore UI] registry config load failed rc=%d preview=%s\n",
+        std::fprintf(stderr, "[Store UI] registry config load failed rc=%d preview=%s\n",
                      rc, preview_output(output).c_str());
         return config;
     }
@@ -477,7 +477,7 @@ bool replace_registry_config(const RegistryConfig &config)
     std::string payload = registry_config_json(config);
     std::string output = backend_capture({"--replace-registry-config", payload}, &rc);
     bool ok = rc == 0 && output.find("ERROR") == std::string::npos;
-    std::fprintf(stderr, "[AppStore UI] registry config replace rc=%d ok=%d preview=%s\n",
+    std::fprintf(stderr, "[Store UI] registry config replace rc=%d ok=%d preview=%s\n",
                  rc, ok ? 1 : 0, preview_output(output).c_str());
     return ok;
 }
@@ -487,7 +487,7 @@ bool clear_cached_catalog()
     int rc = -1;
     const std::string output = backend_capture({"--clear-registry-cache"}, &rc);
     if (rc != 0)
-        std::fprintf(stderr, "[AppStore UI] registry cache clear failed rc=%d preview=%s\n",
+        std::fprintf(stderr, "[Store UI] registry cache clear failed rc=%d preview=%s\n",
                      rc, preview_output(output).c_str());
     return rc == 0;
 }
@@ -499,13 +499,13 @@ SummaryData load_summary(SortRule rule)
     std::string output = backend_capture({"--summary"}, &rc);
     if (rc != 0) {
         data.warning = "Unable to load cache: " + one_line(backend_error_message(output), 80);
-        std::fprintf(stderr, "[AppStore UI] summary failed rc=%d bytes=%zu warning=%s preview=%s\n",
+        std::fprintf(stderr, "[Store UI] summary failed rc=%d bytes=%zu warning=%s preview=%s\n",
                      rc, output.size(), data.warning.c_str(), preview_output(output).c_str());
         return data;
     }
     if (trim(output).empty()) {
         data.warning = "Unable to load cache: native backend returned no data";
-        std::fprintf(stderr, "[AppStore UI] summary empty rc=%d bytes=%zu warning=%s\n",
+        std::fprintf(stderr, "[Store UI] summary empty rc=%d bytes=%zu warning=%s\n",
                      rc, output.size(), data.warning.c_str());
         return data;
     }
@@ -556,14 +556,14 @@ SummaryData load_summary(SortRule rule)
             data.apps.push_back(app);
         } else if (!trim(line).empty()) {
             ++ignored_count;
-            std::fprintf(stderr, "[AppStore UI] summary ignored line fields=%zu text=%s\n",
+            std::fprintf(stderr, "[Store UI] summary ignored line fields=%zu text=%s\n",
                          fields.size(), one_line(line, 160).c_str());
         }
     }
 
     if (!data.apps.empty()) sort_apps(data.apps, rule);
     std::fprintf(stderr,
-                 "[AppStore UI] summary parsed rc=%d bytes=%zu meta=%d cats=%d warn=%d apps=%d ignored=%d saw_meta=%d status=%s\n",
+                 "[Store UI] summary parsed rc=%d bytes=%zu meta=%d cats=%d warn=%d apps=%d ignored=%d saw_meta=%d status=%s\n",
                  rc, output.size(), meta_count, category_count, warning_count, app_count, ignored_count,
                  data.saw_meta ? 1 : 0, data.repo_status.c_str());
     return data;
