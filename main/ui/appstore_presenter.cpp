@@ -10,7 +10,7 @@ namespace appstore_ui {
 namespace {
 
 constexpr int kHomeIconX = 10;
-constexpr int kHomeIconY = 45;
+constexpr int kHomeIconY = 49;
 constexpr int kHomeIconSize = 68;
 constexpr uint32_t kStatusVisibleMs = 6000;
 
@@ -26,6 +26,8 @@ lv_obj_t *label(lv_obj_t *parent, const std::string &text, int x, int y, int w, 
     lv_obj_set_style_text_letter_space(obj, 0, 0);
     lv_label_set_long_mode(obj, mode);
     lv_label_set_text(obj, text.c_str());
+    if (mode == LV_LABEL_LONG_SCROLL_CIRCULAR)
+        lv_obj_set_style_anim_duration(obj, 4000, LV_PART_MAIN | LV_STATE_DEFAULT);
     return obj;
 }
 
@@ -59,6 +61,20 @@ void box(lv_obj_t *root, int x, int y, int w, int h, uint32_t color,
     lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(obj, border_width, 0);
     lv_obj_set_style_border_color(obj, lv_color_hex(border), 0);
+}
+
+void transparent_frame(lv_obj_t *root, int x, int y, int w, int h,
+                       uint32_t border, int border_width, int radius)
+{
+    lv_obj_t *obj = lv_obj_create(root);
+    lv_obj_remove_style_all(obj);
+    lv_obj_set_pos(obj, x, y);
+    lv_obj_set_size(obj, w, h);
+    lv_obj_set_style_radius(obj, radius, 0);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(obj, border_width, 0);
+    lv_obj_set_style_border_color(obj, lv_color_hex(border), 0);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
 }
 
 std::string app_initial(const appstore::StoreApp &app)
@@ -100,19 +116,20 @@ void AppStorePresenter::prepare(AppStoreUiPage &page)
     page.clear_content();
     lv_obj_t *root = page.screen();
     images_.begin_frame();
-    lv_obj_set_style_bg_color(root, lv_color_hex(0x080B10), 0);
+    lv_obj_set_style_bg_color(root, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
     lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
 }
 
 void AppStorePresenter::draw_category_selector(lv_obj_t *root)
 {
-    if (!images_.draw_packaged(root, "store_arrow_left.png", 205, 34))
-        strong_label(root, "<", 206, 32, 14, 18, &lv_font_montserrat_20, 0xFF6A3D);
+    if (!images_.draw_packaged(root, "store_arrow_left.png", 197, 34))
+        strong_label(root, "<", 198, 32, 14, 18, &lv_font_montserrat_20, 0xFF6A3D);
     const std::string category = appstore::upper_ascii(session_.catalog.current_category_name());
-    const lv_font_t *font = category.size() > 8 ? &lv_font_montserrat_10 : &lv_font_montserrat_14;
-    center_strong_label(root, appstore::one_line(category, 13), 220, 35, 72, 15,
-                        font, 0xFFFFFF, LV_LABEL_LONG_DOT);
+    const lv_label_long_mode_t mode = appstore::utf8_display_width(category) > 8
+        ? LV_LABEL_LONG_SCROLL_CIRCULAR : LV_LABEL_LONG_CLIP;
+    center_strong_label(root, category, 212, 32, 82, 16,
+                        &lv_font_montserrat_14, 0xFFFFFF, mode);
     if (!images_.draw_packaged(root, "store_arrow_right.png", 298, 34))
         strong_label(root, ">", 300, 32, 14, 18, &lv_font_montserrat_20, 0xFF6A3D);
 }
@@ -121,11 +138,9 @@ void AppStorePresenter::draw_home_icon_panel(lv_obj_t *root,
                                               const appstore::StoreApp *app)
 {
     const int arrow_x = kHomeIconX + (kHomeIconSize - 14) / 2;
-    if (!images_.draw_packaged(root, "store_arrow_up.png", arrow_x, 32))
-        center_strong_label(root, "^", kHomeIconX + 20, 31, 28, 18,
+    if (!images_.draw_packaged(root, "store_arrow_up.png", arrow_x, 36))
+        center_strong_label(root, "^", kHomeIconX + 20, 35, 28, 18,
                             &lv_font_montserrat_20, 0xFF6A3D);
-    box(root, kHomeIconX, kHomeIconY, kHomeIconSize, kHomeIconSize,
-        0x202020, 0x4D4D4D, 2, 10);
     if (!app) {
         center_strong_label(root, "-", kHomeIconX + 22, kHomeIconY + 24, 24, 22,
                             &lv_font_montserrat_20, 0x9A9A9A);
@@ -134,8 +149,10 @@ void AppStorePresenter::draw_home_icon_panel(lv_obj_t *root,
                             kHomeIconSize, 28, &lv_font_montserrat_20,
                             app->installed ? 0x52D05D : 0xFFFFFF);
     }
-    if (!images_.draw_packaged(root, "store_arrow_down.png", arrow_x, 119))
-        center_strong_label(root, "v", kHomeIconX + 20, 119, 28, 18,
+    transparent_frame(root, kHomeIconX, kHomeIconY, kHomeIconSize, kHomeIconSize,
+                      0x6E7681, 2, 10);
+    if (!images_.draw_packaged(root, "store_arrow_down.png", arrow_x, 123))
+        center_strong_label(root, "v", kHomeIconX + 20, 123, 28, 18,
                             &lv_font_montserrat_20, 0xFF6A3D);
 }
 
@@ -160,7 +177,10 @@ void AppStorePresenter::render(Screen screen, bool registry_operation_running)
                 context(catalog_page_), view_models_.catalog(lv_tick_get(), kStatusVisibleMs),
                 [this, root]() { draw_category_selector(root); },
                 [this, root]() { draw_home_icon_panel(root, session_.catalog.selected_app()); },
-                [this, root]() { AppStoreShortcutBar::render_catalog(root, images_); });
+                [this, root]() {
+                    AppStoreShortcutBar::render_catalog(
+                        root, session_.catalog.selected_app());
+                });
             break;
         }
         case Screen::Detail: {
@@ -170,7 +190,7 @@ void AppStorePresenter::render(Screen screen, bool registry_operation_running)
                 view_models_.detail(selected, lv_tick_get(), kStatusVisibleMs),
                 [this](const appstore::StoreApp &app) {
                     AppStoreShortcutBar::render_detail(
-                        detail_page_.screen(), images_, session_.app_dir, app);
+                        detail_page_.screen(), session_.app_dir, app);
                 });
             break;
         }
@@ -183,19 +203,28 @@ void AppStorePresenter::render(Screen screen, bool registry_operation_running)
         case Screen::ErrorDialog:
             detail_page_.render_error(context(detail_page_), view_models_.error());
             break;
-        case Screen::Registry:
-            settings_page_.render(context(settings_page_),
-                                  view_models_.settings(registry_operation_running));
+        case Screen::Registry: {
+            const StoreSettingsViewModel model =
+                view_models_.settings(registry_operation_running);
+            settings_page_.render(context(settings_page_), model);
+            AppStoreShortcutBar::render_settings(
+                settings_page_.screen(), model.has_entry,
+                model.has_entry && model.entry.builtin,
+                !model.loading && !model.operation_running &&
+                    !model.region_commit_pending);
             break;
+        }
         case Screen::RegistryEdit:
             settings_page_.render_editor(context(settings_page_), view_models_.registry_editor());
             break;
         case Screen::ShareCode:
             catalog_page_.render_text_entry(context(catalog_page_), view_models_.share_code());
             break;
-        case Screen::Search:
-            catalog_page_.render_search(context(catalog_page_), view_models_.search());
+        case Screen::Search: {
+            const SearchPageViewModel model = view_models_.search();
+            catalog_page_.render_search(context(catalog_page_), model);
             break;
+        }
         case Screen::Screenshots: {
             appstore::StoreApp *app = catalog_.ensure_selected();
             std::vector<std::string> screenshots;

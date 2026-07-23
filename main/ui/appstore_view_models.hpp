@@ -70,11 +70,12 @@ struct AppDetailViewModel {
     appstore::StoreApp app;
     std::string title;
     std::string state;
-    std::string review;
+    std::string updated;
     bool installable = false;
     bool show_status = false;
     std::string status;
     std::vector<std::string> description_lines;
+    int description_start = 0;
     int description_position = 0;
     int description_page_count = 0;
     bool job_running = false;

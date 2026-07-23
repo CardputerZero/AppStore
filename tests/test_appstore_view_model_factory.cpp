@@ -76,9 +76,22 @@ int main()
     app.installable = true;
     app.review_status = "Approved";
     app.description = "Description";
+    app.size = "20560446";
+    app.updated_at = "2026-07-23T14:32:18+08:00";
+    app.name = "A very long application name that must stay intact";
     auto detail = factory.detail(&app, 100, 6000);
     assert(detail.state == "Installed 1.0");
     assert(detail.installable && detail.description_lines.size() == 1);
+    assert(detail.app.size == "19.6M");
+    assert(detail.updated == "2026-07-23 14:32");
+    assert(detail.title == "A very long application name that must stay intact  2.0");
+
+    app.name = "Line one\nLine two";
+    app.version = "2.0\tbeta";
+    detail = factory.detail(&app, 100, 6000);
+    assert(detail.title == "Line one Line two  2.0 beta");
+    app.name = "App 0";
+    app.version = "2.0";
 
     session.status.value() = "Refreshing";
     detail = factory.detail(&app, 101, 6000);
@@ -117,7 +130,7 @@ int main()
     assert(session.search.results_active());
     session.search.selected_index() = 6;
     auto search = factory.search();
-    assert(search.result_count == 7 && search.rows.size() == 4);
+    assert(search.result_count == 7 && search.rows.size() == 3);
     assert(search.rows.back().selected && search.rows.back().name == "App 6");
 
     std::cout << "appstore view model factory tests passed\n";

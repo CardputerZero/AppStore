@@ -20,7 +20,7 @@ DetailActionController::DetailActionController(AppStoreSessionState &session,
 
 std::vector<std::string> DetailActionController::description_lines(const StoreApp &app)
 {
-    return wrap_display_text(app.description.empty() ? "-" : app.description, 48);
+    return wrap_display_text(app.description.empty() ? "-" : app.description, 34);
 }
 
 StoreApp *DetailActionController::selected_app()
@@ -45,8 +45,8 @@ void DetailActionController::start_confirmation(const std::string &action)
     session_.confirmation.begin(action, app->id);
     if (action == "uninstall") {
         session_.confirmation.lines() = {"Delete " + app->name,
-                                         "Remove installed Debian package.",
-                                         "Disk free: " + session_.free_space};
+                                         "Remove the installed application.",
+                                         "Application data may remain on disk."};
         session_.screen = Screen::Confirm;
         return;
     }
@@ -193,9 +193,9 @@ void DetailActionController::scroll_description(int delta)
         return;
     }
     auto lines = description_lines(*app);
-    session_.detail_media.normalize_description(app->id, static_cast<int>(lines.size()), 2);
-    if (lines.size() <= 2) return;
-    session_.detail_media.scroll_description(delta, static_cast<int>(lines.size()), 2);
+    session_.detail_media.normalize_description(app->id, static_cast<int>(lines.size()), 3);
+    if (lines.size() <= 3) return;
+    session_.detail_media.scroll_description(delta, static_cast<int>(lines.size()), 3);
     session_.status.value().clear();
 }
 

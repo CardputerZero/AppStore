@@ -3,10 +3,64 @@
 #include "detail_action_controller.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iomanip>
+#include <sstream>
 
 namespace appstore_ui {
 
 using namespace appstore;
+
+namespace {
+
+std::string human_size(const std::string &value)
+{
+    if (value.empty()) return "-";
+    char *end = nullptr;
+    const unsigned long long bytes = std::strtoull(value.c_str(), &end, 10);
+    if (!end || *end != '\0') return value;
+
+    const char *unit = "B";
+    double amount = static_cast<double>(bytes);
+    if (bytes >= 1024ULL * 1024ULL * 1024ULL) {
+        amount /= 1024.0 * 1024.0 * 1024.0;
+        unit = "G";
+    } else if (bytes >= 1024ULL * 1024ULL) {
+        amount /= 1024.0 * 1024.0;
+        unit = "M";
+    } else if (bytes >= 1024ULL) {
+        amount /= 1024.0;
+        unit = "K";
+    }
+
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(unit[0] == 'B' ? 0 : 1);
+    out << amount << unit;
+    std::string result = out.str();
+    const std::string redundant_decimal = std::string(".0") + unit;
+    const size_t decimal = result.rfind(redundant_decimal);
+    if (decimal != std::string::npos && decimal + redundant_decimal.size() == result.size())
+        result.erase(decimal, 2);
+    return result;
+}
+
+std::string friendly_updated_at(std::string value)
+{
+    if (value.empty()) return "-";
+    if (value.size() > 10 && value[10] == 'T') value[10] = ' ';
+    if (value.size() > 16) value.resize(16);
+    return value;
+}
+
+std::string single_line(std::string value)
+{
+    for (char &ch : value) {
+        if (ch == '\n' || ch == '\r' || ch == '\t') ch = ' ';
+    }
+    return value;
+}
+
+} // namespace
 
 AppStoreViewModelFactory::AppStoreViewModelFactory(AppStoreSessionState &session,
                                                    PackageJobState &package_job,
@@ -55,11 +109,12 @@ AppDetailViewModel AppStoreViewModelFactory::detail(StoreApp *selected, uint32_t
     model.has_app = selected != nullptr;
     if (!selected) return model;
     model.app = *selected;
-    model.title = one_line(selected->name + "  " + selected->version, 30);
+    model.app.size = human_size(selected->size);
+    model.title = single_line(selected->name) + "  " + single_line(selected->version);
     model.state = selected->installed ? "Installed" : "Not installed";
     if (selected->installed && !selected->installed_version.empty())
         model.state += " " + one_line(selected->installed_version, 10);
-    model.review = one_line(review_label(*selected), 36);
+    model.updated = friendly_updated_at(selected->updated_at);
     model.installable = can_install_app(*selected);
     model.job_running = package_job_.running;
     model.job_progress = package_job_.progress;
@@ -68,15 +123,14 @@ AppDetailViewModel AppStoreViewModelFactory::detail(StoreApp *selected, uint32_t
         session_.status.visible(now, status_visible_ms);
     if (model.show_status) return model;
     auto lines = DetailActionController::description_lines(*selected);
-    session_.detail_media.normalize_description(selected->id, static_cast<int>(lines.size()), 2);
+    session_.detail_media.normalize_description(selected->id, static_cast<int>(lines.size()), 3);
     const int total = static_cast<int>(lines.size());
-    const int first = std::min(session_.detail_media.description_scroll(),
-                               std::max(0, total - 1));
-    for (int row = 0; row < 2 && first + row < total; ++row)
-        model.description_lines.push_back(lines[first + row]);
-    if (total > 2) {
+    model.description_lines = std::move(lines);
+    model.description_start = std::min(session_.detail_media.description_scroll(),
+                                       std::max(0, total - 1));
+    if (total > 3) {
         model.description_position = session_.detail_media.description_scroll() + 1;
-        model.description_page_count = std::max(0, total - 2) + 1;
+        model.description_page_count = std::max(0, total - 3) + 1;
     }
     return model;
 }
@@ -127,7 +181,7 @@ InitializationProgressViewModel AppStoreViewModelFactory::initialization() const
     model.error_title = session_.error.title.empty() ? "NETWORK FAILED" : session_.error.title;
     model.error_message = session_.error.message.empty() ? "Network check failed." : session_.error.message;
     const std::string detail = session_.error.detail.empty()
-        ? "Check Wi-Fi before opening AppStore again." : session_.error.detail;
+        ? "Check Wi-Fi before opening Store again." : session_.error.detail;
     model.error_detail_lines = wrap_display_text(detail, 44);
     return model;
 }
@@ -173,8 +227,8 @@ SearchPageViewModel AppStoreViewModelFactory::search()
     session_.search.selected_index() = std::max(
         0, std::min(total - 1, session_.search.selected_index()));
     int first = std::max(0, session_.search.selected_index() - 1);
-    int last = std::min(total - 1, first + 3);
-    first = std::max(0, last - 3);
+    int last = std::min(total - 1, first + 2);
+    first = std::max(0, last - 2);
     for (int index = first; index <= last; ++index) {
         const StoreApp &app = session_.catalog.apps()[session_.search.results()[index]];
         model.rows.push_back({app.name, app.category.empty() ? app.author : app.category,

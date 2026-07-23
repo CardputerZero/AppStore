@@ -890,13 +890,32 @@ std::string free_space()
 
 std::string author(const json &app)
 {
-    if (!app.contains("author")) return "";
-    if (app["author"].is_string()) return app["author"].get<std::string>();
-    if (app["author"].is_object()) {
-        for (const char *key : {"display_name", "github", "name"}) {
-            std::string value = app["author"].value(key, "");
+    if (app.contains("author") && app["author"].is_string())
+        return app["author"].get<std::string>();
+    if (app.contains("author") && app["author"].is_object()) {
+        for (const char *key : {"display_name", "github"}) {
+            const auto candidate = app["author"].find(key);
+            std::string value = candidate != app["author"].end() && candidate->is_string()
+                ? candidate->get<std::string>() : "";
             if (!value.empty()) return value;
         }
+    }
+    std::string repository;
+    if (app.contains("source") && app["source"].is_object())
+        repository = app["source"].value("repository", "");
+    if (repository.empty())
+        repository = app.value("source_repo", app.value("repository", app.value("git_url", "")));
+    const std::string https_prefix = "https://github.com/";
+    const std::string ssh_prefix = "git@github.com:";
+    size_t owner_start = std::string::npos;
+    if (repository.rfind(https_prefix, 0) == 0)
+        owner_start = https_prefix.size();
+    else if (repository.rfind(ssh_prefix, 0) == 0)
+        owner_start = ssh_prefix.size();
+    if (owner_start != std::string::npos) {
+        const size_t owner_end = repository.find('/', owner_start);
+        if (owner_end != std::string::npos && owner_end > owner_start)
+            return repository.substr(owner_start, owner_end - owner_start);
     }
     return "";
 }
@@ -1270,7 +1289,7 @@ std::string prepare_package(const std::string &action, const std::string &id, in
         }
         if (pending.is_object() && !pending.empty()) {
             if (pending.value("helper_completed", false))
-                throw std::runtime_error("package operation was applied but not finalized; refresh AppStore to recover it");
+                throw std::runtime_error("package operation was applied but not finalized; refresh Store to recover it");
             if (action != "uninstall") {
                 const fs::path saved_deb = pending.value("deb_path", "");
                 const std::string expected = download_meta(app).value(
@@ -1389,7 +1408,7 @@ int package_helper(const std::string &action, const std::string &value, bool rei
     try {
         if (geteuid() != 0) throw std::runtime_error("package helper requires root");
         if (fs::weakly_canonical(path) != fs::weakly_canonical(privileged_pending_path()))
-            throw std::runtime_error("package pending path is not the AppStore transaction file");
+            throw std::runtime_error("package pending path is not the Store transaction file");
         lock_transaction(fd);
         json pending = read_json(path);
         if (!pending.is_object() || pending.value("transaction_id", "") != transaction)

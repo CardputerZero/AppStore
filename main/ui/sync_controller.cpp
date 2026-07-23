@@ -57,7 +57,7 @@ void SyncController::set_start_failure()
     session_.status.value() = "Network unavailable - press R to retry";
     session_.error.title = "NETWORK FAILED";
     session_.error.message = "No registry is reachable.";
-    session_.error.detail = "Exit AppStore or open settings to change registry addresses.";
+    session_.error.detail = "Exit Store or open settings to change registry addresses.";
     if (dependencies_.render) dependencies_.render();
 }
 
@@ -100,7 +100,7 @@ void SyncController::continue_after_startup_failure(const std::string &detail)
     session_.error.title = "NETWORK FAILED";
     session_.error.message = "No registry is reachable.";
     session_.error.detail = detail.empty()
-        ? "Exit AppStore or open settings to change registry addresses."
+        ? "Exit Store or open settings to change registry addresses."
         : detail;
     session_.status.value().clear();
     session_.screen = Screen::StartupSync;

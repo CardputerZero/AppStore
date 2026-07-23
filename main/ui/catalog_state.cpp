@@ -26,7 +26,7 @@ bool CatalogState::select_category_by_name(const std::string &name)
 void CatalogState::select_default_category()
 {
     if (!select_category_by_name("All") && !categories_.empty()) category_index_ = 0;
-    std::fprintf(stderr, "[AppStore UI] select_default_category index=%d name=%s cats=%zu\n",
+    std::fprintf(stderr, "[Store UI] select_default_category index=%d name=%s cats=%zu\n",
                  category_index_, current_category_name().c_str(), categories_.size());
 }
 
@@ -48,7 +48,7 @@ void CatalogState::rebuild_visible()
         selected_index_ = static_cast<int>(visible_.size()) - 1;
     if (selected_index_ < 0) selected_index_ = 0;
     std::fprintf(stderr,
-                 "[AppStore UI] rebuild_visible category=%s category_index=%d apps=%zu visible=%zu recommended=%d exact_category=%d selected=%d\n",
+                 "[Store UI] rebuild_visible category=%s category_index=%d apps=%zu visible=%zu recommended=%d exact_category=%d selected=%d\n",
                  category.c_str(), category_index_, apps_.size(), visible_.size(),
                  recommended_count, exact_category_count, selected_index_);
 }

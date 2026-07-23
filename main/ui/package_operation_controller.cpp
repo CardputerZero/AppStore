@@ -113,7 +113,7 @@ void PackageOperationController::finish(const std::string &output, int result_co
         session_.error.detail = backend_error_message(output);
         if (session_.error.detail.empty()) session_.error.detail = "Package operation failed.";
         session_.error.repairable = pending_conflict || output.find(
-            "package pending path is not the AppStore transaction file") != std::string::npos;
+            "package pending path is not the Store transaction file") != std::string::npos;
         if (pending_conflict) {
             session_.error.message = "Interrupted package transaction";
             session_.error.detail = "An earlier " + pending_action + " for " +
