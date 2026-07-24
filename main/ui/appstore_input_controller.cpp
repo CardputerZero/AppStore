@@ -50,8 +50,12 @@ void AppStoreInputController::handle(const AppStoreKeyEvent &key, uint32_t now)
 
     switch (session_.screen) {
         case Screen::StartupSync:
+            if (key.code == KEY_TAB) {
+                if (actions_.open_registry) actions_.open_registry();
+                break;
+            }
             if (!session_.sync.startup_failed) break;
-            if (key.code == KEY_LEFT || key.code == KEY_RIGHT || key.code == KEY_TAB ||
+            if (key.code == KEY_LEFT || key.code == KEY_RIGHT ||
                 key.code == KEY_Z || key.code == KEY_C || key.ch == 'z' || key.ch == 'c') {
                 session_.sync.failure_focus = 1 - session_.sync.failure_focus;
             } else if (key.code == KEY_ENTER) {

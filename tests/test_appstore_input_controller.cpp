@@ -179,6 +179,11 @@ int main()
     assert(backs == 1 && session.screen == Screen::Home);
 
     session.screen = Screen::StartupSync;
+    session.sync.startup_failed = false;
+    input.handle({KEY_TAB}, 390);
+    assert(registry_opens == 1 && session.screen == Screen::Registry);
+
+    session.screen = Screen::StartupSync;
     session.sync.startup_failed = true;
     input.handle({KEY_ENTER}, 400);
     assert(quits == 1);
@@ -186,7 +191,10 @@ int main()
     input.handle({KEY_RIGHT}, 410);
     assert(session.sync.failure_focus == 1);
     input.handle({KEY_ENTER}, 420);
-    assert(registry_opens == 1 && session.screen == Screen::Registry);
+    assert(registry_opens == 2 && session.screen == Screen::Registry);
+    session.screen = Screen::StartupSync;
+    input.handle({KEY_TAB}, 425);
+    assert(registry_opens == 3 && session.screen == Screen::Registry);
     session.sync.startup_active = true;
     input.handle({KEY_B}, 430);
     assert(session.screen == Screen::StartupSync && session.sync.startup_failed);

@@ -232,8 +232,8 @@ void InitializationProgressPage::render(const PageRenderContext &context,
     center_label(root, appstore::one_line(model.detail, 52), 18, 119, 284, 14,
                  &lv_font_montserrat_10, 0xB8B8B8, LV_LABEL_LONG_DOT);
     center_strong_label(root, model.cancel_requested ? "Cancelling..." :
-                        (preparing_catalog ? "Building app list...   Hold ESC: Exit" :
-                         "Checking connection...   Hold ESC: Exit"), 18, 151, 284, 12,
+                        (preparing_catalog ? "Building app list...   Tab: Settings" :
+                         "Tab: Settings   Hold ESC: Exit"), 18, 151, 284, 12,
                         &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
     if (!model.failed) return;
 
@@ -261,7 +261,7 @@ void InitializationProgressPage::render(const PageRenderContext &context,
         settings_focused ? 0xCCCC33 : 0x2EA043, settings_focused ? 2 : 1, 2);
     center_strong_label(root, "SETTINGS", 170, 123, 101, 12,
                         &lv_font_montserrat_10, 0xFFFFFF);
-    center_label(root, "Left/Right select   Enter confirm", 48, 146, 224, 12,
+    center_label(root, "Tab: Settings   Enter confirm", 48, 146, 224, 12,
                  &lv_font_montserrat_10, 0xCCCC33);
 }
 
