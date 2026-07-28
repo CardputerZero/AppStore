@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cp0_keyboard_input_context.hpp"
+
 #include "appstore_image_renderer.hpp"
 #include "appstore_input_controller.hpp"
 #include "appstore_lifecycle.hpp"
@@ -66,6 +68,7 @@ private:
     static AppStoreRuntimeState runtime_;
     static AppStoreApp *current_;
 
+    Cp0KeyboardInputContextScope input_context_scope_;
     AppStoreLowBatteryOverlay low_battery_overlay_;
     SystemStatusController status_controller_;
     DetailActionController detail_actions_;

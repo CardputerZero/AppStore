@@ -1,5 +1,6 @@
 #pragma once
 
+
 #include "appstore_client.hpp"
 #include "appstore_task_coordinator.hpp"
 #include "catalog_state.hpp"

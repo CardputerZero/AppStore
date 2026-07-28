@@ -1,5 +1,7 @@
 #pragma once
 
+#include "keyboard_input.h"
+
 #include "appstore_session_state.hpp"
 #include "catalog_controller.hpp"
 #include "detail_action_controller.hpp"
@@ -13,6 +15,14 @@
 #include <functional>
 
 namespace appstore_ui {
+
+constexpr cp0_keyboard_input_context_t appstore_input_context(Screen screen)
+{
+    return screen == Screen::Search || screen == Screen::ShareCode ||
+                   screen == Screen::RegistryEdit
+               ? KBD_INPUT_CONTEXT_TEXT
+               : KBD_INPUT_CONTEXT_NAVIGATION;
+}
 
 struct AppStoreKeyEvent {
     uint32_t code = 0;

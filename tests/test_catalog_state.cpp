@@ -14,6 +14,7 @@ int main()
     appstore::StoreApp utility;
     utility.id = "utility";
     utility.category = "Utilities";
+    utility.categories = {"Utilities", "Calendar"};
     state.apps() = {recommended, utility};
 
     state.rebuild_visible();
@@ -35,5 +36,11 @@ int main()
     state.rebuild_visible();
     assert(state.visible().size() == 1);
     assert(state.selected_index() == 0);
+
+    state.categories().push_back("Calendar");
+    assert(state.select_category_by_name("Calendar"));
+    state.rebuild_visible();
+    assert(state.visible().size() == 1);
+    assert(state.selected_app() && state.selected_app()->id == "utility");
     return 0;
 }

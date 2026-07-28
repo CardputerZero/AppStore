@@ -48,6 +48,14 @@ std::vector<std::string> detail_screenshot_paths(const std::string &,
 
 int main()
 {
+    assert(appstore_ui::appstore_input_context(appstore_ui::Screen::Home) ==
+           KBD_INPUT_CONTEXT_NAVIGATION);
+    assert(appstore_ui::appstore_input_context(appstore_ui::Screen::Search) ==
+           KBD_INPUT_CONTEXT_TEXT);
+    assert(appstore_ui::appstore_input_context(appstore_ui::Screen::RegistryEdit) ==
+           KBD_INPUT_CONTEXT_TEXT);
+    assert(appstore_ui::appstore_input_context(appstore_ui::Screen::Detail) ==
+           KBD_INPUT_CONTEXT_NAVIGATION);
     using namespace appstore_ui;
     AppStoreSessionState session;
     PackageJobState package_job;
@@ -111,6 +119,19 @@ int main()
     session.screen = Screen::Home;
     input.handle({KEY_6}, 140);
     assert(session.screen == Screen::Search);
+
+    session.catalog.apps()[0].name = "Firefox";
+    session.catalog.apps()[1].name = "Firefly";
+    session.search.input() = "fire";
+    session.search.submit(session.catalog.apps());
+    assert(session.search.results_active());
+    input.handle({KEY_F, 0, 'f'}, 141);
+    assert(session.search.input() == "firef");
+    assert(!session.search.results_active());
+    session.search.submit(session.catalog.apps());
+    input.handle({KEY_X, 0, 'x'}, 142);
+    assert(session.search.input() == "firefx");
+    assert(!session.search.results_active());
 
     session.screen = Screen::Confirm;
     session.confirmation.focus() = 0;

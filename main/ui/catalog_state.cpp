@@ -1,5 +1,6 @@
 #include "catalog_state.hpp"
 
+#include <algorithm>
 #include <cstdio>
 
 namespace appstore_ui {
@@ -37,11 +38,14 @@ void CatalogState::rebuild_visible()
     int recommended_count = 0;
     int exact_category_count = 0;
     for (int index = 0; index < static_cast<int>(apps_.size()); ++index) {
-        if (apps_[index].recommended) ++recommended_count;
-        if (apps_[index].category == category) ++exact_category_count;
+        const auto &app = apps_[index];
+        const bool category_match = app.category == category ||
+            std::find(app.categories.begin(), app.categories.end(), category) !=
+                app.categories.end();
+        if (app.recommended) ++recommended_count;
+        if (category_match) ++exact_category_count;
         const bool show = category == "All" ||
-            (category == "Recommended" && apps_[index].recommended) ||
-            apps_[index].category == category;
+            (category == "Recommended" && app.recommended) || category_match;
         if (show) visible_.push_back(index);
     }
     if (selected_index_ >= static_cast<int>(visible_.size()))

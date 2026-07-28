@@ -17,6 +17,7 @@ struct StoreApp {
     std::string version;
     std::string installed_version;
     std::string category;
+    std::vector<std::string> categories;
     bool installed = false;
     bool recommended = false;
     std::string size;

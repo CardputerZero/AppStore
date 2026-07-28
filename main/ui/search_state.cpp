@@ -32,8 +32,11 @@ std::optional<int> SearchState::submit(const std::vector<appstore::StoreApp> &ap
     }
     for (int index = 0; index < static_cast<int>(apps.size()); ++index) {
         const auto &app = apps[index];
+        std::string categories;
+        for (const auto &category : app.categories) categories += " " + category;
         const std::string haystack = appstore::match_key(
-            app.name + " " + app.author + " " + app.category + " " + app.share_code + " " + app.id);
+            app.name + " " + app.author + " " + app.category + categories +
+            " " + app.share_code + " " + app.id);
         if (haystack.find(query) != std::string::npos) results_.push_back(index);
     }
     if (results_.empty()) {

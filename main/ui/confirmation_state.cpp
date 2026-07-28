@@ -11,7 +11,7 @@ void ConfirmationState::begin(std::string action, std::string app_id)
     action_ = std::move(action);
     app_id_ = std::move(app_id);
     lines_.clear();
-    focus_ = 0;
+    focus_ = 1;
     force_overwrite_ = false;
 }
 
@@ -20,7 +20,7 @@ void ConfirmationState::reset()
     action_.clear();
     app_id_.clear();
     lines_.clear();
-    focus_ = 0;
+    focus_ = 1;
     force_overwrite_ = false;
 }
 

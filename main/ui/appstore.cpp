@@ -192,6 +192,7 @@ void AppStoreApp::draw_system_bar()
 
 void AppStoreApp::render_current_screen()
 {
+    input_context_scope_.update(appstore_input_context(g_runtime.session.screen));
     activate(g_runtime.session.screen);
     presenter_.render(g_runtime.session.screen, registry_actions_.operation_running());
 }

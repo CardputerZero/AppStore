@@ -231,10 +231,10 @@ void AppStoreInputController::handle(const AppStoreKeyEvent &key, uint32_t now)
             break;
         case Screen::Search:
             if (session_.search.results_active() && !session_.search.results().empty() &&
-                (key.code == KEY_UP || key.code == KEY_F || key.ch == 'f'))
+                key.code == KEY_UP)
                 session_.search.move_selection(-1);
             else if (session_.search.results_active() && !session_.search.results().empty() &&
-                     (key.code == KEY_DOWN || key.code == KEY_X || key.ch == 'x'))
+                     key.code == KEY_DOWN)
                 session_.search.move_selection(1);
             else if (key.code == KEY_BACKSPACE && !session_.search.input().empty()) {
                 session_.search.input().pop_back();

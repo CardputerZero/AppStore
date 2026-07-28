@@ -1044,6 +1044,13 @@ std::string summary_output()
         if (std::find(categories.begin(), categories.end(), category) == categories.end()) categories.push_back(category);
     for (const auto &category : categories) emit(out, "CAT", category);
     for (const auto &app : apps) {
+        const std::vector<std::string> app_categories =
+            string_list(app.value("categories", json::array()));
+        std::ostringstream category_text;
+        for (size_t index = 0; index < app_categories.size(); ++index) {
+            if (index) category_text << '\x1f';
+            category_text << app_categories[index];
+        }
         json download = download_meta(app);
         auto state = effective_package_state(package_name(app));
         std::vector<std::string> images;
@@ -1057,11 +1064,12 @@ std::string summary_output()
         if (source.empty()) source = app.value("source_repo", app.value("repository", app.value("git_url", "")));
         std::string dependencies = dependencies_text(app);
         emit(out, "APP", app_key(app), localized(app, "title"), app.value("version", ""),
-             string_list(app.value("categories", json::array())).empty() ? "Other" : string_list(app.value("categories", json::array())).front(),
+             app_categories.empty() ? "Other" : app_categories.front(),
              installed(app) ? "1" : "0", (app.value("featured", false) || review(app) == "approved") ? "1" : "0",
              field(download.value("size", json("online"))), localized(app, "summary").empty() ? localized(app, "description") : localized(app, "summary"),
              author(app), source, image_text.str(), dependencies, app.value("share_code", ""), app.value("_registry_name", ""),
-             app.value("updated_at", app.value("published_at", "")), review(app), review(app) == "approved" ? "1" : "0", state.version);
+             app.value("updated_at", app.value("published_at", "")), review(app), review(app) == "approved" ? "1" : "0", state.version,
+             category_text.str());
     }
     return out.str();
 }

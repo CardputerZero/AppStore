@@ -553,6 +553,14 @@ SummaryData load_summary(SortRule rule)
             if (fields.size() >= 17) app.review_status = fields[16];
             if (fields.size() >= 18) app.installable = fields[17] == "1";
             if (fields.size() >= 19) app.installed_version = fields[18];
+            if (fields.size() >= 20) {
+                std::istringstream categories(fields[19]);
+                std::string category;
+                while (std::getline(categories, category, '\x1f'))
+                    if (!category.empty()) app.categories.push_back(category);
+            }
+            if (app.categories.empty() && !app.category.empty())
+                app.categories.push_back(app.category);
             data.apps.push_back(app);
         } else if (!trim(line).empty()) {
             ++ignored_count;
