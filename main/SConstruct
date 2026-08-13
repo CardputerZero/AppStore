@@ -37,6 +37,8 @@ APPSTORE_STATIC_ROOT = os.path.join(PROJECT_ROOT, "APPLaunch")
 APPLAUNCH_STATIC_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, "..", "APPLaunch", "APPLaunch"))
 STAGED_STATIC_ROOT = os.path.abspath(os.path.join("build", "static"))
 STAGED_APPLAUNCH = os.path.join(STAGED_STATIC_ROOT, "APPLaunch")
+RUNTIME_BINARY = os.environ.get("APPSTORE_RUNTIME_BINARY", "M5CardputerZero-AppStore")
+RUNTIME_WRAPPER = os.path.join(PROJECT_ROOT, "bin", "M5CardputerZero-AppStore")
 
 
 def stage_appstore_static_files():
@@ -65,6 +67,8 @@ def stage_appstore_static_files():
 
 stage_appstore_static_files()
 STATIC_FILES += [(STAGED_APPLAUNCH, "APPLaunch")]
+if RUNTIME_BINARY != "M5CardputerZero-AppStore":
+    STATIC_FILES += [(RUNTIME_WRAPPER, "M5CardputerZero-AppStore")]
 
 def pkg_config_flags(kind, package):
     try:
@@ -108,6 +112,8 @@ if FREETYPE_INCLUDE:
 if "CONFIG_V9_5_LV_USE_FREETYPE" in os.environ:
     REQUIREMENTS += ["freetype"]
 if "CONFIG_V9_5_LV_USE_SDL" in os.environ:
+    REQUIREMENTS += ["SDL2"]
+    INCLUDE += ["/usr/include/SDL2"]
     lvgl_component["REQUIREMENTS"] += ["SDL2"]
     lvgl_component["INCLUDE"] += ["/usr/include/SDL2"]
     for sdl_include in [
@@ -117,6 +123,7 @@ if "CONFIG_V9_5_LV_USE_SDL" in os.environ:
         "/usr/local/include/SDL2",
     ]:
         if os.path.exists(sdl_include):
+            INCLUDE += [sdl_include]
             lvgl_component["INCLUDE"] += [sdl_include]
     for sdl_lib in ["/opt/homebrew/lib", "/usr/local/lib"]:
         if os.path.exists(sdl_lib):
@@ -130,7 +137,7 @@ if "CONFIG_V9_5_LV_USE_SDL" in os.environ:
 
 env["COMPONENTS"].append(
     {
-        "target": "M5CardputerZero-AppStore",
+        "target": RUNTIME_BINARY,
         "SRCS": SRCS,
         "INCLUDE": INCLUDE,
         "PRIVATE_INCLUDE": PRIVATE_INCLUDE,
