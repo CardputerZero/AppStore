@@ -3,6 +3,8 @@ set -eu
 build_dir="${TMPDIR:-/tmp}/appstore-tests"
 mkdir -p "$build_dir"
 "$(dirname "$0")/test_backend_boundaries.sh"
+"$(dirname "$0")/test_runtime_deployment.sh"
+"$(dirname "$0")/test_runtime_launcher.sh"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Werror \
     -I"$(dirname "$0")/../main/include" -I"$(dirname "$0")/../main/interface" -I"$(dirname "$0")/../main/ui" \
     "$(dirname "$0")/test_appstore_paths.cpp" \

@@ -21,8 +21,54 @@ version_file = local_path.parent.parent / "ext_components" / "cp0_lvgl" / "sdk_v
 version = version_file.read_text(encoding="utf-8")
 static_lib_path = sdk_path / "github_source" / f"static_lib_{version}"
 
+def requested_display_backend():
+    value = (
+        os.environ.get("APPSTORE_DISPLAY_BACKEND") or
+        os.environ.get("M5APPSTORE_DISPLAY_BACKEND") or
+        "auto"
+    ).strip().lower()
+    aliases = {
+        "": "auto",
+        "auto": "auto",
+        "fb": "fbdev",
+        "fbdev": "fbdev",
+        "framebuffer": "fbdev",
+        "direct-fb": "fbdev",
+        "device": "fbdev",
+        "sdl": "wayland",
+        "wayland": "wayland",
+        "labwc": "wayland",
+        "x11": "wayland",
+        "window": "wayland",
+    }
+    if value not in aliases:
+        raise RuntimeError(
+            "Unsupported APPSTORE_DISPLAY_BACKEND={!r}. "
+            "Use auto, fbdev, sdl, wayland, labwc, or x11.".format(value)
+        )
+    return aliases[value]
+
+
+display_backend = requested_display_backend()
 if os.environ.get("CardputerZero", '') == 'y':
+    if display_backend == "wayland":
+        raise RuntimeError(
+            "APPSTORE_DISPLAY_BACKEND=wayland is a native Linux build. "
+            "The CardputerZero cross build remains the fbdev runtime."
+        )
     os.environ["CONFIG_DEFAULT_FILE"] = "linux_x86_cross_cp0_config_defaults.mk"
+    if display_backend == "fbdev":
+        os.environ["APPSTORE_RUNTIME_BINARY"] = "M5CardputerZero-AppStore-fbdev"
+elif display_backend == "wayland":
+    os.environ["CONFIG_DEFAULT_FILE"] = "linux_x86_sdl2_config_defaults.mk"
+    os.environ["APPSTORE_RUNTIME_BINARY"] = "M5CardputerZero-AppStore-wayland"
+elif display_backend == "fbdev":
+    if os.environ.get("CONFIG_DEFAULT_FILE") is None:
+        raise RuntimeError(
+            "APPSTORE_DISPLAY_BACKEND=fbdev requires CardputerZero=y for the "
+            "cross profile, or an explicit framebuffer CONFIG_DEFAULT_FILE."
+        )
+    os.environ["APPSTORE_RUNTIME_BINARY"] = "M5CardputerZero-AppStore-fbdev"
 
 if os.environ.get("CONFIG_DEFAULT_FILE") == None:
     if platform.machine() == 'x86_64':

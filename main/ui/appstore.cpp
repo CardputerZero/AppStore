@@ -12,6 +12,11 @@
 #include "cp0_lvgl_app_runner.hpp"
 #include "hal_lvgl_bsp.h"
 
+#ifdef CONFIG_V9_5_LV_USE_SDL
+#include <SDL.h>
+#include "lvgl/src/drivers/sdl/lv_sdl_window.h"
+#endif
+
 #include <cstdarg>
 #include <csignal>
 #include <cstdio>
@@ -110,6 +115,22 @@ void handle_signal(int)
 {
     request_quit();
 }
+
+#ifdef CONFIG_V9_5_LV_USE_SDL
+void configure_sdl_window()
+{
+    lv_display_t *display = lv_display_get_default();
+    SDL_Window *window = display ? lv_sdl_window_get_window(display) : nullptr;
+    if (!window) return;
+    SDL_HideWindow(window);
+    SDL_SetWindowTitle(window, "AppStore");
+    SDL_SetWindowBordered(window, SDL_FALSE);
+    SDL_SetWindowResizable(window, SDL_FALSE);
+    SDL_SetWindowMinimumSize(window, kScreenWidth, kScreenHeight);
+    SDL_SetWindowSize(window, kScreenWidth, kScreenHeight);
+    SDL_ShowWindow(window);
+}
+#endif
 
 class AppStoreSyncTopBarComponent final : public AppTopBarComponent
 {
@@ -588,6 +609,9 @@ void ui_init(int argc, char **argv)
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
     cp0_zmq_log_init();
+#ifdef CONFIG_V9_5_LV_USE_SDL
+    configure_sdl_window();
+#endif
     if (auto *app = appstore_ui::AppStoreApp::current())
         app->lifecycle().initialize(argc, argv);
 }

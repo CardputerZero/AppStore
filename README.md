@@ -21,6 +21,74 @@ M5APPSTORE_STATE_DIR=/root/.local/share/cardputerzero-appstore
 M5APPSTORE_APP_ROOT=/usr/share/APPLaunch
 ```
 
+## Display runtimes
+
+The default CardputerZero deployment is unchanged: it builds and installs the
+single `M5CardputerZero-AppStore` framebuffer/evdev binary through the existing
+APPLaunch path. Wayland support is an optional dual-runtime deployment; it does
+not replace the default framebuffer runtime.
+
+For an explicit dual-runtime deployment, the stable APPLaunch entry becomes a
+wrapper that selects the display implementation at runtime:
+
+```text
+/usr/share/APPLaunch/bin/M5CardputerZero-AppStore
+  wrapper at the existing launcher path
+/usr/share/APPLaunch/bin/M5CardputerZero-AppStore-wayland
+  SDL/LVGL runtime for labwc/Wayland and X11 sessions
+/usr/share/APPLaunch/bin/M5CardputerZero-AppStore-fbdev
+  direct framebuffer runtime for the legacy launcher
+```
+
+When the optional wrapper is installed, `M5APPSTORE_DISPLAY_BACKEND` selects a
+runtime explicitly. If it is unset, the wrapper uses the Wayland/SDL runtime if
+`WAYLAND_DISPLAY` or `DISPLAY` is present; otherwise it uses the framebuffer
+runtime. This preserves the APPLaunch entry path:
+
+```bash
+M5APPSTORE_DISPLAY_BACKEND=wayland M5CardputerZero-AppStore
+M5APPSTORE_DISPLAY_BACKEND=fbdev M5CardputerZero-AppStore
+```
+
+The wrapper preserves a caller-provided `SDL_VIDEODRIVER`. In a Wayland session
+where it is not already set, it selects SDL's Wayland driver and disables
+libdecor so labwc owns the window decorations. The SDL runtime identifies its
+Wayland window as `cardputerzero-appstore` and creates a fixed 320×170 AppStore
+window.
+
+The normal framebuffer-only device build remains the existing command:
+
+```bash
+CardputerZero=y scons -j8
+```
+
+To make a dual-runtime release, build the two named runtime binaries separately
+(use separate build directories or clean between configurations), then assemble
+the wrapper and both binaries into one release directory:
+
+```bash
+# CardputerZero cross build: primary framebuffer runtime
+CardputerZero=y APPSTORE_DISPLAY_BACKEND=fbdev scons -j8
+
+# Native aarch64 Linux build on the Wayland-capable runtime image: optional runtime
+APPSTORE_DISPLAY_BACKEND=wayland scons -j8
+```
+
+Install the dual-runtime release only when all three files are present:
+
+```bash
+install -m 755 M5CardputerZero-AppStore /usr/share/APPLaunch/bin/M5CardputerZero-AppStore
+install -m 755 M5CardputerZero-AppStore-fbdev /usr/share/APPLaunch/bin/M5CardputerZero-AppStore-fbdev
+install -m 755 M5CardputerZero-AppStore-wayland /usr/share/APPLaunch/bin/M5CardputerZero-AppStore-wayland
+```
+
+The framebuffer build deliberately remains the primary cross-compilation
+profile. The Wayland build is native because it links against the runtime
+image's SDL2/Wayland libraries; requesting it with `CardputerZero=y` fails
+early instead of producing an incompatible binary. The stock `setup.ini`
+continues to deploy the framebuffer-only artifact; dual-runtime release
+assembly and installation are an explicit opt-in.
+
 Default registry:
 
 ```text

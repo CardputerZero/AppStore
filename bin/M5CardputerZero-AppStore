@@ -1,0 +1,58 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+
+set -eu
+
+case "$0" in
+    */*) app_dir=${0%/*} ;;
+    *) app_dir=/usr/share/APPLaunch/bin ;;
+esac
+
+backend=${M5APPSTORE_DISPLAY_BACKEND:-${APPSTORE_DISPLAY_BACKEND:-auto}}
+
+case "$backend" in
+    auto|"")
+        if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
+            backend=wayland
+        else
+            backend=fbdev
+        fi
+        ;;
+    wayland|labwc|sdl|x11|window)
+        backend=wayland
+        ;;
+    fb|fbdev|framebuffer|direct-fb|device)
+        backend=fbdev
+        ;;
+    *)
+        echo "M5CardputerZero-AppStore: unsupported M5APPSTORE_DISPLAY_BACKEND=$backend" >&2
+        exit 2
+        ;;
+esac
+
+if [ "$backend" = "wayland" ]; then
+    binary=$app_dir/M5CardputerZero-AppStore-wayland
+    if [ ! -x "$binary" ]; then
+        echo "M5CardputerZero-AppStore: Wayland/SDL runtime is not installed: $binary" >&2
+        exit 127
+    fi
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -z "${SDL_VIDEODRIVER:-}" ]; then
+        export SDL_VIDEODRIVER=wayland
+    fi
+    export SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR=0
+    export SDL_VIDEO_WAYLAND_PREFER_LIBDECOR=0
+    exec "$binary" "$@"
+fi
+
+binary=$app_dir/M5CardputerZero-AppStore-fbdev
+if [ ! -x "$binary" ]; then
+    legacy=$app_dir/M5CardputerZero-AppStore.bin
+    if [ -x "$legacy" ]; then
+        binary=$legacy
+    else
+        echo "M5CardputerZero-AppStore: framebuffer runtime is not installed: $binary" >&2
+        exit 127
+    fi
+fi
+
+exec "$binary" "$@"
