@@ -41,6 +41,7 @@ void PackageJobState::reset()
     helper_execs.clear();
     helper_reinstall = false;
     force_overwrite = false;
+    repairing = false;
     sudo_request_id = 0;
     phase = PackageJobPhase::Idle;
     progress = -1;

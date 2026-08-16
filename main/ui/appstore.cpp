@@ -345,6 +345,7 @@ void AppStoreApp::repair_package_error()
     const std::string title = g_runtime.session.error.repair_title;
     g_runtime.session.error.clear();
     g_runtime.package_jobs.state().begin(action, app_id, title, lv_tick_get());
+    g_runtime.package_jobs.state().repairing = true;
     g_runtime.package_jobs.state().phase = appstore_ui::PackageJobPhase::Repair;
     g_runtime.package_jobs.state().detail = "Repairing package transaction";
     g_runtime.session.status.value() = "Repairing package transaction...";

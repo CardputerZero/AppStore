@@ -87,20 +87,37 @@ int main()
     assert(service.state().detail == "Verifying package");
 
     service.state().phase = PackageJobPhase::Repair;
+    service.state().repairing = true;
     service.state().pending_start = false;
-    service.state().complete_backend("PACKAGE_REPAIRED\tdemo\tremoved\n", 0, true);
+    service.state().complete_backend("PACKAGE_REPAIR_READY\tdemo\tdemo-package\t1\n", 0, true);
     controller.poll(210, 80);
     assert(service.state().phase == PackageJobPhase::Prepare);
     assert(service.state().pending_start);
-    assert(session.status.value() == "Package transaction repaired. Retrying...");
+    assert(session.status.value() == "Starting system package repair...");
     service.state().pending_start = false;
 
+    controller.finish(
+        "PACKAGE_REPAIRED\tdemo\tdemo-package\trolled back\n"
+        "PACKAGE_RESULT\trepair-rollback\tdemo\tdemo-package\t\n", 0);
+    assert(!session.catalog.apps()[0].installed);
+    assert(session.status.value() == "Package state repaired");
+    assert(session.screen == Screen::Detail && summaries == 1);
+    assert(!service.state().running);
+
+    service.state().begin("upgrade", "demo", "Demo", 225);
+    service.state().repairing = true;
+    controller.finish(
+        "PACKAGE_REPAIRED\tdemo\tdemo-package\trestored\n"
+        "PACKAGE_RESULT\trepair-restored\tdemo\tdemo-package\t1.1\n", 0);
+    assert(session.catalog.apps()[0].installed);
+    assert(session.catalog.apps()[0].installed_version == "1.1");
+    assert(session.status.value() == "Package state repaired");
+
+    service.state().begin("install", "demo", "Demo", 250);
     controller.finish("PACKAGE_RESULT\tINSTALLED\tdemo\tDemo\t2.1\n", 0);
     assert(session.catalog.apps()[0].installed);
     assert(session.catalog.apps()[0].installed_version == "2.1");
-    assert(session.status.value() == "Installed. Return to launcher to test.");
-    assert(session.screen == Screen::Detail && summaries == 1);
-    assert(!service.state().running);
+    assert(session.status.value() == "Installed. Exit Store to test.");
 
     service.state().begin("uninstall", "demo", "Demo", 300);
     controller.finish("PACKAGE_RESULT\tUNINSTALLED\tdemo\tDemo\t\n", 0);

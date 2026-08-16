@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 build_dir="${TMPDIR:-/tmp}/appstore-tests"
+ext_components_path="${CARDPUTERZERO_EXT_COMPONENTS_PATH:-$(dirname "$0")/../../../ext_components}"
 mkdir -p "$build_dir"
 "$(dirname "$0")/test_backend_boundaries.sh"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Werror \
@@ -204,7 +205,7 @@ ${CXX:-g++} -std=c++17 -Wall -Wextra -Werror -pthread \
 "$build_dir/test_appstore_view_model_factory"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Werror -pthread \
     -I"$(dirname "$0")/../main/interface" -I"$(dirname "$0")/../main/ui" \
-    -I"$(dirname "$0")/../../../ext_components/cp0_lvgl/include" \
+    -I"$ext_components_path/cp0_lvgl/include" \
     "$(dirname "$0")/test_appstore_input_controller.cpp" \
     "$(dirname "$0")/../main/ui/appstore_input_controller.cpp" \
     "$(dirname "$0")/../main/ui/catalog_controller.cpp" \
@@ -226,13 +227,13 @@ ${CXX:-g++} -std=c++17 -Wall -Wextra -Werror -pthread \
 "$build_dir/test_appstore_input_controller"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Werror \
     -I"$(dirname "$0")/../main/ui" \
-    -I"$(dirname "$0")/../../../ext_components/cp0_lvgl/include" \
+    -I"$ext_components_path/cp0_lvgl/include" \
     "$(dirname "$0")/test_system_status_state.cpp" \
     -o "$build_dir/test_system_status_state"
 "$build_dir/test_system_status_state"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Werror \
     -I"$(dirname "$0")/../main/ui" \
-    -I"$(dirname "$0")/../../../ext_components/cp0_lvgl/include" \
+    -I"$ext_components_path/cp0_lvgl/include" \
     "$(dirname "$0")/test_system_status_controller.cpp" \
     "$(dirname "$0")/../main/ui/system_status_controller.cpp" \
     -o "$build_dir/test_system_status_controller"
@@ -252,7 +253,13 @@ ${CXX:-g++} -std=c++17 -Wall -Wextra -Werror "$(dirname "$0")/test_job_shutdown_
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Werror "$(dirname "$0")/test_low_battery_flow.cpp" -o "$build_dir/test_low_battery_flow"
 "$build_dir/test_low_battery_flow"
 ${CXX:-g++} -std=c++17 -Wall -Wextra -Werror \
-    -I"$(dirname "$0")/../../../SDK/components/utilities/include" \
+    -isystem "$(dirname "$0")/../../../SDK/components/utilities/include" \
     "$(dirname "$0")/test_native_backend.cpp" -o "$build_dir/test_native_backend"
-"$build_dir/test_native_backend" "$(dirname "$0")/../dist/M5CardputerZero-AppStore"
-"$(dirname "$0")/test_native_backend.sh"
+native_binary="$(dirname "$0")/../dist/M5CardputerZero-AppStore"
+if file "$native_binary" | grep -q 'ELF' && [ "$(uname -s)" != "Linux" ]; then
+    echo "native backend runtime tests skipped: Linux target binary on $(uname -s)"
+else
+    "$build_dir/test_native_backend" "$native_binary"
+    "$(dirname "$0")/test_native_backend.sh"
+    "$(dirname "$0")/test_package_repair_helper.sh" "$native_binary"
+fi

@@ -200,6 +200,14 @@ StoreSettingsViewModel AppStoreViewModelFactory::settings(bool operation_running
     if (model.has_entry) model.entry = *session_.registry.selected_entry();
     model.operation_running = operation_running;
     model.region_commit_pending = session_.registry.region_commit_pending();
+    if (model.region_commit_pending) {
+        model.status = "Region update pending...";
+    } else if (model.operation_running) {
+        model.status = "Registry operation running...";
+    } else if (model.has_entry && !model.entry.error.empty()) {
+        model.status = single_line(model.entry.error);
+        model.status_is_error = true;
+    }
     return model;
 }
 

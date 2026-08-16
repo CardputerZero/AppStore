@@ -160,11 +160,12 @@ void modal_backdrop(lv_obj_t *root)
     lv_obj_set_style_blur_quality(obj, LV_BLUR_QUALITY_SPEED, 0);
 }
 
-void scrolling_status_label(lv_obj_t *root, const std::string &text, int x, int y, int w, int h)
+void scrolling_status_label(lv_obj_t *root, const std::string &text, int x, int y, int w, int h,
+                            uint32_t color = 0xCCCC33)
 {
-    lv_obj_t *obj = label(root, text, x, y, w, h, &lv_font_montserrat_10, 0xCCCC33,
+    lv_obj_t *obj = label(root, text, x, y, w, h, &lv_font_montserrat_10, color,
                           LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_style_anim_duration(obj, 40, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_anim_duration(obj, 4000, LV_PART_MAIN | LV_STATE_DEFAULT);
 }
 
 void radio_option(lv_obj_t *root, int x, int y, const std::string &text,
@@ -310,7 +311,7 @@ void CatalogDisplayPage::render(const PageRenderContext &context,
                            std::to_string(model.app_count), 249, 123, 58, 15,
                            &lv_font_montserrat_14, 0xFFFFFF);
     }
-    if (model.show_status) scrolling_status_label(root, model.status, 106, 132, 172, 8);
+    if (model.show_status) scrolling_status_label(root, model.status, 90, 139, 220, 12);
     draw_shortcuts();
 }
 
@@ -382,7 +383,7 @@ void CatalogDisplayPage::render_search(const PageRenderContext &context,
             item.selected ? 0xFFFFFF : 0x8B949E, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_align(version, LV_TEXT_ALIGN_RIGHT, 0);
     }
-    center_label(root, "F/X Select   BS Edit   Enter Open   Esc Back",
+    center_label(root, "Fn+F/X Move   BS Edit   Enter Open   Esc Back",
                  10, 153, 300, 12, &lv_font_montserrat_10, 0xCCCC33,
                  LV_LABEL_LONG_DOT);
 }
@@ -633,16 +634,10 @@ void StoreSettingsPage::render(const PageRenderContext &context,
         box(root, 24, 109, 272, 26, 0x111923, 0x2A3A46, 1, 2);
         label(root, entry.builtin ? model.registry_url : entry.url, 30, 112, 260, 20,
               &lv_font_montserrat_10, 0xE6EDF3, LV_LABEL_LONG_WRAP);
-        if (!entry.error.empty())
-            label(root, appstore::one_line(entry.error, 45), 24, 136, 272, 12,
-                  &lv_font_montserrat_10, 0xF85149, LV_LABEL_LONG_DOT);
     }
-    if (model.region_commit_pending)
-        label(root, "Region update pending...", 10, 138, 300, 12,
-              &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
-    else if (model.operation_running)
-        label(root, "Registry operation running...", 10, 138, 300, 12,
-              &lv_font_montserrat_10, 0xCCCC33, LV_LABEL_LONG_DOT);
+    if (!model.status.empty())
+        scrolling_status_label(root, model.status, 10, 138, 300, 12,
+                               model.status_is_error ? 0xF85149 : 0xCCCC33);
 }
 
 void StoreSettingsPage::render_editor(const PageRenderContext &context,

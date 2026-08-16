@@ -47,7 +47,6 @@ private:
         return static_cast<uint32_t>(now - start);
     }
 
-    AppStoreSessionState &session_;
     PackageJobState &package_job_;
     ExitController &exit_;
     Dependencies dependencies_;

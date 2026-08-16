@@ -11,9 +11,10 @@ AppStoreLifecycle::AppStoreLifecycle(AppStoreSessionState &session,
                                      PackageJobState &package_job,
                                      ExitController &exit,
                                      Dependencies dependencies)
-    : session_(session), package_job_(package_job), exit_(exit),
+    : package_job_(package_job), exit_(exit),
       dependencies_(std::move(dependencies))
 {
+    (void)session;
 }
 
 void AppStoreLifecycle::initialize(int argc, char **argv)

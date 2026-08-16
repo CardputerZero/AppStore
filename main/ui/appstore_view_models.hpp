@@ -124,6 +124,8 @@ struct StoreSettingsViewModel {
     int entry_count = 0;
     bool operation_running = false;
     bool region_commit_pending = false;
+    std::string status;
+    bool status_is_error = false;
 };
 
 struct RegistryEditorViewModel {

@@ -132,6 +132,14 @@ int main()
     input.handle({KEY_X, 0, 'x'}, 142);
     assert(session.search.input() == "firefx");
     assert(!session.search.results_active());
+    session.search.input() = "fire";
+    session.search.submit(session.catalog.apps());
+    assert(session.search.results_active() && session.search.selected_index() == 0);
+    input.handle({KEY_DOWN}, 143);
+    assert(session.search.selected_index() == 1);
+    assert(session.search.input() == "fire");
+    input.handle({KEY_UP}, 144);
+    assert(session.search.selected_index() == 0);
 
     session.screen = Screen::Confirm;
     session.confirmation.focus() = 0;

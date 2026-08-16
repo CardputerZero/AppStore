@@ -25,7 +25,8 @@ void SudoPackageRunner::complete(cp0_sudo_result_t result, int exit_code)
         job_.phase = PackageJobPhase::Finalize;
         job_.pending_start = true;
         job_.clear_backend_result(false);
-        job_.detail = "Finalizing package state";
+        job_.detail = job_.repairing ? "Finalizing package repair" :
+            "Finalizing package state";
         job_.start_tick = lv_tick_get();
         return;
     }
@@ -57,7 +58,8 @@ bool SudoPackageRunner::start(const std::string &backend_executable)
         return false;
     }
     job_.phase = PackageJobPhase::Sudo;
-    job_.detail = "Waiting for sudo authentication";
+    job_.detail = job_.repairing ? "Waiting to repair package manager" :
+        "Waiting for sudo authentication";
     return true;
 }
 

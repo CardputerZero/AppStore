@@ -15,10 +15,13 @@ scons -j8
 cross_package_enabled = False
 
 local_path = Path(os.getcwd())
-sdk_path = local_path.parent.parent / "SDK"
-version_file = local_path.parent.parent / "ext_components" / "cp0_lvgl" / "sdk_version.txt"
+workspace_root = local_path.parent.parent
+sdk_path = Path(os.environ.get("CARDPUTERZERO_SDK_PATH", workspace_root / "SDK")).resolve()
+ext_components_path = Path(os.environ.get(
+    "CARDPUTERZERO_EXT_COMPONENTS_PATH", workspace_root / "ext_components")).resolve()
+version_file = ext_components_path / "cp0_lvgl" / "sdk_version.txt"
 
-version = version_file.read_text(encoding="utf-8")
+version = version_file.read_text(encoding="utf-8").strip()
 static_lib_path = sdk_path / "github_source" / f"static_lib_{version}"
 
 if os.environ.get("CardputerZero", '') == 'y':
@@ -32,6 +35,8 @@ if os.environ.get("CONFIG_DEFAULT_FILE") == None:
 # generated configuration when callers switch between SDL and cross defaults.
 selected_config_path = Path(os.environ["CONFIG_DEFAULT_FILE"]).resolve()
 selected_config = str(selected_config_path) + "\n" + selected_config_path.read_text()
+if "cross" in os.environ.get("CONFIG_DEFAULT_FILE", ""):
+    selected_config += "\nstatic-lib=" + str(static_lib_path) + "\n"
 config_selection_path = Path("build") / "config" / "selected-defaults.txt"
 previous_config = config_selection_path.read_text() if config_selection_path.exists() else ""
 if previous_config != selected_config:
@@ -59,7 +64,7 @@ else:
         config_tmp_path.unlink()
 
 os.environ["SDK_PATH"] = str(sdk_path)
-os.environ["EXT_COMPONENTS_PATH"] = str(sdk_path.parent / "ext_components")
+os.environ["EXT_COMPONENTS_PATH"] = str(ext_components_path)
 
 env = SConscript(
     str(sdk_path / "tools" / "scons" / "project.py"),

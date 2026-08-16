@@ -48,6 +48,7 @@ public:
     std::vector<std::string> helper_execs;
     bool helper_reinstall = false;
     bool force_overwrite = false;
+    bool repairing = false;
     uint64_t sudo_request_id = 0;
     PackageJobPhase phase = PackageJobPhase::Idle;
     int progress = -1;

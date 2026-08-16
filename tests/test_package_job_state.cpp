@@ -37,8 +37,15 @@ int main()
     assert(std::find(forced_arguments.begin(), forced_arguments.end(),
                      "--package-force-overwrite") != forced_arguments.end());
 
+    state.repairing = true;
+    assert(state.parse_prepare_output(
+        "PACKAGE_JOB\trepair\tdemo-package\t0\t\ttx-repair\t/tmp/pending\n"));
+    const auto repair_arguments = state.sudo_arguments("appstore");
+    assert(repair_arguments[2] == "repair" && repair_arguments[4] == "demo-package");
+
     state.reset();
     assert(!state.running && !state.pending_start);
+    assert(!state.repairing);
     assert(state.phase == appstore_ui::PackageJobPhase::Idle);
     assert(state.result_snapshot().output.empty());
     return 0;

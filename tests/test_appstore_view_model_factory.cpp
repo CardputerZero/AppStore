@@ -119,6 +119,18 @@ int main()
         {"https://example.test/registry.json", "Example", "ok", "1", "now", "", "global", true, false});
     auto settings = factory.settings(false);
     assert(settings.has_entry && settings.entry.name == "Example");
+    session.registry.entries()[0].error = "Registry offline; using cached catalog";
+    settings = factory.settings(false);
+    assert(settings.status == "Registry offline; using cached catalog");
+    assert(settings.status_is_error);
+    assert(session.registry.schedule_region("CN", 100));
+    settings = factory.settings(false);
+    assert(settings.status == "Region update pending...");
+    assert(!settings.status_is_error);
+    assert(session.registry.take_due_region(2100, 2000, false));
+    settings = factory.settings(true);
+    assert(settings.status == "Registry operation running...");
+    assert(!settings.status_is_error);
 
     share_code.input() = "ABC123";
     auto share = factory.share_code();

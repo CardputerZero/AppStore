@@ -2,7 +2,7 @@
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-binary="$project_dir/dist/M5CardputerZero-AppStore"
+binary=${1:-"$project_dir/dist/M5CardputerZero-AppStore"}
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/appstore-native-test.XXXXXX")
 trap 'rm -rf -- "$test_root"' EXIT HUP INT TERM
 
@@ -84,6 +84,11 @@ sed -i 's/"helper_completed": false/"helper_completed": true/' "$test_root/state
 touch "$FAKE_PACKAGE_STATE"
 $binary --finalize-package install app-id "$tx" | grep -q '^PACKAGE_RESULT[[:space:]]install[[:space:]]app-id[[:space:]]demo-package[[:space:]]1.2.0'
 $binary --finalize-package install app-id "$tx" | grep -q '^PACKAGE_RESULT[[:space:]]install[[:space:]]app-id[[:space:]]demo-package[[:space:]]1.2.0'
-jq -e '."app-id".files == ["/usr/bin/demo-package"]' "$test_root/state/installed.json" >/dev/null
+python3 - "$test_root/state/installed.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    installed = json.load(source)
+assert installed["app-id"]["files"] == ["/usr/bin/demo-package"]
+PY
 
 echo 'native backend integration tests passed'

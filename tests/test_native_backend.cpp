@@ -1,4 +1,5 @@
 #include "json.hpp"
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <fcntl.h>
@@ -50,11 +51,14 @@ static void call_and_kill(std::initializer_list<std::string> args) {
 }
 static std::string tx(const Result &r) {
     std::istringstream lines(r.out); std::string line;
-    while (std::getline(lines, line)) if (line.rfind("PACKAGE_JOB\t", 0) == 0) {
-        std::istringstream row(line); std::string f; std::vector<std::string> fields;
-        while (std::getline(row, f, '\t')) fields.push_back(f);
-        return fields.size() > 5 ? fields[5] : "";
-    } return "";
+    while (std::getline(lines, line)) {
+        if (line.rfind("PACKAGE_JOB\t", 0) == 0) {
+            std::istringstream row(line); std::string f; std::vector<std::string> fields;
+            while (std::getline(row, f, '\t')) fields.push_back(f);
+            return fields.size() > 5 ? fields[5] : "";
+        }
+    }
+    return "";
 }
 static json app(const std::string &id, const std::string &review) {
     json result={{"uuid",id},{"share_code",id=="app-id"?"demo":"blocked"},{"title",id=="app-id"?"Demo":"Blocked"},
@@ -180,10 +184,11 @@ static void package_cases() {
     Result conflict=call({"--prepare-package","install","blocked"});
     CHECK(conflict.rc!=0&&has(conflict,"PENDING_CONFLICT\tapp-id\tinstall\tdemo-package"));
     repaired=call({"--repair-package-transaction","app-id"});
-    CHECK(repaired.rc==0&&has(repaired,"prepared for retry")&&fs::exists(pending));
+    CHECK(repaired.rc==0&&has(repaired,"PACKAGE_REPAIR_READY\tapp-id\tdemo-package")&&fs::exists(pending));
     CHECK(!load(pending).value("helper_completed",true));
     Result recovered_retry=call({"--prepare-package","install","demo"});
-    CHECK(recovered_retry.rc==0&&tx(recovered_retry)=="conflict");
+    CHECK(recovered_retry.rc==0&&tx(recovered_retry)=="conflict"&&
+          has(recovered_retry,"PACKAGE_JOB\trepair\tdemo-package"));
     fs::remove(pending); unsetenv("FAKE_VERSION"); setenv("FAKE_DPKG_MODE","absent",1);
     prep=call({"--prepare-package","install","demo"}); id=tx(prep);
     CHECK(prep.rc==0&&!id.empty()&&fs::exists(pending));

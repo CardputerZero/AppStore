@@ -5,6 +5,7 @@
 
 #include "cp0_lvgl_app.h"
 #include <hv/HttpClient.h>
+#include <hv/hssl.h>
 #include <hv/hasync.h>
 #include "json.hpp"
 
@@ -255,12 +256,23 @@ std::vector<const char *> argv_view(const std::vector<std::string> &storage)
     return out;
 }
 
-int run(const std::vector<std::string> &args)
+int bounded_seconds(const char *name, int fallback, int maximum = 1800)
+{
+    const char *value = std::getenv(name);
+    if (!value || !value[0]) return fallback;
+    char *end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (!end || *end != '\0' || parsed < 1) return fallback;
+    return static_cast<int>(std::min<long>(parsed, maximum));
+}
+
+int run_bounded(const std::vector<std::string> &args, int timeout_seconds)
 {
     if (args.empty()) return -1;
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
+        setpgid(0, 0);
 #ifdef __linux__
         const pid_t parent = getppid();
         prctl(PR_SET_PDEATHSIG, SIGTERM);
@@ -270,10 +282,30 @@ int run(const std::vector<std::string> &args)
         execvp(view[0], const_cast<char *const *>(view.data()));
         _exit(127);
     }
+    setpgid(pid, pid);
     int status = 0;
-    pid_t waited;
-    do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
-    if (waited != pid) return -1;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(std::max(1, timeout_seconds));
+    for (;;) {
+        const pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) break;
+        if (waited < 0 && errno != EINTR) return -1;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            kill(-pid, SIGTERM);
+            const auto kill_deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(2);
+            do {
+                const pid_t terminated = waitpid(pid, &status, WNOHANG);
+                if (terminated == pid) return 124;
+                if (terminated < 0 && errno != EINTR) return 124;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            } while (std::chrono::steady_clock::now() < kill_deadline);
+            kill(-pid, SIGKILL);
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            return 124;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return -1;
@@ -491,7 +523,11 @@ std::vector<bool> hv_download_batch(const std::vector<HttpDownload> &downloads,
         (std::getenv("HTTPS_PROXY") && std::getenv("HTTPS_PROXY")[0]) ||
         (std::getenv("http_proxy") && std::getenv("http_proxy")[0]) ||
         (std::getenv("https_proxy") && std::getenv("https_proxy")[0]);
-    if (proxy_configured) {
+    const bool https_without_ssl = !HV_WITH_SSL && std::any_of(
+        downloads.begin(), downloads.end(), [](const HttpDownload &download) {
+            return download.url.rfind("https://", 0) == 0;
+        });
+    if (proxy_configured || https_without_ssl) {
         hv::async::startup(2, 6);
         std::vector<std::future<bool>> futures;
         futures.reserve(downloads.size());
@@ -951,7 +987,10 @@ PackageState package_state(const std::string &package)
     std::string version = tab == std::string::npos ? "" : output.substr(tab + 1);
     while (!status.empty() && std::isspace(static_cast<unsigned char>(status.back()))) status.pop_back();
     while (!version.empty() && std::isspace(static_cast<unsigned char>(version.back()))) version.pop_back();
-    const bool installed = status.size() >= 2 && status[1] == 'i';
+    // A third status character denotes a dpkg error such as Reinst-required.
+    // Do not treat that state as a healthy installed package merely because the
+    // current-state character is `i`.
+    const bool installed = status.size() >= 2 && status[1] == 'i' && status.size() < 3;
     const bool absent = (status.size() == 2 || status.size() == 3) &&
         std::string("uihpr").find(status[0]) != std::string::npos && (status[1] == 'n' || status[1] == 'c');
     return {installed, version, installed || absent};
@@ -1152,6 +1191,11 @@ void emit_pending_package_job(std::ostringstream &out, const json &pending)
     const std::string action = pending.value("action", "");
     const std::string package = pending.value("package", "");
     const std::string tx = pending.value("transaction_id", "");
+    if (pending.value("repair_requested", false)) {
+        emit(out, "PACKAGE_JOB", "repair", package, "0", "", tx,
+             pending_path().string());
+        return;
+    }
     if (action == "uninstall") {
         emit(out, "PACKAGE_JOB", "uninstall", package, "0", "", tx, pending_path().string());
         return;
@@ -1183,10 +1227,9 @@ std::string deb_field(const fs::path &path, const std::string &name)
     return result.second;
 }
 
-void lock_transaction(int &fd)
+void lock_transaction_at(int &fd, const fs::path &lock)
 {
-    ensure_dirs();
-    fs::path lock = state_dir() / "package-transaction.lock";
+    fs::create_directories(lock.parent_path());
     fd = ::open(lock.c_str(), O_CREAT | O_RDWR, 0644);
     if (fd < 0) throw std::runtime_error("unable to open package transaction lock");
     const int timeout_seconds = std::max(1, std::atoi(env_or("M5APPSTORE_LOCK_TIMEOUT", "30").c_str()));
@@ -1202,6 +1245,12 @@ void lock_transaction(int &fd)
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+}
+
+void lock_transaction(int &fd)
+{
+    ensure_dirs();
+    lock_transaction_at(fd, state_dir() / "package-transaction.lock");
 }
 
 void unlock_transaction(int fd) { if (fd >= 0) { flock(fd, LOCK_UN); close(fd); } }
@@ -1241,27 +1290,38 @@ std::string repair_package_transaction(const std::string &id, int &rc)
         json pending = read_json(pending_path());
         if (!pending.is_object() || pending.empty()) {
             emit(out, "PACKAGE_REPAIRED", id, "No pending transaction remained");
+            emit(out, "PACKAGE_RESULT", "repair", id, "", "");
             rc = 0;
         } else if (pending.value("app_id", "") != id) {
             throw std::runtime_error("pending package transaction belongs to another app");
         } else if (package_state_unchanged(
-                       pending, package_state(pending.value("package", "")))) {
+                       pending, package_state(pending.value("package", ""))) &&
+                   !pending.value("repair_scripts_quarantined", false)) {
             std::error_code error;
             if (!fs::remove(pending_path(), error) && error)
                 throw std::runtime_error("unable to remove the invalid package transaction: " +
                                          error.message());
             emit(out, "PACKAGE_REPAIRED", id, "Invalid pending transaction removed");
+            emit(out, "PACKAGE_RESULT", "repair", id,
+                 pending.value("package", ""), "");
             rc = 0;
         } else {
             pending["helper_completed"] = false;
             pending["helper_started"] = false;
-            pending["recovery_reason"] = "Retrying interrupted package operation";
+            pending["repair_requested"] = true;
+            pending["repair_requested_at"] = now_text();
+            pending["repair_attempts"] = pending.value("repair_attempts", 0) + 1;
+            pending["recovery_reason"] = "Repairing interrupted Debian package state";
             pending.erase("helper_failed");
             pending.erase("helper_exit_code");
             pending.erase("helper_failed_at");
+            pending.erase("repair_completed");
+            pending.erase("repair_completed_at");
+            pending.erase("repair_outcome");
+            pending.erase("repair_detail");
             write_json(pending_path(), pending);
-            emit(out, "PACKAGE_REPAIRED", id,
-                 "Interrupted transaction prepared for retry");
+            emit(out, "PACKAGE_REPAIR_READY", id,
+                 pending.value("package", ""), pending.value("repair_attempts", 1));
             rc = 0;
         }
     } catch (const std::exception &error) {
@@ -1279,9 +1339,16 @@ std::string prepare_package(const std::string &action, const std::string &id, in
     try {
         lock_transaction(fd);
         g_package_cancel = false;
+        json pending = read_json(pending_path());
+        if (pending.is_object() && pending.value("repair_requested", false) &&
+            pending.value("app_id", "") == id && pending.value("action", "") == action) {
+            emit_pending_package_job(out, pending);
+            rc = 0;
+            unlock_transaction(fd);
+            return out.str();
+        }
         json app = find_app(id);
         if (!app.is_object()) throw std::runtime_error("app not found: " + id);
-        json pending = read_json(pending_path());
         if (pending.is_object() && !pending.empty()) {
             const bool same_operation = pending.value("app_id", "") == app_key(app) &&
                 pending.value("action", "") == action;
@@ -1347,6 +1414,20 @@ std::string prepare_package(const std::string &action, const std::string &id, in
                    {"helper_completed", false}, {"previously_installed", previous_state.installed},
                    {"previous_version", previous_state.version}, {"expected_version", app.value("version", "")},
                    {"app_snapshot", app}};
+        if (previous_state.installed) {
+            const json records = installed_records();
+            const json record = records.value(app_key(app), json::object());
+            const fs::path rollback_deb = record.value("deb_path", "");
+            if (!rollback_deb.empty() && fs::is_regular_file(rollback_deb)) {
+                try {
+                    if (deb_field(rollback_deb, "Package") == package &&
+                        deb_field(rollback_deb, "Version") == previous_state.version)
+                        pending["rollback_deb_path"] = rollback_deb.string();
+                } catch (...) {
+                    // A stale cached package must not prevent a new transaction.
+                }
+            }
+        }
         if (action == "uninstall") {
             write_json(pending_path(), pending);
             emit_pending_package_job(out, pending);
@@ -1406,6 +1487,247 @@ void rewrite_desktop(const fs::path &path, const std::vector<std::string> &candi
     for (const auto &item : lines) output << item << '\n';
 }
 
+bool valid_debian_package_name(const std::string &package)
+{
+    if (package.empty() || package.size() > 255 ||
+        !std::isalnum(static_cast<unsigned char>(package.front()))) return false;
+    return std::all_of(package.begin(), package.end(), [](unsigned char ch) {
+        return std::islower(ch) || std::isdigit(ch) || ch == '+' || ch == '-' || ch == '.';
+    });
+}
+
+bool package_reached_original_target(const json &pending, const PackageState &state)
+{
+    if (!state.known) return false;
+    if (pending.value("action", "") == "uninstall") return !state.installed;
+    const std::string expected = pending.value("expected_package_version", "");
+    return state.installed && !expected.empty() && state.version == expected;
+}
+
+fs::path repair_backup_dir(const json &pending)
+{
+    const fs::path root = expand_home(env_or(
+        "M5APPSTORE_REPAIR_BACKUP_DIR", "/var/backups/cardputerzero-appstore"));
+    return root / sha1_text(pending.value("transaction_id", "invalid-transaction"));
+}
+
+fs::path dpkg_info_dir()
+{
+    return expand_home(env_or("M5APPSTORE_DPKG_INFO_DIR", "/var/lib/dpkg/info"));
+}
+
+bool maintainer_script_name(const std::string &filename, const std::string &package)
+{
+    const size_t dot = filename.rfind('.');
+    if (dot == std::string::npos) return false;
+    const std::string owner = filename.substr(0, dot);
+    if (owner != package && owner.rfind(package + ":", 0) != 0) return false;
+    static const std::set<std::string> scripts = {
+        "preinst", "postinst", "prerm", "postrm", "config"
+    };
+    return scripts.count(filename.substr(dot + 1)) != 0;
+}
+
+void quarantine_maintainer_scripts(json &pending, const fs::path &pending_file)
+{
+    const std::string package = pending.value("package", "");
+    if (!valid_debian_package_name(package))
+        throw std::runtime_error("invalid Debian package name in repair transaction");
+    const fs::path info = dpkg_info_dir();
+    const fs::path backup = repair_backup_dir(pending);
+    fs::create_directories(backup);
+    ::chmod(backup.c_str(), 0700);
+    pending["repair_scripts_quarantined"] = true;
+    pending["repair_script_backup"] = backup.string();
+    pending["repair_quarantined_files"] = json::array();
+    write_json(pending_file, pending);
+    std::error_code error;
+    if (!fs::is_directory(info, error))
+        throw std::runtime_error("Debian maintainer-script directory is unavailable");
+    for (const auto &entry : fs::directory_iterator(info)) {
+        const std::string filename = entry.path().filename().string();
+        if (!maintainer_script_name(filename, package)) continue;
+        const fs::path destination = backup / filename;
+        if (!fs::exists(destination)) fs::rename(entry.path(), destination);
+        pending["repair_quarantined_files"].push_back(filename);
+        write_json(pending_file, pending);
+    }
+}
+
+void restore_quarantined_scripts(json &pending, const fs::path &pending_file)
+{
+    const fs::path backup = repair_backup_dir(pending);
+    const fs::path info = dpkg_info_dir();
+    std::error_code error;
+    if (fs::is_directory(backup, error)) {
+        for (const auto &entry : fs::directory_iterator(backup)) {
+            const fs::path destination = info / entry.path().filename();
+            if (!fs::exists(destination)) fs::rename(entry.path(), destination);
+        }
+        fs::remove(backup, error);
+    }
+    pending["repair_scripts_quarantined"] = false;
+    pending.erase("repair_script_backup");
+    pending.erase("repair_quarantined_files");
+    write_json(pending_file, pending);
+}
+
+void discard_quarantined_scripts(json &pending)
+{
+    std::error_code ignored;
+    fs::remove_all(repair_backup_dir(pending), ignored);
+    pending["repair_scripts_quarantined"] = false;
+    pending.erase("repair_script_backup");
+    pending.erase("repair_quarantined_files");
+}
+
+void settle_package_triggers(json &pending)
+{
+    std::printf("PROGRESS\trepair-triggers\t0\t0\t-1\tFinishing package triggers\n");
+    std::fflush(stdout);
+    const int result = run_bounded(
+        {"dpkg", "--triggers-only", "--pending"},
+        bounded_seconds("M5APPSTORE_REPAIR_TRIGGER_TIMEOUT", 60, 300));
+    pending["repair_trigger_exit_code"] = result;
+    if (result != 0)
+        pending["repair_warning"] = "Package triggers remain pending";
+    else
+        pending.erase("repair_warning");
+}
+
+int finish_repair(json &pending, const fs::path &pending_file,
+                  const std::string &outcome, const std::string &detail)
+{
+    settle_package_triggers(pending);
+    pending["repair_completed"] = true;
+    pending["repair_completed_at"] = now_text();
+    pending["repair_outcome"] = outcome;
+    pending["repair_detail"] = detail;
+    pending["helper_completed"] = true;
+    pending["helper_completed_at"] = now_text();
+    pending.erase("repair_failed");
+    pending.erase("repair_failed_at");
+    write_json(pending_file, pending);
+    std::printf("PACKAGE_HELPER\trepair\t%s\n", pending.value("package", "").c_str());
+    return 0;
+}
+
+int repair_package_state(json &pending, const fs::path &pending_file)
+{
+    const std::string package = pending.value("package", "");
+    if (!valid_debian_package_name(package))
+        throw std::runtime_error("invalid Debian package name in repair transaction");
+
+    PackageState state = package_state(package);
+    if (package_reached_original_target(pending, state)) {
+        discard_quarantined_scripts(pending);
+        return finish_repair(pending, pending_file, "completed",
+                             "Interrupted package operation had already completed");
+    }
+
+    const bool install_like = pending.value("action", "") != "uninstall";
+    const std::string previous_version = pending.value("previous_version", "");
+    if (install_like && pending.value("previously_installed", false) && state.known &&
+        state.installed && !previous_version.empty() && state.version == previous_version) {
+        // A reboot can happen after dpkg restored the old version but before the
+        // transaction JSON was checkpointed.  Recognize that rollback instead
+        // of attempting to remove a known-good package on the next run.
+        discard_quarantined_scripts(pending);
+        return finish_repair(pending, pending_file, "restored",
+                             "Previous package version was already restored");
+    }
+    if (install_like && state.known && !state.installed) {
+        discard_quarantined_scripts(pending);
+        return finish_repair(pending, pending_file, "rolled_back",
+                             "Broken package was already absent; transaction rolled back");
+    }
+    if (install_like && !pending.value("repair_scripts_quarantined", false)) {
+        std::printf("PROGRESS\trepair-configure\t0\t0\t-1\tConfiguring interrupted package\n");
+        std::fflush(stdout);
+        const int configure_result = run_bounded(
+            {"dpkg", "--configure", package},
+            bounded_seconds("M5APPSTORE_REPAIR_CONFIGURE_TIMEOUT", 120, 600));
+        pending["repair_configure_exit_code"] = configure_result;
+        write_json(pending_file, pending);
+        state = package_state(package);
+        if (package_reached_original_target(pending, state)) {
+            discard_quarantined_scripts(pending);
+            return finish_repair(pending, pending_file, "completed",
+                                 "Interrupted package was configured successfully");
+        }
+    }
+
+    if (install_like && pending.value("previously_installed", false) &&
+        !pending.value("repair_scripts_quarantined", false)) {
+        const fs::path rollback_deb = pending.value("rollback_deb_path", "");
+        bool rollback_valid = !rollback_deb.empty() && fs::is_regular_file(rollback_deb);
+        if (rollback_valid) {
+            try {
+                rollback_valid = deb_field(rollback_deb, "Package") == package &&
+                    !previous_version.empty() &&
+                    deb_field(rollback_deb, "Version") == previous_version;
+            } catch (...) {
+                rollback_valid = false;
+            }
+        }
+        if (rollback_valid) {
+            std::printf("PROGRESS\trepair-restore\t0\t0\t-1\tRestoring previous package version\n");
+            std::fflush(stdout);
+            const int restore_result = run_bounded(
+                {"dpkg", "--install", rollback_deb.string()},
+                bounded_seconds("M5APPSTORE_REPAIR_RESTORE_TIMEOUT", 120, 600));
+            pending["repair_restore_exit_code"] = restore_result;
+            write_json(pending_file, pending);
+            state = package_state(package);
+            if (state.known && state.installed && state.version == previous_version) {
+                discard_quarantined_scripts(pending);
+                return finish_repair(pending, pending_file, "restored",
+                                     "Previous package version was restored");
+            }
+        }
+    }
+
+    std::printf("PROGRESS\trepair-rollback\t0\t0\t-1\tRolling back broken package\n");
+    std::fflush(stdout);
+    int remove_result = run_bounded(
+        {"dpkg", "--force-remove-reinstreq", "--remove", package},
+        bounded_seconds("M5APPSTORE_REPAIR_REMOVE_TIMEOUT", 60, 300));
+    pending["repair_remove_exit_code"] = remove_result;
+    write_json(pending_file, pending);
+    state = package_state(package);
+    if (state.known && !state.installed) {
+        discard_quarantined_scripts(pending);
+        return finish_repair(pending, pending_file,
+                             pending.value("action", "") == "uninstall" ? "completed" : "rolled_back",
+                             "Broken package was removed and the transaction was rolled back");
+    }
+
+    std::printf("PROGRESS\trepair-force-remove\t0\t0\t-1\tIsolating broken package scripts\n");
+    std::fflush(stdout);
+    quarantine_maintainer_scripts(pending, pending_file);
+    remove_result = run_bounded(
+        {"dpkg", "--force-all", "--remove", package},
+        bounded_seconds("M5APPSTORE_REPAIR_FORCE_TIMEOUT", 60, 300));
+    pending["repair_force_remove_exit_code"] = remove_result;
+    write_json(pending_file, pending);
+    state = package_state(package);
+    if (state.known && !state.installed) {
+        discard_quarantined_scripts(pending);
+        return finish_repair(pending, pending_file,
+                             pending.value("action", "") == "uninstall" ? "completed" : "rolled_back",
+                             "Broken maintainer scripts were isolated and the package was removed");
+    }
+
+    restore_quarantined_scripts(pending, pending_file);
+    pending["repair_failed"] = true;
+    pending["repair_failed_at"] = now_text();
+    pending["repair_detail"] = "Unable to configure or remove the affected package";
+    write_json(pending_file, pending);
+    std::fprintf(stderr, "REPAIR_FAILED\t%s\tUnable to configure or remove package\n",
+                 package.c_str());
+    return remove_result == 0 ? 1 : remove_result;
+}
+
 int package_helper(const std::string &action, const std::string &value, bool reinstall,
                    bool force_overwrite,
                    const std::string &desktop, const std::vector<std::string> &execs,
@@ -1413,23 +1735,46 @@ int package_helper(const std::string &action, const std::string &value, bool rei
 {
     int fd = -1;
     fs::path path = pending_file.empty() ? pending_path() : fs::path(pending_file);
+    bool transaction_validated = false;
+    bool repairing = false;
     try {
         if (geteuid() != 0) throw std::runtime_error("package helper requires root");
         if (fs::weakly_canonical(path) != fs::weakly_canonical(privileged_pending_path()))
             throw std::runtime_error("package pending path is not the Store transaction file");
-        lock_transaction(fd);
+        // The privileged helper may have HOME=/root.  Lock beside the validated
+        // pending file so it serializes with the unprivileged Store process.
+        lock_transaction_at(fd, path.parent_path() / "package-transaction.lock");
         json pending = read_json(path);
         if (!pending.is_object() || pending.value("transaction_id", "") != transaction)
             throw std::runtime_error("package transaction does not match helper request");
+        transaction_validated = true;
+        repairing = pending.value("repair_requested", false);
         const std::string pending_action = pending.value("action", "");
-        const std::string expected_helper_action = pending_action == "uninstall" ? "uninstall" : "install";
-        const std::string expected_value = pending_action == "uninstall"
-            ? pending.value("package", "") : pending.value("deb_path", "");
+        const std::string expected_helper_action = repairing ? "repair" :
+            (pending_action == "uninstall" ? "uninstall" : "install");
+        const std::string expected_value = repairing ? pending.value("package", "") :
+            (pending_action == "uninstall" ? pending.value("package", "") :
+                                              pending.value("deb_path", ""));
+        const bool expected_reinstall = !repairing && pending_action == "reinstall";
         if (action != expected_helper_action || value != expected_value ||
-            reinstall != (pending_action == "reinstall"))
+            reinstall != expected_reinstall)
             throw std::runtime_error("package helper arguments do not match the pending transaction");
         if (pending.value("helper_completed", false))
             throw std::runtime_error("package helper transaction is already complete");
+        pending["helper_started"] = true;
+        pending["helper_started_at"] = now_text();
+        pending.erase("helper_failed");
+        pending.erase("helper_exit_code");
+        pending.erase("helper_failed_at");
+        write_json(path, pending);
+        if (repairing) {
+            const int result = repair_package_state(pending, path);
+            if (result != 0)
+                throw std::runtime_error("package repair failed with exit code " +
+                                         std::to_string(result));
+            unlock_transaction(fd);
+            return 0;
+        }
         std::vector<std::string> command;
         if (action == "install") {
             std::printf("PROGRESS\tverify\t0\t0\t-1\tVerifying package\n");
@@ -1470,25 +1815,16 @@ int package_helper(const std::string &action, const std::string &value, bool rei
             }
         } else if (action == "uninstall") command = {"dpkg", "--remove", value};
         else throw std::runtime_error("unsupported package helper action");
-        pending["helper_started"] = true;
-        pending["helper_started_at"] = now_text();
-        pending.erase("helper_failed");
-        pending.erase("helper_exit_code");
-        pending.erase("helper_failed_at");
-        write_json(path, pending);
         std::printf("PROGRESS\tpackage-manager\t0\t0\t-1\t%s package\n",
                     action == "install" ? "Installing" : "Removing");
         std::fflush(stdout);
-        int result = run(command);
+        int result = run_bounded(
+            command, bounded_seconds("M5APPSTORE_PACKAGE_TIMEOUT", 600));
         if (result != 0) {
             pending["helper_failed"] = true;
             pending["helper_exit_code"] = result;
             pending["helper_failed_at"] = now_text();
             write_json(path, pending);
-            if (package_state_unchanged(pending, package_state(pending.value("package", "")))) {
-                fs::remove(path);
-                std::fprintf(stderr, "WARNING\tfailed package command left installed package state unchanged\n");
-            }
             throw std::runtime_error("package manager failed with exit code " + std::to_string(result));
         }
         const PackageState resulting_state = package_state(pending.value("package", ""));
@@ -1506,6 +1842,40 @@ int package_helper(const std::string &action, const std::string &value, bool rei
         unlock_transaction(fd);
         return 0;
     } catch (const std::exception &error) {
+        if (transaction_validated) {
+            try {
+                json failed = read_json(path);
+                if (failed.is_object() &&
+                    failed.value("transaction_id", "") == transaction &&
+                    !failed.value("helper_completed", false)) {
+                    const PackageState state = package_state(failed.value("package", ""));
+                    if (package_state_unchanged(failed, state) &&
+                        !failed.value("repair_scripts_quarantined", false)) {
+                        fs::remove(path);
+                        std::fprintf(stderr,
+                                     "WARNING\tfailed package command left package state unchanged\n");
+                    } else {
+                        failed["helper_failed"] = true;
+                        failed["helper_failed_at"] = now_text();
+                        if (repairing) {
+                            failed["repair_failed"] = true;
+                            failed["repair_failed_at"] = now_text();
+                        }
+                        write_json(path, failed);
+                        std::fprintf(stderr, "REPAIR_REQUIRED\t%s\t%s\t%s\n",
+                                     failed.value("app_id", "").c_str(),
+                                     failed.value("action", "").c_str(),
+                                     failed.value("package", "").c_str());
+                        if (repairing)
+                            std::fprintf(stderr, "REPAIR_FAILED\t%s\tRecovery remains available\n",
+                                         failed.value("package", "").c_str());
+                    }
+                }
+            } catch (...) {
+                std::fprintf(stderr, "REPAIR_FAILED\t%s\tUnable to persist recovery state\n",
+                             value.c_str());
+            }
+        }
         std::fprintf(stderr, "ERROR\t%s\n", error.what());
         unlock_transaction(fd);
         return 1;
@@ -1517,7 +1887,11 @@ void record_completed(const json &pending, const std::string &version)
     json completed = read_json(completed_path());
     if (!completed.is_object()) completed = json::object();
     std::string tx = pending.value("transaction_id", "");
+    const std::string repair_outcome = pending.value("repair_outcome", "");
+    const std::string result_action = repair_outcome == "rolled_back" ? "repair-rollback" :
+        (repair_outcome == "restored" ? "repair-restored" : pending.value("action", ""));
     completed[tx] = {{"transaction_id", tx}, {"action", pending.value("action", "")},
+                     {"result_action", result_action},
                      {"app_id", pending.value("app_id", "")}, {"package", pending.value("package", "")},
                      {"version", version}, {"completed_at", now_text()}};
     while (completed.size() > 32) {
@@ -1540,7 +1914,9 @@ std::string finalize_package(const std::string &action, const std::string &id, c
             json completed = read_json(completed_path());
             if (completed.is_object() && completed.contains(tx)) {
                 const json &item = completed[tx];
-                emit(out, "PACKAGE_RESULT", action, item.value("app_id", id), item.value("package", ""), item.value("version", ""));
+                emit(out, "PACKAGE_RESULT", item.value("result_action", action),
+                     item.value("app_id", id), item.value("package", ""),
+                     item.value("version", ""));
                 rc = 0; unlock_transaction(fd); return out.str();
             }
             throw std::runtime_error("no pending package transaction");
@@ -1553,13 +1929,40 @@ std::string finalize_package(const std::string &action, const std::string &id, c
         json app = pending.value("app_snapshot", json::object());
         std::string key = app_key(app);
         json records = installed_records();
-        if (action == "uninstall") {
+        const bool repaired = pending.value("repair_requested", false);
+        const std::string repair_outcome = pending.value("repair_outcome", "");
+        if (repaired && repair_outcome == "restored") {
+            const std::string previous_version = pending.value("previous_version", "");
+            if (!state.known || !state.installed || state.version != previous_version)
+                throw std::runtime_error("previous package version was not restored: " + package);
+            record_completed(pending, state.version);
+            fs::remove(pending_path());
+            emit(out, "PROGRESS", "repair", 1, 1, 100, "Previous version restored");
+            emit(out, "PACKAGE_REPAIRED", id, package,
+                 pending.value("repair_detail", "Previous package version restored"));
+            emit(out, "PACKAGE_RESULT", "repair-restored", key, package, state.version);
+        } else if (repaired && repair_outcome == "rolled_back") {
+            if (!state.known || state.installed)
+                throw std::runtime_error("broken package is still installed after repair: " + package);
+            records.erase(key);
+            records.erase(id);
+            write_json(installed_path(), records);
+            record_completed(pending, "");
+            fs::remove(pending_path());
+            emit(out, "PROGRESS", "repair", 1, 1, 100, "Package state repaired");
+            emit(out, "PACKAGE_REPAIRED", id, package,
+                 pending.value("repair_detail", "Broken package removed"));
+            emit(out, "PACKAGE_RESULT", "repair-rollback", key, package, "");
+        } else if (action == "uninstall") {
             if (!state.known || state.installed) throw std::runtime_error("package is still installed after uninstall: " + package);
             records.erase(key); records.erase(id);
             write_json(installed_path(), records);
             record_completed(pending, "");
             fs::remove(pending_path());
             emit(out, "PROGRESS", "uninstall", 1, 1, 100, "Remove complete");
+            if (repaired)
+                emit(out, "PACKAGE_REPAIRED", id, package,
+                     pending.value("repair_detail", "Interrupted uninstall completed"));
             emit(out, "UNINSTALLED", id);
             emit(out, "PACKAGE_RESULT", action, key, package, "");
         } else {
@@ -1575,6 +1978,9 @@ std::string finalize_package(const std::string &action, const std::string &id, c
             fs::remove(pending_path());
             emit(out, "PROGRESS", action == "upgrade" ? "upgrade" : "install", 1, 1, 100,
                  action == "upgrade" ? "Upgrade complete" : "Install complete");
+            if (repaired)
+                emit(out, "PACKAGE_REPAIRED", id, package,
+                     pending.value("repair_detail", "Interrupted package configured"));
             emit(out, action == "upgrade" ? "UPGRADED" : "INSTALLED", key, localized(app, "title"));
             emit(out, "PACKAGE_RESULT", action, key, package, state.version);
         }
@@ -1625,7 +2031,14 @@ void reconcile_pending()
         const bool applied = terminal &&
             (action == "uninstall" ? pending.value("previously_installed", false)
                                    : changed_from_previous);
-        if (pending.value("helper_completed", false)) {
+        const std::string repair_outcome = pending.value("repair_outcome", "");
+        const bool repaired_terminal = pending.value("repair_completed", false) &&
+            ((repair_outcome == "rolled_back" && state.known && !state.installed) ||
+             (repair_outcome == "restored" && state.known && state.installed &&
+              state.version == pending.value("previous_version", "")));
+        if (repaired_terminal) {
+            finalize = true;
+        } else if (pending.value("helper_completed", false)) {
             if (terminal) {
                 finalize = true;
             } else if (state.known) {
@@ -1658,13 +2071,16 @@ std::string legacy_package(const std::string &action, const std::string &id, int
     std::string prepared = prepare_package(action, id, rc);
     if (rc != 0) return prepared;
     json pending = read_json(pending_path());
-    std::string helper_action = action == "uninstall" ? "uninstall" : "install";
-    std::string value = action == "uninstall" ? pending.value("package", "") : pending.value("deb_path", "");
+    const bool repairing = pending.value("repair_requested", false);
+    std::string helper_action = repairing ? "repair" :
+        (action == "uninstall" ? "uninstall" : "install");
+    std::string value = repairing ? pending.value("package", "") :
+        (action == "uninstall" ? pending.value("package", "") : pending.value("deb_path", ""));
     json app = pending.value("app_snapshot", json::object());
     std::string package = pending.value("package", "");
     std::vector<std::string> candidates = {"/usr/lib/" + package + "/" + package + "_zero_device",
                                            "/usr/bin/" + package, "/usr/lib/" + package + "/" + package};
-    if (package_helper(helper_action, value, action == "reinstall", false,
+    if (package_helper(helper_action, value, !repairing && action == "reinstall", false,
                        action == "uninstall" ? "" : desktop_path(app),
                        candidates, pending.value("transaction_id", ""), pending_path().string()) != 0) {
         rc = 1;
