@@ -116,3 +116,24 @@ download:
 On the AppStore home screen, press `C` to open the share code input page. Type
 the code from CardputerZero Hub, then press `Enter` to jump to that app's detail
 page. From there, use the normal install/reinstall flow.
+
+## Fonts
+
+The UI uses DejaVu Sans as its primary western font. Its glyph fallback is
+Noto Sans CJK, which covers Chinese, Japanese, and Korean text while DejaVu
+continues to render Latin, Greek, Cyrillic, and other western scripts. The
+corresponding serif pair is also initialized for consumers that request it:
+DejaVu Serif with Noto Serif CJK.
+
+The default device paths are:
+
+```text
+/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf
+/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
+/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc
+```
+
+Override paths when running on a system with a different font layout using
+`M5APPSTORE_LATIN_SANS_FONT`, `M5APPSTORE_LATIN_SERIF_FONT`,
+`M5APPSTORE_CJK_SANS_FONT`, and `M5APPSTORE_CJK_SERIF_FONT`.

@@ -1,5 +1,7 @@
 #include "appstore_shortcut_bar.hpp"
 
+#include "appstore_fonts.hpp"
+
 namespace appstore_ui {
 namespace {
 
@@ -10,7 +12,7 @@ void centered_strong_label(lv_obj_t *root, const std::string &text, int x, int y
         lv_obj_t *label = lv_label_create(root);
         lv_obj_set_pos(label, x + offset, y);
         lv_obj_set_size(label, w, h);
-        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_font(label, font_for_text(text, &lv_font_montserrat_12), 0);
         lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
         lv_obj_set_style_text_letter_space(label, 0, 0);
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);

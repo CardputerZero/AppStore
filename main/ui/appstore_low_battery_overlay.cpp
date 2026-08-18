@@ -1,5 +1,7 @@
 #include "appstore_low_battery_overlay.hpp"
 
+#include "appstore_fonts.hpp"
+
 #include <string>
 
 namespace appstore_ui {
@@ -11,7 +13,7 @@ lv_obj_t *label(lv_obj_t *parent, const char *text, int x, int y, int w, int h,
     lv_obj_t *object = lv_label_create(parent);
     lv_obj_set_pos(object, x, y);
     lv_obj_set_size(object, w, h);
-    lv_obj_set_style_text_font(object, font, 0);
+    lv_obj_set_style_text_font(object, font_for_text(text, font), 0);
     lv_obj_set_style_text_color(object, lv_color_hex(color), 0);
     lv_obj_set_style_text_letter_space(object, 0, 0);
     lv_obj_set_style_text_align(object, centered ? LV_TEXT_ALIGN_CENTER : LV_TEXT_ALIGN_LEFT, 0);

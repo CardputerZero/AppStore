@@ -62,12 +62,6 @@ def stage_appstore_static_files():
             os.path.join(APPLAUNCH_STATIC_ROOT, "share", "images", image),
             os.path.join(dst_images, image),
         )
-    dst_fonts = os.path.join(STAGED_APPLAUNCH, "share", "font")
-    os.makedirs(dst_fonts, exist_ok=True)
-    shutil.copy2(
-        os.path.join(APPLAUNCH_STATIC_ROOT, "share", "font", "AlibabaPuHuiTi-3-55-Regular.ttf"),
-        os.path.join(dst_fonts, "AlibabaPuHuiTi-3-55-Regular.ttf"),
-    )
 
 
 stage_appstore_static_files()

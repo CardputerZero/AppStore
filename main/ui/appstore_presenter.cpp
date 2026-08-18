@@ -21,7 +21,7 @@ lv_obj_t *label(lv_obj_t *parent, const std::string &text, int x, int y, int w, 
     lv_obj_t *obj = lv_label_create(parent);
     lv_obj_set_pos(obj, x, y);
     lv_obj_set_size(obj, w, h);
-    lv_obj_set_style_text_font(obj, font, 0);
+    lv_obj_set_style_text_font(obj, font_for_text(text, font), 0);
     lv_obj_set_style_text_color(obj, lv_color_hex(color), 0);
     lv_obj_set_style_text_letter_space(obj, 0, 0);
     lv_label_set_long_mode(obj, mode);

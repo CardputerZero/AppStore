@@ -135,7 +135,7 @@ protected:
         label_ = lv_label_create(obj);
         lv_label_set_text(label_, "SYNC");
         lv_obj_set_size(label_, LV_PCT(100), LV_PCT(100));
-        lv_obj_set_style_text_font(label_, &lv_font_montserrat_10,
+        lv_obj_set_style_text_font(label_, font_for_text("SYNC", &lv_font_montserrat_10),
                                    LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_style_text_color(label_, lv_color_hex(0x33CC33),
                                     LV_PART_MAIN | LV_STATE_DEFAULT);
