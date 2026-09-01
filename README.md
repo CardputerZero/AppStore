@@ -128,10 +128,10 @@ DejaVu Serif with Noto Serif CJK.
 The default device paths are:
 
 ```text
-/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
-/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf
-/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
-/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc
+/usr/share/APPLaunch/share/font/DejaVuSans.ttf
+/usr/share/APPLaunch/share/font/DejaVuSerif.ttf
+/usr/share/APPLaunch/share/font/NotoSansCJK-Regular.ttc
+/usr/share/APPLaunch/share/font/NotoSerifCJK-Regular.ttc
 ```
 
 Override paths when running on a system with a different font layout using

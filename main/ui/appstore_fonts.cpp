@@ -5,10 +5,10 @@
 
 namespace {
 
-constexpr const char *kLatinSansFont = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
-constexpr const char *kCjkSansFont = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
-constexpr const char *kLatinSerifFont = "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf";
-constexpr const char *kCjkSerifFont = "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc";
+constexpr const char *kLatinSansFont = "/usr/share/APPLaunch/share/font/DejaVuSans.ttf";
+constexpr const char *kCjkSansFont = "/usr/share/APPLaunch/share/font/NotoSansCJK-Regular.ttc";
+constexpr const char *kLatinSerifFont = "/usr/share/APPLaunch/share/font/DejaVuSerif.ttf";
+constexpr const char *kCjkSerifFont = "/usr/share/APPLaunch/share/font/NotoSerifCJK-Regular.ttc";
 
 #if LV_USE_FREETYPE
 const char *g_latin_sans_path = kLatinSansFont;
